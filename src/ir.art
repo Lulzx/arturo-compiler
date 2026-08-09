@@ -118,11 +118,18 @@ renderValue: function [v][
 ; [base seg seg ...] -> `base\seg\seg`. Segments print bare
 ; (a `:literal` segment is a field name, not a quoted value);
 ; a `:block` segment keeps its brackets (`c\[i]`).
+; The base is a read of a variable and takes the emitted name;
+; the segments are field names and stay as written.
 renderPathParts: function [parts][
     out: @[]
+    isBase: true
     loop parts [p][
         if :block = type p -> addItem out (renderValue p)
-        if :block <> type p -> addItem out (to :string p)
+        if :block <> type p [
+            if isBase -> addItem out (emitName (to :string p))
+            if not? isBase -> addItem out (to :string p)
+        ]
+        isBase: false
     ]
     joinWith out "\\"
 ]
@@ -276,10 +283,74 @@ ir2artDict: function [args][
     "#[" ++ (joinWith labelled " ") ++ "]"
 ]
 
+;-----------------------------------------------
+; Calls that take a path reference.
+;
+; `append 'c\stack 4` hands the builtin a reference to write
+; back through. The host's bytecode compiler drops that write —
+; nothing lands in `c\stack` — while the same call through a
+; plain reference, `append 'b 4`, is fine both interpreted and
+; compiled.
+;
+; Binding the path to a local first is enough, because the local
+; is an alias of the same container, so the plain reference
+; reaches it:
+;
+;   f 'base\seg... rest   ->   do [_ref1: base\seg... f '_ref1 rest]
+;
+; The block's value is still f's, so `pop` keeps handing back
+; the element it removed. And nothing binds the call's result,
+; which matters: `v: append 'b 4` kills the host outright,
+; interpreted or compiled — so a source that reads an in-place
+; `append` dies either way, and parity holds.
+;
+; The counter is reset per program by renderProgram, so the
+; output is a function of the source alone.
+;-----------------------------------------------
+REF_SEQ: #[n: 0]
+
+; index of the first argument that is a path reference — a
+; `:pathliteral` carrying at least one segment — or -1. A bare
+; `'b` is a `:literal` and already survives `-c` untouched.
+pathRefArg: function [args][
+    found: 0 - 1
+    j: 0
+    loop args [a][
+        if 0 > found [
+            if isIR a [
+                if "passthrough" = a\op [
+                    if :pathliteral = type a\src [
+                        if 1 < size (to :block a\src) -> found: j
+                    ]
+                ]
+            ]
+        ]
+        j: j + 1
+    ]
+    found
+]
+
+ir2artRefCall: function [node idx][
+    REF_SEQ\n: REF_SEQ\n + 1
+    tmp: "_ref" ++ (to :string REF_SEQ\n)
+    place: renderPathParts (to :block node\args\[idx]\src)
+    parts: @[]
+    j: 0
+    loop node\args [a][
+        if j = idx -> addItem parts ("'" ++ tmp)
+        if j <> idx -> addItem parts (ir2art a)
+        j: j + 1
+    ]
+    call: (ir2art node\fn) ++ " " ++ (joinWith parts " ")
+    "do [" ++ tmp ++ ": " ++ place ++ " " ++ call ++ "]"
+]
+
 ir2artCall: function [node][
     if and? (isIR node\fn) ["load" = node\fn\op] [
         if "makeDict" = node\fn\name -> return ir2artDict node\args
     ]
+    refIdx: pathRefArg node\args
+    if refIdx >= 0 -> return ir2artRefCall node refIdx
     fnText: ir2art node\fn
     argsText: @[]
     loop node\args [a][ addItem argsText (ir2art a) ]

@@ -46,17 +46,18 @@ claim — the compiler reproduces itself.
     src/tests.art     the differential harness
     corpus/           one program per rule, then compositions
 
-Known limits, stated plainly, all of them the host's. Arturo
-0.10.0's bytecode compiler (`arturo -c`) silently drops a
-mutation made through a path reference — `append 'c\stack 4`
-writes nothing, though `append 'b 4` is fine — and it dies on a
-store bound to a negative constant, which is why negatives are
-emitted as `neg 4` and not `(0 - 4)`. Binding the result of an
-in-place `append` (`v: append 'b 4`) kills the host outright,
-source or bytecode, so the compiler cannot faithfully rewrite
-the first of those. Path-reference mutation is covered in
-`src/smoke.art` rather than the corpus for that reason: the
-compiled engine cannot agree with the other three.
+Every construct the compiler emits survives `arturo -c`, which
+takes the bootstrap one step further: stage 2 compiled to host
+bytecode and run by `-x` re-emits the compiler byte-identically
+too, with no source-level interpretation anywhere in the loop.
 
-Read `SPEC.md` for the full design and `corpus/m1/RESULTS.md`
-for the pinned host behavior.
+Getting there meant designing around seven bugs in the host —
+`-c` dropping mutation made through a path reference, dying on a
+store bound to a negative constant, and mis-compiling
+operator-like dictionary keys; `to :dictionary` handing out
+copies of its values; and binding an in-place `append`'s result
+killing the process outright. Each one is pinned with its probe
+in `corpus/m1/RESULTS.md`, alongside what the compiler does
+instead.
+
+Read `SPEC.md` for the full design.

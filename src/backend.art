@@ -19,6 +19,9 @@ executeIR: function [ir][
 ; v1 backend: render IR to source, donate the compile
 ;-----------------------------------------------
 renderProgram: function [src][
+    ; the path-reference temporaries are numbered per program, so
+    ; the output depends only on the source
+    REF_SEQ\n: 0
     ir2artSeq (fold (compileToIR src))
 ]
 

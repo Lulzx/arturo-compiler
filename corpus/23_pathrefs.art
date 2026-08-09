@@ -1,11 +1,8 @@
 ; paths: reading through `\`, assigning through `\` at one and
-; two levels, and index segments — plus `( ... )` grouping,
-; which must survive the round-trip as a group and not as a
-; block literal.
-;
-; Mutation through a path *reference* (`append 'c\stack v`) is
-; in src/smoke.art instead: the host's `-c` silently drops it,
-; so the compiled engine cannot agree with the other three.
+; two levels, index segments, and the literal path references
+; (`'c\stack`) that the mutating builtins write back through.
+; Plus `( ... )` grouping, which must survive the round-trip as
+; a group and not as a block literal.
 c: #[stack: @[10 20 30] n: 0]
 print c\stack\1
 c\n: (2 + 3) * 2
@@ -14,6 +11,14 @@ print (size c\stack) + c\n
 i: 2
 print c\stack\[i]
 
-box: #[inner: #[v: 41]]
+append 'c\stack 40
+print c\stack
+v: pop 'c\stack
+print c\stack
+print v
+
+box: #[inner: #[v: 41] list: @[1]]
 box\inner\v: box\inner\v + 1
 print box\inner\v
+append 'box\list 2
+print box\list

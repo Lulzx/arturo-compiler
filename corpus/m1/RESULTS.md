@@ -110,11 +110,15 @@ nothing usable; values that are never claimed are dropped at block end.
 4. **`-c` drops mutation through a path reference.** `append 'c\stack 4`
    and `pop 'c\stack` work when the source is interpreted but write
    nothing once compiled to bytecode; `append 'b 4` through a plain
-   literal reference is fine either way.
+   literal reference is fine either way. Binding the path to a local
+   first is enough — the local aliases the same container — so the
+   printer emits `do [_ref1: c\stack append '_ref1 4]`.
 5. **Binding an in-place `append`'s result kills the process.**
    `v: append 'b 4` exits silently, source or bytecode, even wrapped in
-   `do [...]`. `v: pop 'b` is fine. This is why 4 cannot simply be
-   rewritten to go through a plain reference and store back.
+   `do [...]`. `v: pop 'b` is fine. This is why the rewrite for 4 must
+   not bind the call's result: it leaves the block's value as the
+   call's, so `pop` still returns the element it removed, and a source
+   that reads an in-place `append` dies exactly as the host does.
 6. **`-c` dies on a store bound to a negative constant.** `x: sub 4 10`
    compiles to a program that stops there; `x: sub 10 4` is fine, and so
    is `x: neg 6`. It is the negative result, not the call. Negative
