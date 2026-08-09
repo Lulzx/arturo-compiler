@@ -167,7 +167,28 @@ delegateThroughRef: function [env name argVals][
 ; Specials: lazy / structural constructs handled by name
 ;-----------------------------------------------
 isSpecialName: function [name][
-    key? SPECIAL_NAMES name
+    not? null? ruleFor name
+]
+
+ruleFor: function [name][
+    if null? name -> return null
+    if key? RULES name -> return RULES\[name]
+    null
+]
+
+;-----------------------------------------------
+; The IR-level counterpart of front.art's calleeName: the name
+; a call head denotes, whether it was written as a lexical load
+; or identified as an intrinsic. Null when the callee is an
+; expression — a closure in a variable, a value returned by
+; another call — which is precisely when nothing static can be
+; said about it.
+;-----------------------------------------------
+irCalleeName: function [node][
+    if not? isIR node -> return null
+    if "intrinsic" = node\op -> return node\name
+    if "load" = node\op -> return node\name
+    null
 ]
 
 ;=======================================================
@@ -292,24 +313,10 @@ makeDictFrom: function [kv][
 evalCall: function [env node][
     fnNode: node\fn
 
-    ; runtime dict construction: evaluate each field (key +
-    ; value expression) and build the dictionary
-    if and? (isLoadNode fnNode) ["makeDict" = fnNode\name] [
-        kv: @[]
-        loop node\args [a][ addItem kv (evalNode env a :interpret) ]
-        return makeDictFrom kv
-    ]
-
-    ; kernel specials, recognised by name before evaluation
-    if and? (isLoadNode fnNode) [isSpecialName fnNode\name] [
-        name: fnNode\name
-        if "function" = name -> return makeClosure env node\args\0 node\args\1
-        if "if"       = name -> return evalIf env node\args\0 node\args\1
-        if "do"       = name -> return evalBody env node\args\0
-        if "return"   = name -> return evalReturn env node\args\0
-        if "while"    = name -> return evalWhile env node\args\0 node\args\1
-        if "until"    = name -> return evalUntil env node\args\0 node\args\1
-    ]
+    ; one row per construct, one lookup, one of its three
+    ; behaviours picked by which dispatcher is asking
+    r: ruleFor (calleeName fnNode)
+    if not? null? r -> return call r\eval @[env node\args]
 
     fnVal: evalNode env fnNode :interpret
     argVals: @[]
@@ -346,6 +353,7 @@ emitSeq: function [env seq][
 
 emitNode: function [env node][
     if and? (isNode node) ["load" = node\nodek] -> return #[op: "load" name: node\name]
+    if and? (isNode node) ["intrinsic" = node\nodek] -> return #[op: "intrinsic" name: node\name]
     if and? (isNode node) ["define" = node\nodek] [
         return #[op: "define" name: node\name expr: emitNode env node\args\0]
     ]
@@ -362,33 +370,8 @@ emitNode: function [env node][
 
 emitCall: function [env node][
     fnNode: node\fn
-    if and? (isLoadNode fnNode) [isSpecialName fnNode\name] [
-        name: fnNode\name
-        if "function" = name [
-            return #[op: "func" params: node\args\0 body: emitSeq env (lowerBlock node\args\1)]
-        ]
-        if "if" = name [
-            return #[op: "if" cond: emitNode env node\args\0
-                           yes: emitSeq env (lowerBlock node\args\1)
-                           no: null]
-        ]
-        if "do" = name [
-            arg: node\args\0
-            if :block = type arg -> return #[op: "do" body: emitSeq env (lowerBlock arg)]
-            return #[op: "do" expr: emitNode env arg]
-        ]
-        if "return" = name [
-            return #[op: "return" expr: emitNode env node\args\0]
-        ]
-        if "while" = name [
-            return #[op: "while" cond: emitSeq env (lowerBlock node\args\0)
-                           action: emitSeq env (lowerBlock node\args\1)]
-        ]
-        if "until" = name [
-            return #[op: "until" action: emitSeq env (lowerBlock node\args\0)
-                           cond: emitSeq env (lowerBlock node\args\1)]
-        ]
-    ]
+    r: ruleFor (calleeName fnNode)
+    if not? null? r -> return call r\emit @[env node\args]
     fnIR: emitNode env fnNode
     argsIR: @[]
     loop node\args [a][ addItem argsIR (emitNode env a) ]
@@ -405,6 +388,7 @@ evalNode: function [env node mode][
 
 evalInterpret: function [env node][
     if and? (isNode node) ["load" = node\nodek] -> return evalLoad env node
+    if and? (isNode node) ["intrinsic" = node\nodek] -> return #[nodek: "hostword" name: node\name]
     if and? (isNode node) ["define" = node\nodek] -> return evalDefine env node
     if and? (isNode node) ["call" = node\nodek] -> return evalCall env node
     if and? (isNode node) ["blockval" = node\nodek] [
@@ -455,6 +439,7 @@ runNode: function [env node][
     op: node\op
     if "const" = op -> return node\value
     if "load" = op -> return loadRule env node\name
+    if "intrinsic" = op -> return #[nodek: "hostword" name: node\name]
     if "define" = op [
         value: runNode env node\expr
         define env node\name value
@@ -517,50 +502,8 @@ runNode: function [env node][
 
 runCall: function [env node][
     fnNode: node\fn
-    if and? (isIR fnNode) ["load" = fnNode\op] [
-        name: fnNode\name
-        if "makeDict" = name [
-            kv: @[]
-            loop node\args [a][ addItem kv (runNode env a) ]
-            return makeDictFrom kv
-        ]
-        if isSpecialName name [
-            if "function" = name -> return #[nodek: "closure" params: node\args\0 body: node\args\1 ir: true env: env]
-            if "if" = name [
-                cond: runNode env node\args\0
-                if truthy cond -> return runBody env node\args\1
-                return null
-            ]
-            if "do" = name -> return runBody env node\args\0
-            if "return" = name [
-                RET\set: true
-                RET\value: runNode env node\args\0
-                return RET\value
-            ]
-            if "while" = name [
-                while [true][
-                    cond: runSeq env node\args\0
-                    if RET\set -> break
-                    if not? truthy cond -> break
-                    runSeq env node\args\1
-                    if RET\set -> break
-                ]
-                if RET\set -> return RET\value
-                return null
-            ]
-            if "until" = name [
-                while [true][
-                    runSeq env node\args\1
-                    if RET\set -> break
-                    cond: runSeq env node\args\0
-                    if RET\set -> break
-                    if truthy cond -> break
-                ]
-                if RET\set -> return RET\value
-                return null
-            ]
-        ]
-    ]
+    r: ruleFor (irCalleeName fnNode)
+    if not? null? r -> return call r\run @[env node\args]
 
     fnVal: runNode env fnNode
     argVals: @[]
@@ -606,4 +549,124 @@ runIR: function [ir][
 runIRIn: function [env ir][
     resetRET
     runSeq env ir
+]
+
+;=======================================================
+; The rule table.
+;
+; One row per construct, carrying its three behaviours: what it
+; means when interpreted from source, what IR it emits, and what
+; it means when that IR is executed. The three dispatchers above
+; do not know these constructs; they look the row up and pick a
+; column.
+;
+; Adding a language feature is adding a row. Getting one of the
+; three paths wrong is now a visibly missing or mismatched field
+; in a row, rather than a branch someone forgot to add to the
+; third `if "while" = name` chain in a different function.
+;
+; Arity is deliberately NOT here. It is already declared upstream
+; and generated into INTRINSICS, and a second copy is a second
+; thing to drift. A row says what a construct MEANS; how many
+; arguments it takes is Arturo's to say.
+;
+; `eval` and `emit` receive source-level argument nodes; `run`
+; receives IR. Same construct, three representations of its
+; arguments — which is exactly the distinction the table exists
+; to make explicit.
+;=======================================================
+RULES: #[]
+
+; the row is built at the call site, not passed in piece by
+; piece: a function reaching a dictionary literal through a
+; WORD is invoked on the spot rather than stored, so
+; `#[eval: evalFn]` runs evalFn and keeps its result.
+defRule: function [name row][ RULES\[name]: row ]
+
+defRule "function" #[
+    eval: function [env argv][ makeClosure env argv\0 argv\1 ]
+    emit: function [env argv][ #[op: "func" params: argv\0 body: emitSeq env (lowerBlock argv\1)] ]
+    run:  function [env argv][ #[nodek: "closure" params: argv\0 body: argv\1 ir: true env: env] ]
+]
+
+defRule "if" #[
+    eval: function [env argv][ evalIf env argv\0 argv\1 ]
+    emit: function [env argv][ #[op: "if" cond: emitNode env argv\0 yes: emitSeq env (lowerBlock argv\1) no: null] ]
+    run:  function [env argv][
+        cond: runNode env argv\0
+        if truthy cond -> return runBody env argv\1
+        null
+    ]
+]
+
+defRule "do" #[
+    eval: function [env argv][ evalBody env argv\0 ]
+    emit: function [env argv][
+        body: argv\0
+        if :block = type body -> return #[op: "do" body: emitSeq env (lowerBlock body)]
+        #[op: "do" expr: emitNode env body]
+    ]
+    run:  function [env argv][ runBody env argv\0 ]
+]
+
+defRule "return" #[
+    eval: function [env argv][ evalReturn env argv\0 ]
+    emit: function [env argv][ #[op: "return" expr: emitNode env argv\0] ]
+    run:  function [env argv][
+        RET\set: true
+        RET\value: runNode env argv\0
+        RET\value
+    ]
+]
+
+defRule "while" #[
+    eval: function [env argv][ evalWhile env argv\0 argv\1 ]
+    emit: function [env argv][ #[op: "while" cond: emitSeq env (lowerBlock argv\0) action: emitSeq env (lowerBlock argv\1)] ]
+    run:  function [env argv][
+        while [true][
+            cond: runSeq env argv\0
+            if RET\set -> break
+            if not? truthy cond -> break
+            runSeq env argv\1
+            if RET\set -> break
+        ]
+        if RET\set -> return RET\value
+        null
+    ]
+]
+
+defRule "until" #[
+    eval: function [env argv][ evalUntil env argv\0 argv\1 ]
+    emit: function [env argv][ #[op: "until" action: emitSeq env (lowerBlock argv\0) cond: emitSeq env (lowerBlock argv\1)] ]
+    run:  function [env argv][
+        while [true][
+            runSeq env argv\1
+            if RET\set -> break
+            cond: runSeq env argv\0
+            if RET\set -> break
+            if truthy cond -> break
+        ]
+        if RET\set -> return RET\value
+        null
+    ]
+]
+
+; `makeDict` is the one row that is not an Arturo word. The
+; front-end lowers a `#[...]` literal into a call to it so the
+; field values become nodes the kernel evaluates in order,
+; rather than a block the host would re-read. Its emit column
+; rebuilds the plain call, which the printer turns back into a
+; literal.
+defRule "makeDict" #[
+    eval: function [env argv][
+        kv: @[]
+        loop argv [a][ addItem kv (evalNode env a :interpret) ]
+        makeDictFrom kv
+    ]
+    emit: function [env argv][ #[op: "call" fn: #[op: "load" name: "makeDict"] args: emitSeq env argv] ]
+    run:  function [env argv][
+        kv: @[]
+        loop argv [a][ addItem kv (runNode env a) ]
+        makeDictFrom kv
+    ]
 ]

@@ -28,3 +28,32 @@ NOT_MUTATING: #[
     "call": true      ; resolves the path to the function to invoke
     "info": true      ; resolves the path to describe what is there
 ]
+
+;-----------------------------------------------
+; Intrinsics the folder may run at compile time.
+;
+; Arturo does not declare purity, so this is a judgement and
+; not an extracted fact — which is exactly why it lives here
+; and not in the generated file. An allowlist, so a builtin
+; nobody has thought about is simply not folded.
+;
+; The folder asks this of an `intrinsic` node only. A call
+; through a NAME is whatever that name is bound to when the
+; call runs, so `mul a b` where the program has said
+; `mul: something` is not this table's business, and used to
+; be: the check was `key? PURE_WORDS ff\name` against a node
+; that could not tell the two apart.
+;-----------------------------------------------
+PURE_INTRINSICS: #[
+    "add": true  "sub": true  "mul": true  "div": true  "fdiv": true
+    "mod": true  "pow": true  "divmod": true
+    "equal?": true  "notEqual?": true  "less?": true  "greater?": true
+    "lessOrEqual?": true  "greaterOrEqual?": true
+    "and?": true  "or?": true
+    "not?": true  "null?": true  "true?": true  "false?": true
+    "size": true  "first": true  "last": true  "inc": true  "dec": true
+    "type": true  "to": true
+    "append": true  "not": true  "and": true  "or": true
+]
+
+pureIntrinsic?: function [name][ key? PURE_INTRINSICS name ]

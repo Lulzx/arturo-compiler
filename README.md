@@ -2,24 +2,66 @@
 
 A compiler for Arturo, written in Arturo, that compiles itself.
 
-One semantic model, expressed along three paths: interpreting
-source, emitting IR, and executing that IR. They are held to each
-other by construction —
+One rule table, one row per construct, three columns:
+
+```arturo
+defRule "while" #[
+    eval: function [env argv][ evalWhile env argv\0 argv\1 ]
+    emit: function [env argv][ #[op: "while" ...] ]
+    run:  function [env argv][ ... ]
+]
+```
+
+`eval` is what the construct means interpreted from source, `emit`
+is the IR it produces, `run` is what that IR means when executed.
+`evalCall`, `emitCall` and `runCall` no longer know any construct
+by name — each looks the row up and picks its column. Adding a
+language feature is adding a row, and getting one path wrong is a
+visibly missing field rather than a branch nobody added to the
+third `if "while" = name` chain.
+
+Arity is deliberately not in the row. It is declared upstream and
+generated into `INTRINSICS`; a second copy is a second thing to
+drift. A row says what a construct *means*.
+
+The three columns are held to each other by construction —
 
 ```
 eval(env, emit(n)) == eval(env, n)      ; for every node n
 ```
 
 — and by a harness that runs every corpus program all three ways
-plus on the real `arturo`, and compares. What the model is *not*,
-yet, is one literal rule table: `evalCall`, `emitCall` and
-`runNode` are three dispatchers over the same constructs, and
-collapsing them into one row per construct is the next milestone.
-Anything short of that and this paragraph would be describing a
-program that does not exist.
+plus on the real `arturo`, and compares.
 
 The donated VM owns the primitives; the kernel owns structure:
 scoping, control flow, application.
+
+## load, intrinsic, call
+
+`load "mul"` and the Arturo primitive MUL used to be the same IR
+node, which meant every question about a callee had to be asked as
+a string — is `"mul"` in `PURE_WORDS`, does `"append"` write
+through its first argument — and a word that merely spelled a
+builtin got the same answers as the builtin. They are separate
+nodes now:
+
+```
+load       resolve this name in the environment
+intrinsic  this Arturo primitive, statically identified
+call       invoke a callee, whichever kind it is
+```
+
+`10 - 3` lowers to `call(intrinsic("sub"), ...)`; a bare word
+lowers to `intrinsic` or `load` by the host's own rule, the one
+`loadRule` already implemented — a builtin word reaches the
+builtin, and only a user *value* binding takes the word away, at
+which point hygiene has already renamed that binding aside.
+
+Constant folding now folds `intrinsic` nodes only, and asks
+`pureIntrinsic?` rather than matching a name against a string
+table. A call through a name is whatever the name is bound to when
+the call runs, and folding it would mean running the primitive in
+place of the user's function.
 
 ## What the compiler knows about Arturo
 
@@ -86,7 +128,7 @@ claim — the compiler reproduces itself.
     src/semantics.art   what Arturo does not declare and we decide
     tools/extract_intrinsics.art  the generator
     src/front.art     strip, lex, lower — the grouping, pinned to ast.nim
-    src/kernel.art    the dual evaluator, plus runIR
+    src/kernel.art    the rule table and its three dispatchers, plus runIR
     src/ir.art        IR, the printer, constant folding
     src/backend.art   runIR; shell out to -c / -x
     src/tests.art     the differential harness

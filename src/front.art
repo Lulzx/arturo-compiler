@@ -157,6 +157,47 @@ noteShadow: function [name][
 ; Node constructors
 ;-----------------------------------------------
 loadNode:   function [name][ #[nodek: "load" name: name] ]
+
+;-----------------------------------------------
+; `load` and `intrinsic` are two different questions.
+;
+;   load "mul"        resolve the name `mul` in the environment
+;   intrinsic "mul"   the Arturo primitive MUL
+;
+; They used to be the same node, which meant every downstream
+; question about a callee had to be asked as a string: is
+; "mul" in PURE_WORDS, is "if" a special, does "append" write
+; through its first argument. A word that happens to spell a
+; builtin got the same answers as the builtin itself.
+;
+; Which one a source word becomes is decided by the host's own
+; rule, the one loadRule already implements: a builtin word
+; resolves to the builtin, never to a user function of that
+; name. Only a user VALUE binding takes the word away, and that
+; binding has already been renamed out of the way by then — so
+; if the name still reaches a builtin, it is the builtin.
+;-----------------------------------------------
+intrinsicNode: function [name][ #[nodek: "intrinsic" name: name] ]
+
+isIntrinsicNode: function [n][
+    if :dictionary <> type n -> return false
+    if not? key? n "nodek" -> return false
+    "intrinsic" = n\nodek
+]
+
+; the node a source word becomes when it is read
+wordNode: function [name][
+    if key? SHADOWED name -> return loadNode (shadowName name)
+    if key? INTRINSICS name -> return intrinsicNode name
+    loadNode name
+]
+
+; the name a call head denotes, whichever kind it is, or null
+calleeName: function [n][
+    if isIntrinsicNode n -> return n\name
+    if isLoadNode n -> return n\name
+    null
+]
 callNode:   function [fn args][ #[nodek: "call" fn: fn args: args] ]
 defineNode: function [name expr][ #[nodek: "define" name: name args: @[expr]] ]
 
@@ -204,8 +245,8 @@ addItem: function [c v][
 ; under, leaving `sub\0` as `get sub 0` in a program where
 ; `sub` had been rebound.
 pathBaseNode: function [base][
-    if :word = type base -> return loadNode (emitName (to :string base))
-    if :literal = type base -> return loadNode (emitName (to :string base))
+    if :word = type base -> return wordNode (to :string base)
+    if :literal = type base -> return wordNode (to :string base)
     base
 ]
 
@@ -224,7 +265,7 @@ buildPathGet: function [parts][
     if 1 < size parts [
         loop 1..dec (size parts) [j][
             seg: pathSegNode parts\[j]
-            if not? null? seg -> node: callNode (loadNode "get") @[node seg]
+            if not? null? seg -> node: callNode (intrinsicNode "get") @[node seg]
         ]
     ]
     node
@@ -238,11 +279,11 @@ pathSetFrame: function [parts][
     if n > 2 [
         loop 1..dec (n - 1) [j][
             seg: pathSegNode parts\[j]
-            if not? null? seg -> node: callNode (loadNode "get") @[node seg]
+            if not? null? seg -> node: callNode (intrinsicNode "get") @[node seg]
         ]
     ]
     lastSeg: pathSegNode parts\[n - 1]
-    fr: #[nodek: "call" fn: loadNode "set" arity: 3 args: @[node lastSeg]]
+    fr: #[nodek: "call" fn: intrinsicNode "set" arity: 3 args: @[node lastSeg]]
     fr
 ]
 
@@ -311,7 +352,7 @@ makeDictCall: function [ib][
             if and? (not? atBlock) [not? hashBlock] [
                 if n = 1 [
                     v: ib\[j + 1]
-                    if :word = type v -> addItem pairs (loadNode (to :string v))
+                    if :word = type v -> addItem pairs (wordNode (to :string v))
                     if :word <> type v -> addItem pairs v
                 ]
                 if n <> 1 [
@@ -321,7 +362,7 @@ makeDictCall: function [ib][
                         while [k < vend][ addItem sub ib\[k] k: k + 1 ]
                         ; a multi-element value is an expression:
                         ; evaluate it with a `do` wrapping the raw block
-                        addItem pairs (callNode (loadNode "do") @[sub])
+                        addItem pairs (callNode (intrinsicNode "do") @[sub])
                     ]
                 ]
             ]
@@ -342,7 +383,7 @@ buildBlockVal: function [blk][
         ; `@[...]` elements are read, so a word here is a load and
         ; takes the emitted name. A raw `[...]` is data (or a body
         ; the host lowers later) and prints verbatim.
-        if :word = type x -> addItem out (loadNode (emitName (to :string x)))
+        if :word = type x -> addItem out (wordNode (to :string x))
         if :word <> type x -> addItem out x
     ]
     #[nodek: "blockval" items: out]
@@ -381,7 +422,7 @@ lowerWalk: function [blok start stopAtRoot][
             if "define" = top\nodek [
                 expr: top\args\0
                 if isCallNode expr [
-                    if and? (isLoadNode expr\fn) ["function" = expr\fn\name] [
+                    if "function" = calleeName expr\fn [
                         params: expr\args\0
                         if :block = type params [
                             cnt: 0
@@ -394,7 +435,7 @@ lowerWalk: function [blok start stopAtRoot][
                     ]
                     ; a call that is not a function: the name is a
                     ; plain variable now — forget any builtin arity
-                    if not? and? (isLoadNode expr\fn) ["function" = expr\fn\name] [
+                    if "function" <> calleeName expr\fn [
                         ARITY\[top\name]: null
                         noteShadow top\name
                     ]
@@ -436,7 +477,7 @@ lowerWalk: function [blok start stopAtRoot][
         if and? (c\i < c\n - 1) [isInfixSymbol blok\[c\i + 1]] [
             opName: to :string blok\[c\i + 1]
             fnName: INFIX_SYMBOLS\[opName]
-            descendCall c (loadNode fnName) (infixArityOf fnName)
+            descendCall c (intrinsicNode fnName) (infixArityOf fnName)
             c\i: c\i + 1
         ]
     ]
@@ -556,17 +597,17 @@ lowerWalk: function [blok start stopAtRoot][
                         ; between `f` printing 100 and printing a
                         ; function value.
                         if ar > 0 [
-                            descendCall ctx (loadNode name) ar
+                            descendCall ctx (wordNode name) ar
                         ]
                         if ar = 0 [
                             rewind ctx
                             tryInfix ctx
-                            appendValue ctx (callNode (loadNode (emitName name)) @[])
+                            appendValue ctx (callNode (wordNode name) @[])
                         ]
                         if ar < 0 [
                             rewind ctx
                             tryInfix ctx
-                            appendValue ctx (loadNode (emitName name))
+                            appendValue ctx (wordNode name)
                         ]
                         ctx\i: ctx\i + 1
                         ctx\processed: ctx\processed + 1
@@ -578,7 +619,7 @@ lowerWalk: function [blok start stopAtRoot][
         if :symbol = type el [
             name: to :string el
             if name = "$" [
-                descendCall ctx (loadNode "function") 2
+                descendCall ctx (intrinsicNode "function") 2
                 ctx\i: ctx\i + 1
                 ctx\processed: ctx\processed + 1
             ]

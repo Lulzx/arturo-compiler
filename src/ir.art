@@ -186,6 +186,10 @@ ir2art: function [node][
     op: node\op
     if "const" = op -> return renderValue node\value
     if "load" = op -> return node\name
+    ; an intrinsic prints as its own word. It is never renamed:
+    ; hygiene moves the user's binding out of the way instead, so
+    ; the word still reaches the primitive in the emitted text.
+    if "intrinsic" = op -> return node\name
     if "define" = op [
         ex: ir2art node\expr
         return node\name ++ ": " ++ ex
@@ -337,7 +341,7 @@ pathRefArg: function [args][
 ; function: it receives a value, not a reference.
 writesThroughRef?: function [fnNode][
     if not? isIR fnNode -> return false
-    if "load" <> fnNode\op -> return false
+    if "intrinsic" <> fnNode\op -> return false
     mutatesThroughRef? fnNode\name
 ]
 
@@ -352,14 +356,17 @@ ir2artRefCall: function [node idx][
         if j <> idx -> addItem parts (ir2art a)
         j: j + 1
     ]
-    call: (ir2art node\fn) ++ " " ++ (joinWith parts " ")
-    "do [" ++ tmp ++ ": " ++ place ++ " " ++ call ++ "]"
+    ; not `call:` — binding a builtin name anywhere in the program
+    ; moves that word aside everywhere, because hygiene is global
+    ; and monotonic. A local called `call` cost the kernel its
+    ; `call` builtin, and a renamed word carries no arity, so the
+    ; grouping of every call through it silently came apart.
+    invocation: (ir2art node\fn) ++ " " ++ (joinWith parts " ")
+    "do [" ++ tmp ++ ": " ++ place ++ " " ++ invocation ++ "]"
 ]
 
 ir2artCall: function [node][
-    if and? (isIR node\fn) ["load" = node\fn\op] [
-        if "makeDict" = node\fn\name -> return ir2artDict node\args
-    ]
+    if "makeDict" = irCalleeName node\fn -> return ir2artDict node\args
     ; the shim is only for calls that actually write back. Before
     ; the intrinsic database there was no way to ask, so any call
     ; carrying a path argument got wrapped — `call 'handlers\ok x`
@@ -379,17 +386,6 @@ ir2artCall: function [node][
 ;-----------------------------------------------
 ; Constant folding
 ;-----------------------------------------------
-PURE_WORDS: #[
-    "add": true  "sub": true  "mul": true  "div": true  "fdiv": true
-    "mod": true  "pow": true  "divmod": true
-    "equal?": true  "notEqual?": true  "less?": true  "greater?": true
-    "lessOrEqual?": true  "greaterOrEqual?": true
-    "and?": true  "or?": true
-    "not?": true  "null?": true  "true?": true  "false?": true
-    "size": true  "first": true  "last": true  "inc": true  "dec": true
-    "type": true  "to": true
-    "append": true  "not": true  "and": true  "or": true
-]
 
 isConstNode: function [n][
     if not? isIR n -> return false
@@ -401,6 +397,7 @@ foldNode: function [node][
     op: node\op
     if "const" = op -> return node
     if "load" = op -> return node
+    if "intrinsic" = op -> return node
     if "passthrough" = op -> return node
     if "define" = op [
         fe: foldNode node\expr
@@ -411,8 +408,12 @@ foldNode: function [node][
         fa: @[]
         loop node\args [a][ addItem fa (foldNode a) ]
         ; fold pure calls over const args by running the kernel
-        if and? (isIR ff) ["load" = ff\op] [
-            if key? PURE_WORDS ff\name [
+        ; only an intrinsic folds. A call through a name — even a
+        ; name spelled `mul` — is whatever that name is bound to at
+        ; the point of the call, and folding it would be running
+        ; the primitive in place of the user's function.
+        if and? (isIR ff) ["intrinsic" = ff\op] [
+            if pureIntrinsic? ff\name [
                 allConst: true
                 loop fa [a][ if not? isConstNode a -> allConst: false ]
                 if allConst [
