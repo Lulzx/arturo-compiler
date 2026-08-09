@@ -1,0 +1,25 @@
+; `if cond -> expr` completing on a word, a label, a path or
+; true/false must end the arrow body — the statements after it
+; belong to the enclosing block, not to the branch.
+kind: function [d][
+    if :dictionary <> type d -> return "not-a-dict"
+    tag: d\tag
+    if "a" = tag -> return d\name
+    if "b" = tag -> return "bee"
+    "other"
+]
+print kind 7
+print kind #[tag: "a" name: "alpha"]
+print kind #[tag: "b" name: "beta"]
+print kind #[tag: "c" name: "gamma"]
+
+count: function [n][
+    total: 0
+    j: 0
+    while [j < n][
+        if 0 = j % 2 -> total: total + j
+        j: j + 1
+    ]
+    total
+]
+print count 10

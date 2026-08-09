@@ -69,7 +69,7 @@ BUILTIN_ARITY: #[
     "intersection": 2  "union": 2  "coalesce": 2
     "and": 2  "or": 2  "xor": 2  "shl": 2  "shr": 2
     "and?": 2  "or?": 2  "xor?": 2
-    "append": 2  "remove": 2  "repeat": 2
+    "append": 2  "remove": 2  "repeat": 2  "pop": 1
     "get": 2  "set": 3  "key?": 2  "contains?": 2
     "empty?": 1  "insert": 3  "join": 1
     "read": 1  "write": 2  "execute": 1  "exists?": 1  "list": 1
@@ -96,6 +96,18 @@ arityOf: function [name][
         if not? null? ARITY\[name] -> return ARITY\[name]
     ]
     (0 - 1)
+]
+
+; An infix symbol always denotes its builtin, whatever the
+; word of that name currently means. Verified on the host:
+; after `sub: 5`, `sub 10 3` loads the variable (prints 5)
+; but `10 - 3` still calls the builtin (prints 7). Reading
+; the mutable table here gave `-` arity -1 in any program
+; that also used `sub` as a variable name, collapsing
+; `0 - 1` into a zero-argument `sub` call.
+infixArityOf: function [name][
+    if key? BUILTIN_ARITY name -> return BUILTIN_ARITY\[name]
+    arityOf name
 ]
 
 isInfixSymbol: function [el][
@@ -352,7 +364,7 @@ lowerWalk: function [blok start stopAtRoot][
         if and? (c\i < c\n - 1) [isInfixSymbol blok\[c\i + 1]] [
             opName: to :string blok\[c\i + 1]
             fnName: INFIX_SYMBOLS\[opName]
-            descendCall c (loadNode fnName) (arityOf fnName)
+            descendCall c (loadNode fnName) (infixArityOf fnName)
             c\i: c\i + 1
         ]
     ]
@@ -563,12 +575,21 @@ lowerWalk: function [blok start stopAtRoot][
                             appendValue ctx el
                             ctx\i: ctx\i + 1
                             ctx\processed: ctx\processed + 1
-                            if and? stopAtRoot (and? (not? empty? ctx\root) [empty? ctx\stack]) -> break
                         ]
                     ]
                 ]
             ]
         ]
+
+        ; stopAtRoot: one expression, then stop. The check lives
+        ; here, at the bottom of the walk, so it fires whatever
+        ; kind of element completed the expression — a plain
+        ; value, a bare word load (`return renderValue node`), a
+        ; path (`op: node\op`), `true`/`false`/`null`, a dict or
+        ; `@[...]` literal. Checking it in the plain-value branch
+        ; alone let every other completing element fall through
+        ; and swallow the statements that followed the arrow.
+        if and? stopAtRoot (and? (not? empty? ctx\root) [empty? ctx\stack]) -> break
     ]
 
     #[root: ctx\root i: ctx\i complete: empty? ctx\stack]

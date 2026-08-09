@@ -1,0 +1,19 @@
+; dict literals whose values are blocks: the emitted text must
+; keep each key paired with its own value.
+mk: function [tag xs][
+    #[tag: tag items: xs size: size xs]
+]
+d: mk "nums" @[1 2 3]
+print d\tag
+print d\items
+print d\size
+
+; keys that are not bare identifiers
+ops: #["+": "add" "-": "sub" "*": "mul"]
+print ops\["+"]
+print ops\["-"]
+print key? ops "*"
+
+nested: #[inner: #[v: 41] label: "n"]
+print nested\inner\v
+print nested\label

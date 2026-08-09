@@ -23,12 +23,19 @@ kernel owns structure: scoping, control flow, application.
 
     arturo src/tests.art       # differential: host vs kernel vs compiled
     arturo src/smoke.art       # interpret mode
-    arturo src/bootstrap.art   # the compiler emits its own source to IR
+    arturo src/bootstrap.art   # the compiler compiles itself
 
 The harness runs every corpus program three ways — on the real
 `arturo`, through the kernel interpreter, and through the emitted
 IR rendered back to source and recompiled by the host. All three
 agree.
+
+The bootstrap goes one further. Stage 1 (the compiler in `src/`)
+emits stage 2, a self-contained compiler that runs on the donated
+VM with no access to `src/`. Stage 2 then renders every corpus
+program exactly as stage 1 did, and re-emits the compiler itself:
+stage 3 is byte-identical to stage 2. That fixpoint is the whole
+claim — the compiler reproduces itself.
 
 ## Files
 
@@ -39,6 +46,12 @@ agree.
     src/tests.art     the differential harness
     corpus/           one program per rule, then compositions
 
-Host quirk, stated plainly: Arturo 0.10.0's value-stack bug
-contaminates deep recompiled walks. The corpus round-trip doesn't
-care. Read `SPEC.md` for the full design.
+Known limits, stated plainly: the emitted code names builtins as
+prefix words (`x * 2` becomes `mul x 2`), so a program that also
+binds a variable called `mul` will have the emitted call captured
+by it — the compiler needs output hygiene it does not yet have.
+The kernel does not model mutation through a path reference
+(`pop 'c\stack`) or a nested path assignment (`d\a\b: v`); both
+work on the host and through `-c`, so the compiler bootstraps,
+but interpret mode diverges on them. Read `SPEC.md` for the full
+design and `corpus/m1/RESULTS.md` for the pinned host behavior.

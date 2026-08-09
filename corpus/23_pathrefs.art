@@ -1,0 +1,14 @@
+; paths: reading through `\`, assigning through `\`, and index
+; segments — plus `( ... )` grouping, which must survive the
+; round-trip as a group and not as a block literal.
+c: #[stack: @[10 20 30] n: 0]
+print c\stack\1
+c\n: (2 + 3) * 2
+print c\n
+print (size c\stack) + c\n
+i: 2
+print c\stack\[i]
+
+
+d: #[inner: #[v: 41]]
+print d\inner\v

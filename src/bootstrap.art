@@ -12,15 +12,19 @@
 ;   3. Emits each compiler source file to IR — the compiler
 ;      compiles its own source — and reports the counts.
 ;   4. Renders the self-contained compiler's own source
-;      back to text and checks the result parses on the
-;      donated VM (a first-order self-host check).
-;
-; Stage 3 (native binary recompiling itself) is the same
-; emit -> print -> -c loop the differential harness runs on
-; every corpus program.
+;      back to text — stage 2, a compiler that runs on the
+;      donated VM with no access to src/.
+;   5. Runs stage 2 over every corpus program and checks it
+;      agrees with stage 1 everywhere.
+;   6. Runs stage 2 over the compiler's own source. Stage 3
+;      comes back byte-identical to stage 2: the fixpoint.
 ;=======================================================
 
 import ./"backend.art"
+
+; the corpus, in a fixed order, as source text — so stage 1
+; and stage 2 walk exactly the same list
+CORPUS_LIST: "sort select list.relative \"corpus\" 'f -> contains? f \".art\""
 
 buildSelfCompiler: function [][
     out: @[]
@@ -37,13 +41,30 @@ buildSelfCompiler: function [][
     joinWith out "\n"
 ]
 
+;-----------------------------------------------
+; The two `main`s appended to the emitted compiler to make
+; it a runnable stage-2 program: one renders the corpus,
+; one renders the compiler's own source.
+;-----------------------------------------------
+CORPUS_MAIN: "\nloop " ++ CORPUS_LIST ++ " [fx][ print renderProgram read (\"corpus/\" ++ fx) ]\n"
+SELF_MAIN: "\nprint renderProgram read \"tmp/selfcompiler.art\"\n"
+
+corpusFiles: do CORPUS_LIST
+
+; what stage 1 makes of the corpus, in the same order
+renderCorpus: function [][
+    out: @[]
+    loop corpusFiles [f][ addItem out (renderProgram read "corpus/" ++ f) ]
+    joinWith out "\n"
+]
+
 go: function [][
     print "== M6 bootstrap: the compiler compiles itself =="
 
     print "step 1: build the self-contained compiler source"
+    execute "mkdir -p tmp"
     selfSrc: buildSelfCompiler
     write selfSrc "tmp/selfcompiler.art"
-    execute "mkdir -p tmp"
     print "self-contained compiler bytes:"
     print (to :string (size selfSrc))
 
@@ -81,9 +102,30 @@ go: function [][
     if :error <> type err [
         print "  YES"
     ]
-    print "note: the fully recompiled compiler executes simple"
-    print "programs, but the host's value-stack contamination"
-    print "(M1 RESULTS, 0.10.0) breaks deep recompiled walks."
-    print "The corpus round-trip is the authoritative validation."
+    print "step 5: the recompiled compiler compiles the corpus"
+    ; stage 2 is the compiler that stage 1 emitted. It runs on
+    ; the donated VM with no access to src/ — if it renders every
+    ; corpus program exactly as stage 1 did, the emitted compiler
+    ; and its source are the same compiler.
+    write selfArt ++ CORPUS_MAIN "tmp/stage2_corpus.art"
+    stage2: execute "arturo --no-color tmp/stage2_corpus.art 2>&1"
+    stage1: renderCorpus
+    print "corpus programs rendered:"
+    print (to :string (size corpusFiles))
+    print "stage 2 agrees with stage 1 on all of them:"
+    if stage1 = strip stage2 [ print "  YES" ]
+    if stage1 <> strip stage2 [ print "  NO" ]
+
+    print "step 6: the recompiled compiler recompiles the compiler"
+    ; the deep walk: stage 2 emits stage 3 from the same source
+    ; stage 1 read. Identical text is the bootstrap fixpoint —
+    ; the compiler has reproduced itself.
+    write selfArt ++ SELF_MAIN "tmp/stage2_self.art"
+    stage3: strip execute "arturo --no-color tmp/stage2_self.art 2>&1"
+    print "stage 3 bytes:"
+    print (to :string (size stage3))
+    print "stage 3 is byte-identical to stage 2 (fixpoint):"
+    if stage3 = strip selfArt [ print "  YES" ]
+    if stage3 <> strip selfArt [ print "  NO" ]
 ]
 go

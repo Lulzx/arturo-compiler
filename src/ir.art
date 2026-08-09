@@ -74,6 +74,14 @@ renderValue: function [v][
         return "'" ++ n
     ]
     if :symbol = t -> return to :string v
+    if :pathliteral = t [
+        ; `'c\stack` — a reference, not a value: it must survive
+        ; to the output verbatim, because the builtins that take
+        ; one (`pop`, `append`, `insert`, `set`) mutate through
+        ; it. Falling off the end of renderValue emitted `null`,
+        ; so `pop 'c\stack` came back as `pop null`.
+        return "'" ++ (renderPathParts (to :block v))
+    ]
     if :label = t -> return (to :string v) ++ ":"
     if :block = t [
         parts: @[]
@@ -81,8 +89,13 @@ renderValue: function [v][
         return "[" ++ (joinWith parts " ") ++ "]"
     ]
     if :inline = t [
-        inner: to :block v
-        return "(" ++ (renderValue inner) ++ ")"
+        ; an inline is a group, not a block value: render its
+        ; elements bare inside the parens. Going through the
+        ; :block arm would emit `([a b])` — a block literal in
+        ; parens — instead of the grouped expression `(a b)`.
+        parts: @[]
+        loop (to :block v) [el][ addItem parts (renderValue el) ]
+        return "(" ++ (joinWith parts " ") ++ ")"
     ]
     if :path = t [
         n: buildPathGet (to :block v)
@@ -97,23 +110,59 @@ renderValue: function [v][
     null
 ]
 
+; [base seg seg ...] -> `base\seg\seg`. Segments print bare
+; (a `:literal` segment is a field name, not a quoted value);
+; a `:block` segment keeps its brackets (`c\[i]`).
+renderPathParts: function [parts][
+    out: @[]
+    loop parts [p][
+        if :block = type p -> addItem out (renderValue p)
+        if :block <> type p -> addItem out (to :string p)
+    ]
+    joinWith out "\\"
+]
+
 renderRange: function [v][
     ; best-effort: range value as `from .. to`
     "range"
 ]
 
+; Dictionaries are rendered as the host's own `#["k": v ...]`
+; literal — see the note above ir2artCall for why nothing else
+; works. Keys the host mis-compiles are handled the same way.
 renderDict: function [v][
     parts: @[]
+    flat: @[]
+    safe: true
     loop v [k val][
-        addItem parts ((to :string k) ++ ":")
+        ks: to :string k
+        if not? safeDictKey? ks -> safe: false
+        addItem parts ("\"" ++ (escapeString ks) ++ "\":")
         addItem parts (renderValue val)
+        addItem flat ("\"" ++ (escapeString ks) ++ "\"")
+        addItem flat (renderValue val)
     ]
+    if not? safe -> return "to :dictionary [" ++ (joinWith flat " ") ++ "]"
     "#[" ++ (joinWith parts " ") ++ "]"
 ]
 
 ;-----------------------------------------------
 ; IR -> source text
 ;-----------------------------------------------
+; a dict key the host will accept as a quoted label under `-c`
+DICT_KEY_CHARS: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_?"
+DICT_KEY_HEAD: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+
+safeDictKey?: function [k][
+    if empty? k -> return false
+    if not? contains? DICT_KEY_HEAD (to :string k\0) -> return false
+    ok: true
+    loop k [ch][
+        if not? contains? DICT_KEY_CHARS (to :string ch) -> ok: false
+    ]
+    ok
+]
+
 ir2artSeq: function [seq][
     parts: @[]
     loop seq [n][ addItem parts (ir2art n) ]
@@ -174,13 +223,57 @@ ir2art: function [node][
     renderValue node
 ]
 
-ir2artCall: function [node][
-    ; dict construction: render as `to :dictionary [k v ...]`
-    if and? (isIR node\fn) ["load" = node\fn\op] [
-        if "makeDict" = node\fn\name [
-            jt: ir2artSeq node\args
-            return "to :dictionary [" ++ jt ++ "]"
+; dict construction. Three candidate renderings, and the host
+; rules out two of them:
+;
+;   to :dictionary [k v ...]   the elements are regrouped when
+;     `to` evaluates them, and a value that is itself a block
+;     re-pairs against the following key — `#[body: emitSeq ...]`
+;     came back holding the wrong field.
+;   to :dictionary @[k v ...]  pairs correctly, but `@[...]`
+;     freezes a nested `@[]`, so a field meant to be an empty,
+;     growable block ends up a readonly constant.
+;   #["k": v ...]              correct on both counts. Only
+;     catch: the host mis-compiles operator-like keys under `-c`
+;     (`#["+": "add"]` -> a `let` arity error).
+;
+; So: `#[...]` whenever every key is a plain identifier, and the
+; flat form otherwise. The one dict with operator keys is
+; INFIX_SYMBOLS, whose values are all strings — no block values,
+; so the regrouping bug cannot bite there.
+ir2artDict: function [args][
+    labelled: @[]
+    flat: @[]
+    safe: true
+    j: 0
+    while [j < size args][
+        kn: args\[j]
+        ks: null
+        if isIR kn [
+            if "const" = kn\op [
+                if :string = type kn\value -> ks: kn\value
+            ]
         ]
+        if null? ks -> safe: false
+        if not? null? ks [
+            if not? safeDictKey? ks -> safe: false
+            addItem labelled ("\"" ++ (escapeString ks) ++ "\":")
+        ]
+        addItem flat (ir2art kn)
+        if (j + 1) < size args [
+            vt: ir2art args\[j + 1]
+            addItem labelled vt
+            addItem flat vt
+        ]
+        j: j + 2
+    ]
+    if not? safe -> return "to :dictionary [" ++ (joinWith flat " ") ++ "]"
+    "#[" ++ (joinWith labelled " ") ++ "]"
+]
+
+ir2artCall: function [node][
+    if and? (isIR node\fn) ["load" = node\fn\op] [
+        if "makeDict" = node\fn\name -> return ir2artDict node\args
     ]
     fnText: ir2art node\fn
     argsText: @[]
