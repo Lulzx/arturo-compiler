@@ -418,6 +418,12 @@ foldNode: function [node][
                 loop fa [a][ if not? isConstNode a -> allConst: false ]
                 if allConst [
                     res: runIR @[#[op: "call" fn: ff args: fa]]
+                    ; an error is not a value. `div 10 0` aborts the
+                    ; host at runtime; folding it into a const would
+                    ; make the compiled program print an error node
+                    ; and carry on. Leave the call unfolded so the
+                    ; runtime raises the same error the host does.
+                    if isErrorNode res -> return #[op: "call" fn: ff args: fa]
                     return #[op: "const" value: res]
                 ]
             ]

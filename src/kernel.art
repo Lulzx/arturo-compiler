@@ -65,6 +65,15 @@ isNode: function [node][
     key? node "nodek"
 ]
 
+; an evaluation that failed. `delegate` returns these instead of
+; letting the host panic propagate, so any consumer that has to
+; tell a failed evaluation apart from a value — the constant
+; folder above all — checks for one.
+isErrorNode: function [node][
+    if not? isNode node -> return false
+    "error" = node\nodek
+]
+
 isIR: function [node][
     if :dictionary <> type node -> return false
     key? node "op"
