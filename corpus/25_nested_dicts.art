@@ -1,0 +1,25 @@
+; nested dictionary literals, including keys that name builtins.
+;
+; A `#[...]` value inside another `#[...]` used to come back out
+; as `do [#[...]]`. That wrapper is an ordinary word lookup, so a
+; sibling key called `do` captured it and every later value in the
+; literal was built from the wrong thing.
+d: #["a": #["v": 1] "b": #["v": 2]]
+print d\a\v
+print d\b\v
+
+; the capture case: a key named after the builtin the wrapper used
+t: #["do": #["v": 10] "next": #["v": 20] "last": #["v": 30]]
+print t\do\v
+print t\next\v
+print t\last\v
+
+; three deep, to make sure the recursion is not one level only
+deep: #["x": #["y": #["z": 7]]]
+print deep\x\y\z
+
+; a nested literal alongside plain values and an evaluated block
+mix: #["name": "m" "inner": #["k": 5] "items": @[1 2]]
+print mix\name
+print mix\inner\k
+print size mix\items

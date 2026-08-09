@@ -330,6 +330,17 @@ pathRefArg: function [args][
     found
 ]
 
+; is this call's callee a builtin declared to write through one of
+; its arguments? A dynamic callee — anything that is not a direct
+; load of a known builtin name — cannot be asked, so it is treated
+; as not writing back, which is what the host does with a user
+; function: it receives a value, not a reference.
+writesThroughRef?: function [fnNode][
+    if not? isIR fnNode -> return false
+    if "load" <> fnNode\op -> return false
+    mutatesThroughRef? fnNode\name
+]
+
 ir2artRefCall: function [node idx][
     REF_SEQ\n: REF_SEQ\n + 1
     tmp: "_ref" ++ (to :string REF_SEQ\n)
@@ -349,7 +360,13 @@ ir2artCall: function [node][
     if and? (isIR node\fn) ["load" = node\fn\op] [
         if "makeDict" = node\fn\name -> return ir2artDict node\args
     ]
-    refIdx: pathRefArg node\args
+    ; the shim is only for calls that actually write back. Before
+    ; the intrinsic database there was no way to ask, so any call
+    ; carrying a path argument got wrapped — `call 'handlers\ok x`
+    ; and `info 'obj\field` included, neither of which mutates
+    ; anything. Now the callee's own declaration decides.
+    refIdx: 0 - 1
+    if writesThroughRef? node\fn -> refIdx: pathRefArg node\args
     if refIdx >= 0 -> return ir2artRefCall node refIdx
     fnText: ir2art node\fn
     argsText: @[]

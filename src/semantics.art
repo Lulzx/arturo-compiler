@@ -1,0 +1,30 @@
+;=======================================================
+; semantics.art — what the compiler knows that Arturo
+; does not declare.
+;
+; src/intrinsics.art is generated: every fact in it is a
+; fact the language implementation states about itself.
+; This file is the opposite — the small set of judgements
+; the compiler has to make on its own, kept separate so
+; that the generated half stays trustworthy.
+;
+; Keep it small. Anything that grows here is a candidate
+; for being derived instead.
+;=======================================================
+
+;-----------------------------------------------
+; Builtins that accept a :pathliteral but do not write
+; through it.
+;
+; PathLiteral in an argument's type set means "this may be
+; handed a path reference". For 100-odd builtins that is
+; exactly the in-place write — `append`, `inc`, `insert`.
+; For these two it is a lookup: they resolve the path and
+; read it. Wrapping their calls in the reference shim would
+; be harmless but pointless, and it would put a `do [...]`
+; around an expression that never needed one.
+;-----------------------------------------------
+NOT_MUTATING: #[
+    "call": true      ; resolves the path to the function to invoke
+    "info": true      ; resolves the path to describe what is there
+]

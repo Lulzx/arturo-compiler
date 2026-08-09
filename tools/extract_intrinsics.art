@@ -1,0 +1,293 @@
+;=======================================================
+; extract_intrinsics.art — generate src/intrinsics.art from
+; Arturo's own builtin declarations.
+;
+; Everything the compiler needs to know about a primitive is
+; already declared in the language implementation:
+;
+;     builtin "append",
+;         alias       = doubleplus,
+;         rule        = InfixPrecedence,
+;         args        = {
+;             "collection": {String, ..., Literal, PathLiteral},
+;             "value"     : {Any}
+;         },
+;
+; from which:
+;   arity   = number of entries in `args`
+;   alias   = the glyph `doubleplus` names in vsymbol.nim ("++")
+;   infix?  = rule is InfixPrecedence
+;   ref?    = the argument accepts Literal: it is handed a NAME
+;   mut?    = the argument accepts PathLiteral: it is written
+;             back through
+;
+; Those last two are not the same thing, and conflating them
+; would be a bug. `function` and `loop` take Literal parameters —
+; they bind a name, they do not write through it. PathLiteral is
+; the one that means in-place mutation: `append`, `insert`,
+; `inc`, `add` and 100-odd others accept a path reference and
+; write to the container it names.
+;
+; Which primitives mutate through a reference was reverse-
+; engineered here from host crashes. It is declared upstream,
+; per argument, for every builtin.
+;
+; Purity is deliberately NOT extracted. Arturo does not declare
+; it, so deriving it here would mean replacing a handwritten
+; table with a generated table of guesses. It stays compiler-
+; owned, in src/semantics.art.
+;
+; Usage:  arturo tools/extract_intrinsics.art [path-to-arturo-checkout]
+;=======================================================
+
+upstream: "../arturo"
+if 0 < size arg -> upstream: arg\0
+
+libDir: upstream ++ "/src/library"
+symFile: upstream ++ "/src/vm/values/custom/vsymbol.nim"
+
+;-----------------------------------------------
+; addItem — `append` flattens block values, so insert instead.
+;-----------------------------------------------
+addItem: function [c v][ insert 'c (size c) v ]
+
+;-----------------------------------------------
+; the text between the first two double quotes of a line
+;-----------------------------------------------
+; split, not slice+size: `size` and `slice` disagree about
+; multi-byte characters on this host, so index arithmetic over a
+; line holding a glyph like `∧` overshoots by a byte and drags the
+; closing quote into the result. The alias table is exactly where
+; the non-ASCII lives, so this is not a hypothetical.
+quoted: function [s][
+    parts: split.by:"\"" s
+    if 2 > size parts -> return null
+    parts\1
+]
+
+; right-hand side of `key = value`, stripped of a trailing comma
+rhs: function [s][
+    i: index s "="
+    if null? i -> return ""
+    v: strip slice s (i + 1) (size s) - 1
+    if suffix? v "," -> v: slice v 0 (size v) - 2
+    strip v
+]
+
+; does this line open a `key = ...` field of the builtin macro?
+field?: function [s k][
+    if not? prefix? s k -> return false
+    rest: strip slice s (size k) (size s) - 1
+    prefix? rest "="
+]
+
+; same helper the compiler carries in src/ir.art — the host has no
+; `joinWith`, and `join.with:` is not in 0.10.0's core either.
+joinWith: function [parts sep][
+    out: ""
+    isFirst: true
+    loop parts [p][
+        if not? isFirst -> out: out ++ sep
+        out: out ++ (to :string p)
+        isFirst: false
+    ]
+    out
+]
+
+countChar: function [s c][
+    n: 0
+    loop s [ch][ if c = to :string ch -> n: n + 1 ]
+    n
+]
+
+;-----------------------------------------------
+; 1. the symbol glyph table: `doubleplus = "++"`
+;-----------------------------------------------
+GLYPH: #[]
+inEnum: false
+loop read.lines symFile [line][
+    s: strip line
+    if contains? s "VSymbol* = enum" -> inEnum: true
+    if inEnum [
+        if and? (contains? s "=") [not? prefix? s "#"] [
+            nm: strip slice s 0 (index s "=") - 1
+            g: quoted s
+            if and? (0 < size nm) [not? null? g] [ GLYPH\[nm]: g ]
+        ]
+    ]
+    if "unaliased" = s -> inEnum: false
+]
+
+;-----------------------------------------------
+; 2. the builtins
+;-----------------------------------------------
+NAMES: @[]        ; declaration order, for a stable diff
+ARITY: #[]
+ALIAS: #[]
+INFIX: #[]
+REFS:  #[]        ; name -> per-argument: does it take a name?
+MUTS:  #[]        ; name -> per-argument: is it written back through?
+
+cur: ""
+inArgs: false
+depth: 0
+argIx: 0
+curRefs: @[]
+curMuts: @[]
+
+files: sort select list.relative libDir 'f -> suffix? f ".nim"
+
+loop files [fx][
+    cur: ""
+    inArgs: false
+    depth: 0
+    argIx: 0
+    loop read.lines (libDir ++ "/" ++ fx) [line][
+        s: strip line
+
+        if prefix? s "builtin \"" [
+            nm: quoted s
+            cur: nm
+            inArgs: false
+            depth: 0
+            argIx: 0
+            curRefs: @[]
+            curMuts: @[]
+            addItem NAMES nm
+            ARITY\[nm]: 0
+            ALIAS\[nm]: ""
+            INFIX\[nm]: false
+            REFS\[nm]: @[]
+            MUTS\[nm]: @[]
+        ]
+
+        if 0 < size cur [
+            if not? inArgs [
+                if field? s "alias" [
+                    a: rhs s
+                    ; `intersection` and `union` name their glyph as
+                    ; `VSymbol.intersection` — the enum member collides
+                    ; with the builtin, so those two lines qualify it.
+                    ; Unqualified lookup silently missed exactly the
+                    ; two symbols whose alias needed disambiguating.
+                    if prefix? a "VSymbol." -> a: replace a "VSymbol." ""
+                    if key? GLYPH a -> ALIAS\[cur]: GLYPH\[a]
+                ]
+                if field? s "rule" [
+                    if "InfixPrecedence" = rhs s -> INFIX\[cur]: true
+                ]
+                if field? s "args" [
+                    v: rhs s
+                    ; `args = NoArgs` — nullary; `args = {` — open the set.
+                    ; depth stays 0 here: the shared counter below runs on
+                    ; this same line and takes the opening brace into
+                    ; account, so counting it twice would put every
+                    ; argument one level deeper than the test expects.
+                    if contains? v "{" [
+                        inArgs: true
+                        depth: 0
+                    ]
+                ]
+            ]
+            ; inside the args set: a line starting with a quote at
+            ; depth 1 is one argument. Its type set is that line's
+            ; own braces — verified: no arg's types span lines.
+            if inArgs [
+                ; accumulated in a local block, not appended straight
+                ; into REFS\[cur]: reading a collection back out of a
+                ; dictionary hands over a copy, so the write would be
+                ; made to a value nothing else can see.
+                if and? [1 = depth] [prefix? s "\""] [
+                    addItem curRefs (contains? s "Literal")
+                    addItem curMuts (contains? s "PathLiteral")
+                    argIx: argIx + 1
+                ]
+                ; the two counts go through temporaries on purpose.
+                ; Written inline as `depth + (countChar s "{") -
+                ; countChar s "}"`, the host mis-parses the second
+                ; call and hands `sub` a null — the same expression at
+                ; top level evaluates correctly, so it is the nesting
+                ; that breaks it. Probe: corpus/m1/e07.art.
+                opens: countChar s "{"
+                closes: countChar s "}"
+                depth: depth + opens - closes
+                if depth =< 0 [
+                    ARITY\[cur]: argIx
+                    REFS\[cur]: curRefs
+                    MUTS\[cur]: curMuts
+                    inArgs: false
+                ]
+            ]
+        ]
+    ]
+]
+
+;-----------------------------------------------
+; 3. render src/intrinsics.art
+;-----------------------------------------------
+rev: strip execute "git -C " ++ upstream ++ " rev-parse HEAD"
+ver: strip execute "arturo --version"
+
+boolStr: function [b][ (b)? -> "true" -> "false" ]
+
+out: @[]
+addItem out ";======================================================="
+addItem out "; intrinsics.art — GENERATED. Do not edit by hand."
+addItem out ";"
+addItem out "; Source of truth: Arturo's own builtin declarations."
+addItem out ";   generator: tools/extract_intrinsics.art"
+addItem out ";   upstream:  " ++ rev
+addItem out ";   host:      " ++ ver
+addItem out ";"
+addItem out "; Re-run the generator after moving to a new Arturo."
+addItem out "; `arity`, `alias` and `infix?` come straight from the"
+addItem out "; macro. The two per-argument flags are different"
+addItem out "; things and the difference matters:"
+addItem out ";"
+addItem out ";   refs — the argument accepts :literal, so it is given"
+addItem out ";          a NAME rather than a value. `function` and"
+addItem out ";          `loop` take their parameters this way; they"
+addItem out ";          bind, they do not write back."
+addItem out ";   muts — the argument accepts :pathliteral, which is"
+addItem out ";          the in-place write. `append`, `inc`, `add`"
+addItem out ";          and friends mutate the container the"
+addItem out ";          reference names."
+addItem out ";"
+addItem out "; Purity is not here: Arturo does not declare it. See"
+addItem out "; src/semantics.art."
+addItem out ";======================================================="
+addItem out ""
+addItem out "INTRINSICS: #["
+
+loop sort NAMES [nm][
+    rs: @[]
+    loop REFS\[nm] [r][ addItem rs (boolStr r) ]
+    ms: @[]
+    loop MUTS\[nm] [r][ addItem ms (boolStr r) ]
+    row: "    \"" ++ nm ++ "\": #[arity: " ++ (to :string ARITY\[nm])
+    row: row ++ " alias: \"" ++ ALIAS\[nm] ++ "\""
+    row: row ++ " infix?: " ++ (boolStr INFIX\[nm])
+    row: row ++ " refs: @[" ++ (joinWith rs " ") ++ "]"
+    row: row ++ " muts: @[" ++ (joinWith ms " ") ++ "]]"
+    addItem out row
+]
+
+addItem out "]"
+addItem out ""
+
+write (joinWith out "\n") "src/intrinsics.art"
+
+print "builtins extracted:"
+print to :string size NAMES
+print "with an infix alias:"
+n: 0
+loop NAMES [nm][ if INFIX\[nm] -> n: n + 1 ]
+print to :string n
+print "taking a reference argument:"
+n: 0
+loop NAMES [nm][
+    r: false
+    loop REFS\[nm] [b][ if b -> r: true ]
+    if r -> n: n + 1
+]
+print to :string n

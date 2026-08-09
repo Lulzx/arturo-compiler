@@ -1,0 +1,33 @@
+; a word of arity 0 is a leaf, not an open call.
+;
+; Opening a call frame for a nullary word parks a frame nothing
+; completes, and `->` ends its body when the call stack empties —
+; so the arrow ran on past its statement and ate the rest of the
+; block. Here that would fold the trailing statement into the
+; branch and give 101 instead of 103.
+bump: function [][ 100 ]
+
+r: 0
+i: 1
+while [i < 4][
+    i: i + 1
+    if i = 3 -> r: r + bump
+    r: r + 1
+]
+print r
+
+; the same shape written with an explicit block, as a control
+s: 0
+j: 1
+while [j < 4][
+    j: j + 1
+    if j = 3 [ s: s + bump ]
+    s: s + 1
+]
+print s
+
+; a nullary word standing alone, and as an argument
+print bump
+print add bump 1
+one: function [][ 1 ]
+print add one one

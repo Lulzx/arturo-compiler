@@ -33,49 +33,49 @@
 ;     symbols never become evaluator values.
 ;=======================================================
 
-;-----------------------------------------------
-; Infix symbols: symbol -> alias FUNCTION WORD NAME
-; (what the host's processBlock resolves the symbol to).
-; All binary. Pinned against the host's alias table
-; (InfixPrecedence). NOTE: `<=`, `==`, `!=` are NOT infix
-; in 0.10.0 — they are plain data (verified on the host).
-;-----------------------------------------------
-INFIX_SYMBOLS: #[
-    "+": "add"  "-": "sub"  "*": "mul"  "/": "div"  "//": "fdiv"
-    "%": "mod"  "^": "pow"  "/%": "divmod"
-    "++": "append"  "--": "remove"  "..": "range"
-    "=": "equal?"  "<>": "notEqual?"  "<": "less?"  ">": "greater?"
-    "=<": "lessOrEqual?"  ">=": "greaterOrEqual?"
-    "∧": "and?"  "∨": "or?"  "⊻": "xor?"
-    "∩": "intersection"  "∪": "union"
-    "??": "coalesce"
-]
+import ./"intrinsics.art"
+import ./"semantics.art"
 
 ;-----------------------------------------------
-; Builtin function word -> arity (pinned against the
-; args blocks in src/library/*.nim).
+; Builtin arity, infix aliases, and which builtins write
+; back through a reference — all three read off the
+; generated intrinsic database rather than maintained here.
+;
+; These used to be two hand-written tables, pinned by
+; reading src/library/*.nim by eye. That is a mirror of
+; another program's signatures, and mirrors drift: the
+; hand table had `chunk` at arity 2 (it takes three, like
+; `loop` and `map`) and was missing ten infix aliases,
+; among them `∈`, `⊆` and `⊼`, all of which the host does
+; group as infix. Both classes of error are silent — the
+; program still compiles, it just groups differently than
+; the host would.
+;
+;   BUILTIN_ARITY   name  -> number of declared arguments
+;   INFIX_SYMBOLS   glyph -> the function word it denotes
+;   MUTATES         name  -> writes through a reference arg
+;
+; MUTATES is the one that was hardest to come by. Which
+; builtins mutate in place was worked out here from host
+; crashes; it is declared upstream as `PathLiteral` in an
+; argument's type set, for every builtin, and has been all
+; along.
 ;-----------------------------------------------
-BUILTIN_ARITY: #[
-    "print": 1  "size": 1  "do": 1  "return": 1  "function": 2  "if": 2
-    "while": 2  "until": 2
-    "map": 3  "select": 3  "loop": 3  "fold": 3  "chunk": 2
-    "first": 1  "last": 1  "inc": 1  "dec": 1  "neg": 1
-    "not": 1  "not?": 1  "odd?": 1  "even?": 1  "null?": 1  "true?": 1
-    "false?": 1  "type": 1  "keys": 1  "values": 1
-    "to": 2  "range": 2  "add": 2  "sub": 2  "mul": 2  "div": 2
-    "fdiv": 2  "mod": 2  "pow": 2  "divmod": 2
-    "equal?": 2  "notEqual?": 2  "less?": 2  "greater?": 2
-    "lessOrEqual?": 2  "greaterOrEqual?": 2
-    "intersection": 2  "union": 2  "coalesce": 2
-    "and": 2  "or": 2  "xor": 2  "shl": 2  "shr": 2
-    "and?": 2  "or?": 2  "xor?": 2
-    "append": 2  "remove": 2  "repeat": 2  "pop": 1
-    "get": 2  "set": 3  "key?": 2  "contains?": 2
-    "empty?": 1  "insert": 3  "join": 1
-    "read": 1  "write": 2  "execute": 1  "exists?": 1  "list": 1
-    "min": 1  "max": 1
-    "switch": 3  "case": 2
+BUILTIN_ARITY: #[]
+INFIX_SYMBOLS: #[]
+MUTATES: #[]
+
+loop INTRINSICS [nm spec][
+    BUILTIN_ARITY\[nm]: spec\arity
+    if spec\infix? [
+        if 0 < size spec\alias -> INFIX_SYMBOLS\[spec\alias]: nm
+    ]
+    if not? key? NOT_MUTATING nm [
+        loop spec\muts [m][ if m -> MUTATES\[nm]: true ]
+    ]
 ]
+
+mutatesThroughRef?: function [name][ key? MUTATES name ]
 
 ;-----------------------------------------------
 ; Words the kernel handles lazily (kernel rules)
@@ -292,7 +292,23 @@ makeDictCall: function [ib][
             ; `@[a b]` value -> an evaluated block value
             atBlock: and? (n = 2) (and? (:symbol = type ib\[j + 1]) ["@" = to :string ib\[j + 1]])
             if atBlock -> addItem pairs (buildBlockVal ib\[j + 2])
-            if not? atBlock [
+            ; `#[k: v]` value -> a nested dictionary, lowered the
+            ; same way as the outer one.
+            ;
+            ; Without this it fell through to the generic
+            ; multi-element case below and came back out as
+            ; `do [#[...]]`. That wrapper is not inert: the emitted
+            ; `do` is an ordinary word lookup, so the moment a
+            ; preceding key in the same literal is itself called
+            ; `do` — as it is in the generated intrinsic table —
+            ; every later value evaluates `do` to that entry's
+            ; dictionary instead of the builtin, and the literal
+            ; silently fills with junk. Emitting the nested literal
+            ; directly has no such hazard, and the host accepts it
+            ; interpreted and under `-c` alike.
+            hashBlock: and? (n = 2) (and? (:symbol = type ib\[j + 1]) ["#" = to :string ib\[j + 1]])
+            if hashBlock -> addItem pairs (makeDictCall to :block ib\[j + 2])
+            if and? (not? atBlock) [not? hashBlock] [
                 if n = 1 [
                     v: ib\[j + 1]
                     if :word = type v -> addItem pairs (loadNode (to :string v))
@@ -518,8 +534,34 @@ lowerWalk: function [blok start stopAtRoot][
                 if name <> "false" [
                     if name <> "null" [
                         ar: arityOf name
-                        if ar >= 0 [
+                        ; A word of arity 0 consumes no operands, so
+                        ; it is a leaf: opening a call frame for it
+                        ; parks a frame that nothing will ever
+                        ; complete. The walk only rewinds after an
+                        ; argument lands, so the frame sits on the
+                        ; stack, and anything that watches for the
+                        ; stack to empty — `->`, whose body ends
+                        ; exactly there — runs past its end. `if x
+                        ; -> break` swallowed the remaining twelve
+                        ; statements of its block that way.
+                        ;
+                        ; It only surfaced once the generated table
+                        ; brought the nullary builtins in with it;
+                        ; before, `break` was simply unknown and
+                        ; took this same leaf path by accident.
+                        ; It stays a CALL, though — with no
+                        ; arguments, completed on the spot. A load
+                        ; would hand back the closure instead of
+                        ; invoking it, which is the difference
+                        ; between `f` printing 100 and printing a
+                        ; function value.
+                        if ar > 0 [
                             descendCall ctx (loadNode name) ar
+                        ]
+                        if ar = 0 [
+                            rewind ctx
+                            tryInfix ctx
+                            appendValue ctx (callNode (loadNode (emitName name)) @[])
                         ]
                         if ar < 0 [
                             rewind ctx
