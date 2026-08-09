@@ -1,0 +1,9 @@
+; arrows — $ sigil, => expansion, -> single-expression body
+f: $[x][x + 2]
+print f 10
+g: function [x] -> x + 1
+print g 41
+print map [1 2 3] => [& + 10]
+h: $[a b][a - b]
+print h 10 4
+print map [1 2 3] 'x [x * 3]

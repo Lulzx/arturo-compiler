@@ -1,0 +1,3 @@
+; M1 c04 — map with a literal param word
+print "== c04"
+print map [1 2 3] 'x [x * 2]

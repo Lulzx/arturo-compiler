@@ -1,0 +1,11 @@
+; while — kernel rule, lazy, kernel-state mutation
+j: 0
+total: 0
+while [j < 5][
+    total: total + j
+    j: j + 1
+]
+print total
+k: 10
+while [k > 0][k: k - 1]
+print k

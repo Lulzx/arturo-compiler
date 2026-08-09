@@ -1,0 +1,3 @@
+; M1 e05 — nested returns: print print 5
+print "== e05"
+print print 5

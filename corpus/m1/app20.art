@@ -1,0 +1,4 @@
+; M1 app20 — function value in expression position
+print "== app20"
+f: function [x][x * 2]
+print f

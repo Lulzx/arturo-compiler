@@ -1,0 +1,3 @@
+; M1 e01 — or? is lazy: right block not evaluated when left true
+print "== e01"
+print true or? [1 / 0]

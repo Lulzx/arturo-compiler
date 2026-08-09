@@ -1,0 +1,3 @@
+; M1 app01 — basic single-argument call
+print "== app01"
+print 1

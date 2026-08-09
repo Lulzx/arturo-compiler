@@ -1,0 +1,3 @@
+; M1 d03 — parens as inline grouping
+print "== d03"
+print 2 * (1 + 3)

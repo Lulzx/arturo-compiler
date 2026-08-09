@@ -1,0 +1,3 @@
+; M1 app12 — print arity: one arg or two?
+print "== app12"
+print "a" "b"

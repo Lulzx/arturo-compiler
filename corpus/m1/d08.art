@@ -1,0 +1,4 @@
+; M1 d08 — a function call nested inside infix operand
+print "== d08"
+add: function [a b][a + b]
+print 10 - add 1 2 - 3

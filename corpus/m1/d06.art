@@ -1,0 +1,4 @@
+; M1 d06 — do returns last value even when earlier values linger
+print "== d06"
+b: [1 2 3]
+print do b

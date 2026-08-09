@@ -1,0 +1,4 @@
+; M1 b01 — precedence: all infix share one precedence
+; ast.nim trace predicts: *(2, +(3,4)) = 14
+print "== b01"
+print 2 * 3 + 4

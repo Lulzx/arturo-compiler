@@ -1,0 +1,4 @@
+; M1 d04 — and/or infix, laziness
+print "== d04"
+print true and false
+print false and 1 = 1

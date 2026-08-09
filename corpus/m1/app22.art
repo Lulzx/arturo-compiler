@@ -1,0 +1,3 @@
+; M1 app22 — loop with implicit current value
+print "== app22"
+loop 1 5 [print &]

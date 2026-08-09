@@ -1,0 +1,4 @@
+; M1 app08 — block argument to if (lazy)
+print "== app08"
+if true [print "yes"]
+print "done"

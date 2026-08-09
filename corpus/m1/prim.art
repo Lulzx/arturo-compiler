@@ -1,0 +1,12 @@
+; prim 1 — delegation via to :word + do
+w: to :word "print"
+do @[w 7]
+; prim 2 — literal construction
+l: to :literal "_0"
+print ["type:" type l "value:" l]
+; prim 3 — block building with a word inside
+b: @[w 1 2]
+do b
+; prim 4 — can do a block whose first element is a symbol tag?
+c: @['call 'load "x"]
+print type c

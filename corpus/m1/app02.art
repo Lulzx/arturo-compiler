@@ -1,0 +1,4 @@
+; M1 app02 — the spec's worked example
+print "== app02"
+add: function [a b][a + b]
+print add 3 4

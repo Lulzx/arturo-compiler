@@ -1,0 +1,44 @@
+;=======================================================
+; tests.art — the differential harness (corpus driver)
+;
+; host(P)      — run P on the real `arturo`        (authority)
+; kernel(P)    — run P through kernel interpret mode (model)
+; compiled(P)  — emit(P) -> fold -> print -> host   (product)
+; runIR(P)     — emit(P) -> fold -> runIR           (product, v0)
+;
+; Each engine runs P in its own process; the four stdout
+; streams must agree. Each test also runs in its own
+; process (see one_test.art) so the host's value-stack
+; contamination cannot spread between tests.
+;=======================================================
+
+go: function [][
+    passed: 0
+    failed: 0
+    if 0 < size args\values [
+        ; single file
+        out: execute ("arturo --no-color src/one_test.art " ++ args\values\0 ++ " 2>&1")
+        if contains? out "OK" -> passed: passed + 1
+        if not? contains? out "OK" -> failed: failed + 1
+    ]
+    if 0 >= size args\values [
+        ; whole corpus
+        files: list "corpus"
+        loop files [f][
+            if f <> "corpus/m1" [
+                out: execute ("arturo --no-color src/one_test.art " ++ f ++ " 2>&1")
+                if contains? out "OK" -> passed: passed + 1
+                if not? contains? out "OK" -> failed: failed + 1
+                print f
+                if contains? out "OK" -> print "  PASS"
+                if not? contains? out "OK" -> print "  FAIL"
+            ]
+        ]
+    ]
+    print "----------------"
+    print "passed:"
+    print passed
+    print "failed:"
+    print failed
+]
+go

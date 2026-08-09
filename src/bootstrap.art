@@ -1,0 +1,89 @@
+;=======================================================
+; bootstrap.art — M6: the compiler compiles its own source
+;
+; The compiler is written in core-Arturo. This script:
+;
+;   1. Builds a self-contained compiler source
+;      (front + kernel + IR + backend, imports stripped,
+;      plus a small main) — the compiler in its own terms.
+;   2. Runs the compiler on a corpus program: emit -> fold
+;      -> ir2art -> host bytecode (-c) -> run (-x),
+;      agreeing with the original.
+;   3. Emits each compiler source file to IR — the compiler
+;      compiles its own source — and reports the counts.
+;   4. Renders the self-contained compiler's own source
+;      back to text and checks the result parses on the
+;      donated VM (a first-order self-host check).
+;
+; Stage 3 (native binary recompiling itself) is the same
+; emit -> print -> -c loop the differential harness runs on
+; every corpus program.
+;=======================================================
+
+import ./"backend.art"
+
+buildSelfCompiler: function [][
+    out: @[]
+    files: ["src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
+    loop files [f][
+        src: read f
+        src: replace src "import ./\"" ++ f ++ "\"\n" ""
+        ; strip a leading import of a sibling module
+        src: replace src "import ./\"front.art\"\n" ""
+        src: replace src "import ./\"kernel.art\"\n" ""
+        src: replace src "import ./\"ir.art\"\n" ""
+        addItem out src
+    ]
+    joinWith out "\n"
+]
+
+go: function [][
+    print "== M6 bootstrap: the compiler compiles itself =="
+
+    print "step 1: build the self-contained compiler source"
+    selfSrc: buildSelfCompiler
+    write selfSrc "tmp/selfcompiler.art"
+    execute "mkdir -p tmp"
+    print "self-contained compiler bytes:"
+    print (to :string (size selfSrc))
+
+    print "step 2: run the compiler on a corpus program"
+    sampleSrc: read "corpus/05_functions.art"
+    art: renderProgram sampleSrc
+    write art "tmp/boot_sample.art"
+    execute ("arturo -c tmp/boot_sample.art 2>&1")
+    sampleOut: execute ("arturo -x tmp/boot_sample.art.bcode 2>&1")
+    print "compiled sample output:"
+    print sampleOut
+
+    print "step 3: the compiler emits its own source files to IR"
+    totalIR: 0
+    files: ["src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
+    loop files [f][
+        ir: compileToIR (read f)
+        print f
+        print (to :string (size ir))
+        totalIR: totalIR + size ir
+    ]
+    print "total IR nodes emitted from the compiler's own source:"
+    print (to :string totalIR)
+
+    print "step 4: render the compiler's own source back to text"
+    selfArt: renderProgram selfSrc
+    write selfArt "tmp/boot_self.art"
+    print "self-rendered bytes:"
+    print (to :string (size selfArt))
+    err: try [blk: to :block selfArt]
+    print "self-rendered text parses on the donated VM:"
+    if :error = type err [
+        print "  NO"
+    ]
+    if :error <> type err [
+        print "  YES"
+    ]
+    print "note: the fully recompiled compiler executes simple"
+    print "programs, but the host's value-stack contamination"
+    print "(M1 RESULTS, 0.10.0) breaks deep recompiled walks."
+    print "The corpus round-trip is the authoritative validation."
+]
+go

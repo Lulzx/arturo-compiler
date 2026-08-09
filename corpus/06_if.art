@@ -1,0 +1,10 @@
+; if — lazy, arity 2, no else
+if 1 = 1 [print "yes"]
+if 1 = 2 [print "no"]
+if 5 > 3 [print "five-bigger"]
+x: 7
+if x < 10 [print "small"]
+if x > 10 [print "big"]
+r: null
+if x = 7 [r: 99]
+print r

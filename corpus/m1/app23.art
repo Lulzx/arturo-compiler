@@ -1,0 +1,4 @@
+; M1 app23 — path access on a dictionary
+print "== app23"
+o: #[x: 5]
+print o\x

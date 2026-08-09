@@ -1,0 +1,4 @@
+; M1 app24 — statement sequencing
+print "== app24"
+print "one"
+print "two"

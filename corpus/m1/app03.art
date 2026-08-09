@@ -1,0 +1,3 @@
+; M1 app03 — operator in prefix position
+print "== app03"
+print 1 + 2

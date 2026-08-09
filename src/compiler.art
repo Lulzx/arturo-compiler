@@ -1,0 +1,33 @@
+;=======================================================
+; compiler.art — the compiler entry point (M6 stage 1)
+;
+;   arturo src/compiler.art <in.art> <out.art>
+;     reads a program, emits IR, folds, renders back to
+;     core-Arturo text, writes <out.art>.
+;
+;   arturo src/compiler.art <in.art> <out.art> -c
+;     additionally compiles <out.art> to bytecode via the
+;     donated VM (`arturo -c`) and runs it.
+;=======================================================
+
+import ./"backend.art"
+
+compileFile: function [inPath outPath][
+    src: read inPath
+    art: renderProgram src
+    write art outPath
+    print outPath
+    art
+]
+
+go: function [][
+    if 0 < size args\values [
+        inPath: args\values\0
+        outPath: args\values\1
+        compileFile inPath outPath
+    ]
+    if 0 >= size args\values [
+        print "usage: arturo src/compiler.art <in.art> <out.art>"
+    ]
+]
+go

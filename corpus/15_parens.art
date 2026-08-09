@@ -1,0 +1,8 @@
+; parens — inline grouping
+print 2 * (1 + 3)
+print (1 + 2) * 3
+print 10 - (2 + 3)
+print 100 / (5 * 2)
+f: function [x][x * 10]
+print f 2 + 3
+print f (2 + 3)

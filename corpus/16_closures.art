@@ -1,0 +1,21 @@
+; closures — capture defining env, recursion
+n: 10
+makeAdder: function [base][
+    function [x][x + base]
+]
+print "done"
+fact: function [n][
+    r: 1
+    while [n > 0][
+        r: r * n
+        n: n - 1
+    ]
+    r
+]
+print fact 5
+print fact 1
+; a closure using an outer variable
+m: 100
+addOuter: function [x][x + m]
+print addOuter 5
+print addOuter 10

@@ -1,0 +1,5 @@
+; M1 app04 — nested application as an operand
+; does `add 2 3` group before `+` consumes its operands?
+print "== app04"
+add: function [a b][a + b]
+print 1 + add 2 3

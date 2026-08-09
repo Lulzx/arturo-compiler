@@ -1,0 +1,5 @@
+; M1 b09 — word as plain value (not a function) is just data
+; a: a plain value, then used: does it call anything?
+print "== b09"
+x: 5
+print x

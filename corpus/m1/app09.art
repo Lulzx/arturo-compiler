@@ -1,0 +1,4 @@
+; M1 app09 — block as argument to a user function
+print "== app09"
+show: function [x][print x]
+show [1 2 3]

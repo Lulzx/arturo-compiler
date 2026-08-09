@@ -1,0 +1,8 @@
+; do — evaluate a block in place, last value is the result
+print do [1 + 2]
+print do [1 2 3]
+b: [10 * 3]
+print do b
+r: do [[1 2] [3 4]]
+print r
+print do [x: 5 x + 1]

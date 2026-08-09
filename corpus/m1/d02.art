@@ -1,0 +1,5 @@
+; M1 d02 — argument evaluation order within one call
+p: function [x][print "p" x  x]
+f: function [a b][a + b]
+print "== d02"
+print f p 1 p 2

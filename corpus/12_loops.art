@@ -1,0 +1,6 @@
+; loop / ranges — delegated collection iteration
+loop 1..3 [x][print x]
+loop [10 20 30] [v][print v]
+loop ["a" "b"] [c][print c ++ c]
+print size 1..5
+print 1..3

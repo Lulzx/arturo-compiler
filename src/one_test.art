@@ -1,0 +1,51 @@
+; one_test.art — run the differential comparison for a SINGLE
+; program in its own process, so value-stack contamination from
+; one test cannot affect the next. Prints OK or BAD.
+import ./"backend.art"
+
+tmpDir: "tmp"
+
+testProgram: function [path][
+    execute "mkdir -p tmp"
+    src: read path
+
+    hostOut: runHost path
+
+    kernelOut: execute ("arturo --no-color src/kernel_runner.art " ++ path ++ " 2>&1")
+
+    outName: tmpDir ++ "/prog.art"
+    bcodeName: outName ++ ".bcode"
+    art: renderProgram src
+    write art outName
+    execute ("arturo -c " ++ outName ++ " 2>&1")
+    compiledOut: execute ("arturo -x " ++ bcodeName ++ " 2>&1")
+
+    irOut: execute ("arturo --no-color src/ir_runner.art " ++ path ++ " 2>&1")
+
+    ok: true
+    if hostOut <> kernelOut -> ok: false
+    if hostOut <> compiledOut -> ok: false
+    if hostOut <> irOut -> ok: false
+
+    if not? ok [
+        print path
+        print "  -- host --"
+        print hostOut
+        print "  -- kernel --"
+        print kernelOut
+        print "  -- compiled --"
+        print compiledOut
+        print "  -- runIR --"
+        print irOut
+    ]
+    ok
+]
+
+go: function [][
+    if 0 < size args\values [
+        ok: testProgram args\values\0
+        if ok -> print "OK"
+        if not? ok -> print "BAD"
+    ]
+]
+go

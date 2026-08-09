@@ -1,0 +1,3 @@
+; M1 c07 — loop with params block
+print "== c07"
+loop 1..3 [x][print x]

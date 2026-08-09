@@ -1,0 +1,47 @@
+;=======================================================
+; backend.art — the donation, phased
+;
+; v0: runIR executes the IR artifact in the kernel.
+; v1: ir2art -> .art text -> `arturo -c` (bytecode) ->
+;     `arturo -x` (execute bytecode on the donated VM).
+;=======================================================
+
+import ./"ir.art"
+
+;-----------------------------------------------
+; v0 backend: execute IR in-kernel
+;-----------------------------------------------
+executeIR: function [ir][
+    runIR ir
+]
+
+;-----------------------------------------------
+; v1 backend: render IR to source, donate the compile
+;-----------------------------------------------
+renderProgram: function [src][
+    ir2artSeq (fold (compileToIR src))
+]
+
+; compile a source program to bytecode, return the .bcode path
+compileToBcode: function [src outPath][
+    art: renderProgram src
+    write art outPath
+    execute ("arturo -c " ++ outPath ++ " 2>&1")
+    outPath ++ ".bcode"
+]
+
+; run a bytecode artifact, returning its stdout
+runBcode: function [bcodePath][
+    execute ("arturo -x " ++ bcodePath ++ " 2>&1")
+]
+
+; full v1 pipeline: source -> IR -> source -> host bytecode -> run
+runCompiled: function [src outPath][
+    bcode: compileToBcode src outPath
+    runBcode bcode
+]
+
+; run a source program on the raw host (the authority)
+runHost: function [srcPath][
+    execute ("arturo --no-color " ++ srcPath ++ " 2>&1")
+]

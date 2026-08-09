@@ -1,0 +1,3 @@
+; M1 b07 — comparison chain: right-assoc
+print "== b07"
+print 1 < 2 < 3

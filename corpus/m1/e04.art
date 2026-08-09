@@ -1,0 +1,5 @@
+; M1 e04 — argument evaluation order (clean return-based bodies)
+p: function [x][print "p:" x  return x]
+f: function [a b][print "f:" a b  return a + b]
+print "== e04"
+print f p 1 p 2

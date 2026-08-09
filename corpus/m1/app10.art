@@ -1,0 +1,6 @@
+; M1 app10 — nested user calls, no side effects
+; g(h(5)) == 12? or something else?
+print "== app10"
+g: function [x][x * 2]
+h: function [x][x + 1]
+print g h 5

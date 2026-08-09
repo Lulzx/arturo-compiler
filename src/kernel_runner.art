@@ -1,0 +1,12 @@
+; kernel_runner.art — interpret a program file with the kernel
+; (interpret mode) in its own process, so its stdout is the
+; program's stdout.
+import ./"kernel.art"
+
+go: function [][
+    if 0 < size args\values [
+        src: read args\values\0
+        interpret src
+    ]
+]
+go

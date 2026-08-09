@@ -1,0 +1,8 @@
+; function — kernel closures, params, application
+add2: function [x][x + 2]
+print add2 40
+mul3: function [a b][a * b]
+print mul3 6 7
+f: function [x][x * 2]
+g: function [x][x + 1]
+print f g 5

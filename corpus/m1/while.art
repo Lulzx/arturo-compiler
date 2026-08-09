@@ -1,0 +1,21 @@
+; while 1 — does a while body update an outer counter?
+j: 0
+while [j < 3][
+    j: j + 1
+]
+print ["j after while:" j]
+; while 2 — nested function mutating i via reference dict
+CTX: #[i: 0]
+bump: function [][
+    CTX\i: CTX\i + 1
+]
+bump
+bump
+print ["CTX\i:" CTX\i]
+; loop 1 — loop over block with params form
+total: 0
+loop [1 2 3] [x][ total: total + x ]
+print ["total:" total]
+; loop 2 — loop over dict keys
+D: #[a: 1 b: 2]
+loop keys D [k][ print [k D\k] ]

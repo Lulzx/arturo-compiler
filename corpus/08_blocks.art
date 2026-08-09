@@ -1,0 +1,8 @@
+; block values — blocks in expression position are values
+b: [1 2 3]
+print b
+print size b
+print [1 2 3]
+c: [a 1]
+print size c
+print do [[1 2] [3 4]]

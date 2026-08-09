@@ -1,0 +1,3 @@
+; M1 c06 — if with else: does the 3rd block reach if?
+print "== c06"
+if 1 = 2 [print "yes"] [print "no"]

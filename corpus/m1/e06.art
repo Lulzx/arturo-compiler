@@ -1,0 +1,3 @@
+; M1 e06 — range is a single value operand
+print "== e06"
+print size 1..5

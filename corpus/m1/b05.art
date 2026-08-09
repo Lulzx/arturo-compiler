@@ -1,0 +1,4 @@
+; M1 b05 — function call around infix: f(2+3)
+print "== b05"
+f: function [x][x * 10]
+print f 2 + 3

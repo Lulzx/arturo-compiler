@@ -1,0 +1,4 @@
+; M1 b06 — infix inside call args: +(1, add(2,3)) = 6
+print "== b06"
+add: function [a b][a + b]
+print 1 + add 2 3

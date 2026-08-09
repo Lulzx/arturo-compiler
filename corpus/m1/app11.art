@@ -1,0 +1,5 @@
+; M1 app11 — side-effect order of nested calls
+print "== app11"
+e1: function [x][print "e1:" x]
+e2: function [x][print "e2:" x]
+e1 e2 5

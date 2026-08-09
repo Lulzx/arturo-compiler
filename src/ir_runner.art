@@ -1,0 +1,12 @@
+; ir_runner.art — run a program file as compiled IR in its own
+; process: emit -> fold -> runIR. Stdout is the program's stdout.
+import ./"ir.art"
+
+go: function [][
+    if 0 < size args\values [
+        src: read args\values\0
+        ir: fold (compileToIR src)
+        runIR ir
+    ]
+]
+go

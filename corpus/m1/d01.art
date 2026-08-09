@@ -1,0 +1,3 @@
+; M1 d01 — else keyword form
+print "== d01"
+if 1 = 2 -> print "yes" else -> print "no"

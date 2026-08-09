@@ -1,0 +1,27 @@
+; test M3: emit mode + runIR, invariant eval(emit(n)) == eval(n)
+import ./"kernel.art"
+
+invariant: function [code][
+    src: to :block code
+    tree: lowerBlock src
+    k: evalSeq (newEnv null) tree
+    ir: emitSeq (newEnv null) tree
+    r: runIR ir
+    same: (to :string k) = (to :string r)
+    print code
+    print (to :string k)
+    print (to :string r)
+    print (to :string same)
+]
+
+go: function [][
+    invariant "1 + 2"
+    invariant "2 * 3 + 4"
+    invariant "add: function [a b][a + b] 1 + add 2 3"
+    invariant "if 1 = 1 [7] [8]"
+    invariant "f: function [x][x * 2] f 21"
+    invariant "map [1 2 3] [x][x * 2]"
+    invariant "2 * (1 + 3)"
+    invariant "j: 0 total: 0 while [j < 4][total: total + j j: j + 1] total"
+]
+go

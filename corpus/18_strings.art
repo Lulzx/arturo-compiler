@@ -1,0 +1,9 @@
+; strings and concat
+s: "Hello"
+print s
+print s ++ " World"
+print size s
+print "abc" ++ "def" ++ "ghi"
+t: "a" ++ "b"
+print t ++ t
+print "x" < "y"

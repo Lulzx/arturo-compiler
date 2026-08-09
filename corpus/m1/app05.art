@@ -1,0 +1,4 @@
+; M1 app05 — chained operator
+; left-assoc? or does + consume all three?
+print "== app05"
+print 2 + 3 + 4

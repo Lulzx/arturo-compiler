@@ -1,0 +1,4 @@
+; M1 app16 — arrow forms: $ sigil and => lambda
+print "== app16"
+print map [1 2 3] $[x][x * 2]
+print map [1 2 3] => [& * 2]

@@ -1,0 +1,10 @@
+D: #[a: 1 b: 2]
+; form 1 — two-param over dict
+loop D [k v][ print [k v] ]
+print "---"
+; form 2 — literal param over keys
+loop keys D 'k [ print [k D\k] ]
+print "---"
+; form 3 — chunk a flat block into pairs
+E: ["x" 1 "y" 2]
+loop (chunk E 2) [p][ print [p\0 p\1] ]

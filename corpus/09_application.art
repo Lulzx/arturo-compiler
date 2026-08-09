@@ -1,0 +1,9 @@
+; application — nested calls, argument order, arities
+print add 1 2 3
+add2: function [a b][a + b]
+print add2 1 add2 2 3
+print size "abcdef"
+print first [10 20 30]
+print last [10 20 30]
+print inc 41
+print dec 100

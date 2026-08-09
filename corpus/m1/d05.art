@@ -1,0 +1,3 @@
+; M1 d05 — or is lazy? right side must not error if left is true
+print "== d05"
+print true or 1 / 0

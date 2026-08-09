@@ -1,0 +1,16 @@
+; composition — programs mixing rules
+base: function [n][n * 2]
+addOne: function [n][n + 1]
+print addOne (base 10)
+total: 0
+i: 0
+while [i < 6][
+    if i = 2 [total: total + 100]
+    if i <> 2 [total: total + i]
+    i: i + 1
+]
+print total
+names: ["ann" "bob" "cat"]
+print map names [n][size n]
+print select names [n][(size n) > 3]
+print map [1 2 3] => [& + 10]

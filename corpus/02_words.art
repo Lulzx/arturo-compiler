@@ -1,0 +1,9 @@
+; word / define — labels bind, loads fetch, builtins delegate
+x: 10
+print x
+y: x + 5
+print y
+print size "hello"
+print size [1 2 3]
+print type 7
+print type "s"

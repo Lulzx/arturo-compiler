@@ -1,0 +1,3 @@
+; M1 c08 — loop with literal param word
+print "== c08"
+loop [1 2 3] 'x [print x]

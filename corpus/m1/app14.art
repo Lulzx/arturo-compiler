@@ -1,0 +1,5 @@
+; M1 app14 — string ops and comparison
+print "== app14"
+print "a" ++ "b"
+print 1 = 1
+print "x" < "y"

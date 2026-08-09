@@ -1,0 +1,4 @@
+; M1 app21 — anonymous function as an argument
+print "== app21"
+apply2: function [f x][f x]
+print apply2 $[y][y + 3] 4

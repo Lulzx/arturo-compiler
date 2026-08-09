@@ -1,0 +1,3 @@
+; M1 e03 — plain and is eager prefix
+print "== e03"
+print and true false

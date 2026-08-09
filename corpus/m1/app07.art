@@ -1,0 +1,4 @@
+; M1 app07 — too few arguments to a user function
+print "== app07"
+add: function [a b][a + b]
+print add 3

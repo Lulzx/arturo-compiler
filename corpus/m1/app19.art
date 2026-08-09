@@ -1,0 +1,4 @@
+; M1 app19 — does print return its argument?
+print "== app19"
+x: print 7
+print x

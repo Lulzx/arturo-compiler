@@ -1,0 +1,5 @@
+; M1 b10 — function-valued word applied then result reused
+print "== b10"
+add: function [a b][a + b]
+print add 3 4
+print add 1 add 2 3

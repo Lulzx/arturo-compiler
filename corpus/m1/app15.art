@@ -1,0 +1,4 @@
+; M1 app15 — map/select with function and symbol arguments
+print "== app15"
+print map [1 2 3] function [x][x * 2]
+print select [1 2 3] 'odd

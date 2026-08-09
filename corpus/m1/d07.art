@@ -1,0 +1,4 @@
+; M1 d07 — block as last element returns the block value
+print "== d07"
+r: do [[1 2] [3 4]]
+print r

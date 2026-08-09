@@ -1,0 +1,510 @@
+;=======================================================
+; kernel.art — the dual evaluator (M2 interpret + M3 emit)
+;
+; One dispatch (evalNode), one rule per construct, each
+; rule carrying both its interpret behavior and its emit
+; behavior. The interpreter and the compiler are the same
+; dispatch with the mode flag flipped.
+;
+;   evalNode env node mode   ; mode ∈ { :interpret, :emit }
+;
+; Interpret mode evaluates the lowered tree from front.art.
+; Emit mode produces IR: op-tagged dictionaries (see ir.art).
+; runIR executes an IR artifact (the v0 backend, and the
+; value the invariant is checked on).
+;
+; Host constraints (same as front.art): no `else` keyword,
+; `and?`/`or?`/`not?` for logic, `while` needs block
+; conditions, runtime symbol values segfault.
+;=======================================================
+
+import ./"front.art"
+
+;-----------------------------------------------
+; return-signal holder (single-threaded; reset per call)
+;-----------------------------------------------
+RET: #[set: false value: null]
+
+;-----------------------------------------------
+; Truthiness: false and null are falsy
+;-----------------------------------------------
+truthy: function [v][
+    if null? v -> return false
+    if :logical = type v -> return v
+    true
+]
+
+;-----------------------------------------------
+; Environment: frames with a parent chain
+;-----------------------------------------------
+newEnv: function [parent][
+    #[bindings: #[] parent: parent]
+]
+
+define: function [env name value][
+    env\bindings\[name]: value
+]
+
+bound?: function [env name][
+    if key? env\bindings name -> return true
+    if not? null? env\parent -> return bound? env\parent name
+    false
+]
+
+lookup: function [env name][
+    if key? env\bindings name -> return env\bindings\[name]
+    if not? null? env\parent -> return lookup env\parent name
+    null
+]
+
+;-----------------------------------------------
+; Node classification
+;-----------------------------------------------
+isNode: function [node][
+    if :dictionary <> type node -> return false
+    key? node "nodek"
+]
+
+isIR: function [node][
+    if :dictionary <> type node -> return false
+    key? node "op"
+]
+
+;-----------------------------------------------
+; Donation: hand a hostword and evaluated args to the host
+;-----------------------------------------------
+delegate: function [name argVals][
+    ; never hand kernel-internal values (closures, hostword
+    ; markers, errors, IR) to the host — it crashes on them
+    loop argVals [v][
+        if isNode v -> return #[nodek: "error" msg: ["cannot delegate internal value" v\nodek]]
+        if isIR v -> return #[nodek: "error" msg: ["cannot delegate IR value"]]
+    ]
+    blk: @[]
+    el0: to :block name
+    if not? empty? el0 -> addItem blk el0\0
+    loop argVals [v][ addItem blk v ]
+    r: null
+    err: try [r: do blk]
+    if :error = type err -> return #[nodek: "error" msg: err]
+    r
+]
+
+;-----------------------------------------------
+; Specials: lazy / structural constructs handled by name
+;-----------------------------------------------
+isSpecialName: function [name][
+    key? SPECIAL_NAMES name
+]
+
+;=======================================================
+; Interpret mode — shared helpers
+;=======================================================
+evalSeq: function [env seq][
+    result: null
+    loop seq [el][
+        result: evalNode env el :interpret
+        if RET\set -> break
+    ]
+    result
+]
+
+; evaluate an expression; if the result is a block, execute it
+evalBody: function [env node][
+    v: evalNode env node :interpret
+    if :block = type v -> return evalSeq env (lowerBlock v)
+    v
+]
+
+loadRule: function [env name][
+    ; The host resolves builtin words to the builtin, never
+    ; to a user function of the same name (verified: a user
+    ; `add` does not shadow the builtin `add`). So builtins
+    ; always delegate.
+    if key? BUILTIN_ARITY name -> return #[nodek: "hostword" name: name]
+    if bound? env name -> return lookup env name
+    #[nodek: "hostword" name: name]
+]
+
+evalDefine: function [env node][
+    value: evalNode env node\args\0 :interpret
+    define env node\name value
+    value
+]
+
+evalReturn: function [env valNode][
+    RET\set: true
+    RET\value: evalNode env valNode :interpret
+]
+
+makeClosure: function [env params body][
+    #[nodek: "closure" params: params body: body ir: false env: env]
+]
+
+evalIf: function [env condNode yesNode][
+    cond: evalNode env condNode :interpret
+    if truthy cond -> return evalBody env yesNode
+    null
+]
+
+evalWhile: function [env condBlock actionBlock][
+    while [true][
+        cond: evalSeq env (lowerBlock condBlock)
+        if RET\set -> break
+        if not? truthy cond -> break
+        evalSeq env (lowerBlock actionBlock)
+        if RET\set -> break
+    ]
+    if RET\set -> return RET\value
+    null
+]
+
+evalUntil: function [env actionBlock condBlock][
+    while [true][
+        evalSeq env (lowerBlock actionBlock)
+        if RET\set -> break
+        cond: evalSeq env (lowerBlock condBlock)
+        if RET\set -> break
+        if truthy cond -> break
+    ]
+    if RET\set -> return RET\value
+    null
+]
+
+applyClosure: function [cl argVals][
+    child: newEnv cl\env
+    params: cl\params
+    if :block = type params [
+        if 0 < size params [
+            loop 0..dec (size params) [j][
+                if j < size argVals -> define child (to :string params\[j]) argVals\[j]
+            ]
+        ]
+    ]
+    if :block <> type params [
+        if not? empty? argVals -> define child (to :string params) argVals\0
+    ]
+    RET\set: false
+    RET\value: null
+    result: null
+    if cl\ir -> result: runSeq child cl\body
+    if not? cl\ir -> result: evalSeq child (lowerBlock cl\body)
+    if RET\set [
+        RET\set: false
+        return RET\value
+    ]
+    result
+]
+
+evalCall: function [env node][
+    fnNode: node\fn
+
+    ; runtime dict construction: evaluate each field (key +
+    ; value expression) and build the dictionary
+    if and? (isLoadNode fnNode) ["makeDict" = fnNode\name] [
+        kv: @[]
+        loop node\args [a][ addItem kv (evalNode env a :interpret) ]
+        return to :dictionary kv
+    ]
+
+    ; kernel specials, recognised by name before evaluation
+    if and? (isLoadNode fnNode) [isSpecialName fnNode\name] [
+        name: fnNode\name
+        if "function" = name -> return makeClosure env node\args\0 node\args\1
+        if "if"       = name -> return evalIf env node\args\0 node\args\1
+        if "do"       = name -> return evalBody env node\args\0
+        if "return"   = name -> return evalReturn env node\args\0
+        if "while"    = name -> return evalWhile env node\args\0 node\args\1
+        if "until"    = name -> return evalUntil env node\args\0 node\args\1
+    ]
+
+    fnVal: evalNode env fnNode :interpret
+    argVals: @[]
+    loop node\args [a][ addItem argVals (evalNode env a :interpret) ]
+
+    if and? (isNode fnVal) [not? null? fnVal\nodek] [
+        if "closure" = fnVal\nodek -> return applyClosure fnVal argVals
+        if "hostword" = fnVal\nodek -> return delegate fnVal\name argVals
+    ]
+    #[nodek: "error" msg: ["cannot call" fnVal]]
+]
+
+;=======================================================
+; Emit mode — rules producing IR (op-tagged dictionaries)
+;=======================================================
+isPrimitive: function [v][
+    t: type v
+    if :integer = t -> return true
+    if :floating = t -> return true
+    if :string = t -> return true
+    if :char = t -> return true
+    if :logical = t -> return true
+    null? v
+]
+
+emitSeq: function [env seq][
+    out: @[]
+    loop seq [el][ addItem out (emitNode env el) ]
+    out
+]
+
+emitNode: function [env node][
+    if and? (isNode node) ["load" = node\nodek] -> return #[op: "load" name: node\name]
+    if and? (isNode node) ["define" = node\nodek] [
+        return #[op: "define" name: node\name expr: emitNode env node\args\0]
+    ]
+    if and? (isNode node) ["call" = node\nodek] -> return emitCall env node
+    if and? (isNode node) ["blockval" = node\nodek] [
+        return #[op: "block" items: emitSeq env node\items]
+    ]
+    if :word = type node -> return #[op: "load" name: to :string node]
+    if :inline = type node -> return #[op: "do" body: emitSeq env (lowerBlock (to :block node))]
+    if :block = type node -> return #[op: "block" items: node]
+    if isPrimitive node -> return #[op: "const" value: node]
+    #[op: "passthrough" src: node]
+]
+
+emitCall: function [env node][
+    fnNode: node\fn
+    if and? (isLoadNode fnNode) [isSpecialName fnNode\name] [
+        name: fnNode\name
+        if "function" = name [
+            return #[op: "func" params: node\args\0 body: emitSeq env (lowerBlock node\args\1)]
+        ]
+        if "if" = name [
+            return #[op: "if" cond: emitNode env node\args\0
+                           yes: emitSeq env (lowerBlock node\args\1)
+                           no: null]
+        ]
+        if "do" = name [
+            arg: node\args\0
+            if :block = type arg -> return #[op: "do" body: emitSeq env (lowerBlock arg)]
+            return #[op: "do" expr: emitNode env arg]
+        ]
+        if "return" = name [
+            return #[op: "return" expr: emitNode env node\args\0]
+        ]
+        if "while" = name [
+            return #[op: "while" cond: emitSeq env (lowerBlock node\args\0)
+                           action: emitSeq env (lowerBlock node\args\1)]
+        ]
+        if "until" = name [
+            return #[op: "until" action: emitSeq env (lowerBlock node\args\0)
+                           cond: emitSeq env (lowerBlock node\args\1)]
+        ]
+    ]
+    fnIR: emitNode env fnNode
+    argsIR: @[]
+    loop node\args [a][ addItem argsIR (emitNode env a) ]
+    #[op: "call" fn: fnIR args: argsIR]
+]
+
+;=======================================================
+; The one dispatch — mode ∈ { :interpret, :emit }
+;=======================================================
+evalNode: function [env node mode][
+    if :interpret = mode -> return evalInterpret env node
+    emitNode env node
+]
+
+evalInterpret: function [env node][
+    if and? (isNode node) ["load" = node\nodek] -> return evalLoad env node
+    if and? (isNode node) ["define" = node\nodek] -> return evalDefine env node
+    if and? (isNode node) ["call" = node\nodek] -> return evalCall env node
+    if and? (isNode node) ["blockval" = node\nodek] [
+        out: @[]
+        loop node\items [it][ addItem out (evalNode env it :interpret) ]
+        return out
+    ]
+    if :word = type node -> return evalWord env node
+    if :inline = type node -> return evalInline env node
+    if :block = type node -> return node
+    if and? (isIR node) ["passthrough" = node\op] -> return node\src
+    node
+]
+
+evalLoad: function [env node][
+    loadRule env node\name
+]
+
+evalWord: function [env node][
+    loadRule env (to :string node)
+]
+
+evalInline: function [env node][
+    evalSeq env (lowerBlock (to :block node))
+]
+
+;=======================================================
+; runIR — execute an IR artifact (v0 backend)
+;=======================================================
+runSeq: function [env seq][
+    result: null
+    loop seq [el][
+        result: runNode env el
+        if RET\set -> break
+    ]
+    result
+]
+
+; run an expression; if the result is a block, execute it
+runBody: function [env node][
+    v: runNode env node
+    if :block = type v -> return runSeq env v
+    v
+]
+
+runNode: function [env node][
+    if not? isIR node -> return node
+    op: node\op
+    if "const" = op -> return node\value
+    if "load" = op -> return loadRule env node\name
+    if "define" = op [
+        value: runNode env node\expr
+        define env node\name value
+        return value
+    ]
+    if "func" = op -> return #[nodek: "closure" params: node\params body: node\body ir: true env: env]
+    if "if" = op [
+        cond: runNode env node\cond
+        if truthy cond -> return runSeq env node\yes
+        if not? null? node\no -> return runSeq env node\no
+        return null
+    ]
+    if "do" = op [
+        if key? node "expr" [
+            v: runNode env node\expr
+            if :block = type v -> return evalSeq env (lowerBlock v)
+            return v
+        ]
+        return runSeq env node\body
+    ]
+    if "block" = op [
+        out: @[]
+        loop node\items [it][
+            if isIR it -> addItem out (runNode env it)
+            if not? isIR it -> addItem out it
+        ]
+        return out
+    ]
+    if "return" = op [
+        RET\set: true
+        RET\value: runNode env node\expr
+        return RET\value
+    ]
+    if "while" = op [
+        while [true][
+            cond: runSeq env node\cond
+            if RET\set -> break
+            if not? truthy cond -> break
+            runSeq env node\action
+            if RET\set -> break
+        ]
+        if RET\set -> return RET\value
+        return null
+    ]
+    if "until" = op [
+        while [true][
+            runSeq env node\action
+            if RET\set -> break
+            cond: runSeq env node\cond
+            if RET\set -> break
+            if truthy cond -> break
+        ]
+        if RET\set -> return RET\value
+        return null
+    ]
+    if "call" = op -> return runCall env node
+    if "passthrough" = op -> return node\src
+    node
+]
+
+runCall: function [env node][
+    fnNode: node\fn
+    if and? (isIR fnNode) ["load" = fnNode\op] [
+        name: fnNode\name
+        if "makeDict" = name [
+            kv: @[]
+            loop node\args [a][ addItem kv (runNode env a) ]
+            return to :dictionary kv
+        ]
+        if isSpecialName name [
+            if "function" = name -> return #[nodek: "closure" params: node\args\0 body: node\args\1 ir: true env: env]
+            if "if" = name [
+                cond: runNode env node\args\0
+                if truthy cond -> return runBody env node\args\1
+                return null
+            ]
+            if "do" = name -> return runBody env node\args\0
+            if "return" = name [
+                RET\set: true
+                RET\value: runNode env node\args\0
+                return RET\value
+            ]
+            if "while" = name [
+                while [true][
+                    cond: runSeq env node\args\0
+                    if RET\set -> break
+                    if not? truthy cond -> break
+                    runSeq env node\args\1
+                    if RET\set -> break
+                ]
+                if RET\set -> return RET\value
+                return null
+            ]
+            if "until" = name [
+                while [true][
+                    runSeq env node\args\1
+                    if RET\set -> break
+                    cond: runSeq env node\args\0
+                    if RET\set -> break
+                    if truthy cond -> break
+                ]
+                if RET\set -> return RET\value
+                return null
+            ]
+        ]
+    ]
+
+    fnVal: runNode env fnNode
+    argVals: @[]
+    loop node\args [a][ addItem argVals (runNode env a) ]
+
+    if and? (isNode fnVal) [not? null? fnVal\nodek] [
+        if "closure" = fnVal\nodek -> return applyClosure fnVal argVals
+        if "hostword" = fnVal\nodek -> return delegate fnVal\name argVals
+    ]
+    #[nodek: "error" msg: ["cannot call" fnVal]]
+]
+
+;=======================================================
+; Entry points
+;=======================================================
+resetRET: function [][
+    RET\set: false
+    RET\value: null
+]
+
+; interpret a source string with the kernel (interpret mode)
+interpret: function [src][
+    resetRET
+    evalSeq (newEnv null) (lowerBlock (to :block src))
+]
+
+; compile a source string to IR (emit mode, top level)
+compileToIR: function [src][
+    emitSeq (newEnv null) (lowerBlock (to :block src))
+]
+
+; run an IR artifact (v0 backend)
+runIR: function [ir][
+    resetRET
+    runSeq (newEnv null) ir
+]
+
+; run an IR artifact in an existing environment (bootstrap uses
+; this to rebuild the compiler from its own IR in a fresh env)
+runIRIn: function [env ir][
+    resetRET
+    runSeq env ir
+]

@@ -1,0 +1,7 @@
+; map/select — delegated higher-order forms (self-contained actions)
+print map [1 2 3] [x][x * 2]
+print map [1 2 3] 'x [x * 2]
+print map [1 2 3] => [& * 2]
+print select [1 2 3 4] [x][x > 2]
+print select [1 2 3 4 5] => [& > 3]
+print map ["a" "b" "c"] [s][s ++ "!"]

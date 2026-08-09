@@ -1,0 +1,4 @@
+; M1 app17 — do returns the last value of the block
+print "== app17"
+b: [1 + 2]
+print do b

@@ -1,0 +1,12 @@
+; return — kernel signal, early exit
+f: function [x][
+    if x > 10 -> return "big"
+    return "small"
+]
+print f 20
+print f 5
+g: function [a b][
+    return a + b
+    print "unreachable"
+]
+print g 3 4

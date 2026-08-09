@@ -1,0 +1,20 @@
+; scope 1 — does x: inside a function create a local or write the global?
+G: #[a: 0]
+f: function [][
+    G: #[a: 1]
+    print ["inside:" G]
+]
+f
+print ["outside:" G]
+; scope 2 — mutation append 'H reaches global from inside a function?
+H: @[]
+g: function [][
+    append 'H 5
+]
+g
+print ["H:" H]
+; scope 3 — assign word? does 'assign exist?
+print type assign
+; scope 4 — is there a way to bind a variable by name at runtime?
+K: 10
+print ["K before:" K]

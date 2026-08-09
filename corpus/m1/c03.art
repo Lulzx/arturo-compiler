@@ -1,0 +1,3 @@
+; M1 c03 — map with => arrow
+print "== c03"
+print map [1 2 3] => [& * 2]

@@ -1,0 +1,3 @@
+; M1 e02 — and? is lazy: right block evaluated only when left true
+print "== e02"
+print false and? [1 / 0]

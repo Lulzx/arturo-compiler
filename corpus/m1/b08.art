@@ -1,0 +1,3 @@
+; M1 b08 — string concat is infix too: "a" ++ "b" ++ "c"
+print "== b08"
+print "a" ++ "b" ++ "c"

@@ -1,0 +1,4 @@
+; M1 app18 — bare literal as a statement
+print "== app18"
+5
+print "after 5"

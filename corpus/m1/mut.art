@@ -1,0 +1,20 @@
+; mut 3 — pop / last / size
+d: #[args: @[5]]
+append 'd\args 7
+print ["last:" last d\args "size:" size d\args]
+print ["pop:" pop 'd\args]
+print d\args
+; mut 4 — append through a frame dict's block field aliases the same block
+root: @[]
+fr: #[args: root]
+append 'fr\args 9
+print root
+; mut 5 — stack of frames: append child frame into parent's args
+top: @[]
+a: #[arity: 2 args: @[]]
+append 'top a
+append 'top\1\args 11
+print top
+; mut 6 — remove last element
+remove 'd\args (dec size d\args)
+print d\args

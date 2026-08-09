@@ -1,0 +1,4 @@
+; M1 c09 — arrow single-expression body
+print "== c09"
+f: function [x] -> x * 2
+print f 21

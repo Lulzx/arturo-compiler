@@ -1,0 +1,279 @@
+;=======================================================
+; ir.art — the IR: rendering (ir2art) and passes (fold)
+;
+; IR nodes are op-tagged dictionaries:
+;   const / load / define / func / if / do / block /
+;   call / return / while / until / passthrough
+;
+; ir2art renders IR back to core-Arturo text so the
+; donated VM can compile it (-c) and run it (-x). Because
+; grouping lives in the call trees (and lowering is an
+; exact mirror of the host's processBlock), prefix calls
+; print naively: `f a b` re-groups identically.
+;
+; fold is the first IR pass: constant folding. A call
+; whose leaves are all const and whose operator is a
+; known-pure host word is evaluated at compile time by
+; running the kernel on the subtree, then replaced by a
+; single const.
+;=======================================================
+
+import ./"kernel.art"
+
+;-----------------------------------------------
+; Word-level canonical text rendering (values)
+;-----------------------------------------------
+joinWith: function [parts sep][
+    out: ""
+    isFirst: true
+    loop parts [p][
+        if not? isFirst -> out: out ++ sep
+        out: out ++ (to :string p)
+        isFirst: false
+    ]
+    out
+]
+
+escapeString: function [s][
+    out: @[]
+    loop s [ch][
+        c: to :string ch
+        if c = "\\" -> addItem out "\\\\"
+        if c = "\"" -> addItem out "\\\""
+        if c <> "\\" [
+            if c <> "\"" -> addItem out c
+        ]
+    ]
+    join out
+]
+
+renderValue: function [v][
+    if null? v -> return "null"
+    t: type v
+    if :integer = t [
+        ; a negative literal splits as `-` + `1` inside a block
+        ; on the host, so render it as a parenthesised expression
+        if 0 > v -> return "(0 - " ++ (to :string (0 - v)) ++ ")"
+        return to :string v
+    ]
+    if :floating = t [
+        if 0.0 > v -> return "(0 - " ++ (to :string (0 - v)) ++ ")"
+        return to :string v
+    ]
+    if :type = t -> return ":" ++ (to :string v)
+    if :string = t -> return "\"" ++ (escapeString v) ++ "\""
+    if :char = t -> return "'" ++ (to :string v) ++ "'"
+    if :logical = t [
+        if v -> return "true"
+        return "false"
+    ]
+    if :word = t -> return to :string v
+    if :literal = t [
+        n: to :string v
+        if "_" = (to :string n\0) -> return n
+        return "'" ++ n
+    ]
+    if :symbol = t -> return to :string v
+    if :label = t -> return (to :string v) ++ ":"
+    if :block = t [
+        parts: @[]
+        loop v [el][ addItem parts (renderValue el) ]
+        return "[" ++ (joinWith parts " ") ++ "]"
+    ]
+    if :inline = t [
+        inner: to :block v
+        return "(" ++ (renderValue inner) ++ ")"
+    ]
+    if :path = t [
+        n: buildPathGet (to :block v)
+        return ir2art (emitNode (newEnv null) n)
+    ]
+    if :pathlabel = t [
+        n: pathSetFrame (to :block v)
+        return ir2art (emitNode (newEnv null) n)
+    ]
+    if :range = t -> return renderRange v
+    if :dictionary = t -> return renderDict v
+    null
+]
+
+renderRange: function [v][
+    ; best-effort: range value as `from .. to`
+    "range"
+]
+
+renderDict: function [v][
+    parts: @[]
+    loop v [k val][
+        addItem parts ((to :string k) ++ ":")
+        addItem parts (renderValue val)
+    ]
+    "#[" ++ (joinWith parts " ") ++ "]"
+]
+
+;-----------------------------------------------
+; IR -> source text
+;-----------------------------------------------
+ir2artSeq: function [seq][
+    parts: @[]
+    loop seq [n][ addItem parts (ir2art n) ]
+    joinWith parts " "
+]
+
+ir2art: function [node][
+    if not? isIR node -> return renderValue node
+    op: node\op
+    if "const" = op -> return renderValue node\value
+    if "load" = op -> return node\name
+    if "define" = op [
+        ex: ir2art node\expr
+        return node\name ++ ": " ++ ex
+    ]
+    if "func" = op [
+        pr: renderValue node\params
+        bd: ir2artSeq node\body
+        return "function " ++ pr ++ " [" ++ bd ++ "]"
+    ]
+    if "if" = op [
+        cd: ir2art node\cond
+        ys: ir2artSeq node\yes
+        return "if " ++ cd ++ " [" ++ ys ++ "]"
+    ]
+    if "do" = op [
+        if key? node "expr" -> return "do " ++ (ir2art node\expr)
+        bd: ir2artSeq node\body
+        return "do [" ++ bd ++ "]"
+    ]
+    if "block" = op [
+        ; a raw source block `[a 1]` keeps words as data and
+        ; prints bare; an evaluated block (`@[a b]`, or an empty
+        ; block that will be mutated through a dict field) prints
+        ; `@[...]` so the host builds a FRESH, element-evaluating
+        ; block rather than a shared bytecode constant.
+        inner: ir2artSeq node\items
+        if empty? node\items -> return "@[]"
+        if isIR node\items\0 -> return "@[" ++ inner ++ "]"
+        return "[" ++ inner ++ "]"
+    ]
+    if "return" = op [
+        ex: ir2art node\expr
+        return "return " ++ ex
+    ]
+    if "while" = op [
+        cd: ir2artSeq node\cond
+        ac: ir2artSeq node\action
+        return "while [" ++ cd ++ "] [" ++ ac ++ "]"
+    ]
+    if "until" = op [
+        ac: ir2artSeq node\action
+        cd: ir2artSeq node\cond
+        return "until [" ++ ac ++ "] [" ++ cd ++ "]"
+    ]
+    if "passthrough" = op -> return renderValue node\src
+    if "call" = op -> return ir2artCall node
+    renderValue node
+]
+
+ir2artCall: function [node][
+    ; dict construction: render as `to :dictionary [k v ...]`
+    if and? (isIR node\fn) ["load" = node\fn\op] [
+        if "makeDict" = node\fn\name [
+            jt: ir2artSeq node\args
+            return "to :dictionary [" ++ jt ++ "]"
+        ]
+    ]
+    fnText: ir2art node\fn
+    argsText: @[]
+    loop node\args [a][ addItem argsText (ir2art a) ]
+    if empty? argsText -> return fnText
+    jt: joinWith argsText " "
+    fnText ++ " " ++ jt
+]
+
+;-----------------------------------------------
+; Constant folding
+;-----------------------------------------------
+PURE_WORDS: #[
+    "add": true  "sub": true  "mul": true  "div": true  "fdiv": true
+    "mod": true  "pow": true  "divmod": true
+    "equal?": true  "notEqual?": true  "less?": true  "greater?": true
+    "lessOrEqual?": true  "greaterOrEqual?": true
+    "and?": true  "or?": true
+    "not?": true  "null?": true  "true?": true  "false?": true
+    "size": true  "first": true  "last": true  "inc": true  "dec": true
+    "type": true  "to": true
+    "append": true  "not": true  "and": true  "or": true
+]
+
+isConstNode: function [n][
+    if not? isIR n -> return false
+    "const" = n\op
+]
+
+foldNode: function [node][
+    if not? isIR node -> return node
+    op: node\op
+    if "const" = op -> return node
+    if "load" = op -> return node
+    if "passthrough" = op -> return node
+    if "define" = op [
+        fe: foldNode node\expr
+        return #[op: "define" name: node\name expr: fe]
+    ]
+    if "call" = op [
+        ff: foldNode node\fn
+        fa: @[]
+        loop node\args [a][ addItem fa (foldNode a) ]
+        ; fold pure calls over const args by running the kernel
+        if and? (isIR ff) ["load" = ff\op] [
+            if key? PURE_WORDS ff\name [
+                allConst: true
+                loop fa [a][ if not? isConstNode a -> allConst: false ]
+                if allConst [
+                    res: runIR @[#[op: "call" fn: ff args: fa]]
+                    return #[op: "const" value: res]
+                ]
+            ]
+        ]
+        return #[op: "call" fn: ff args: fa]
+    ]
+    if "func" = op [
+        fb: @[]
+        loop node\body [b][ addItem fb (foldNode b) ]
+        return #[op: "func" params: node\params body: fb]
+    ]
+    if "if" = op [
+        fc: foldNode node\cond
+        fy: @[]
+        loop node\yes [b][ addItem fy (foldNode b) ]
+        return #[op: "if" cond: fc yes: fy no: node\no]
+    ]
+    if "do" = op [
+        if key? node "expr" -> return #[op: "do" expr: foldNode node\expr]
+        fb: @[]
+        loop node\body [b][ addItem fb (foldNode b) ]
+        return #[op: "do" body: fb]
+    ]
+    if "return" = op -> return #[op: "return" expr: foldNode node\expr]
+    if "while" = op [
+        fc: @[]
+        loop node\cond [b][ addItem fc (foldNode b) ]
+        fa: @[]
+        loop node\action [b][ addItem fa (foldNode b) ]
+        return #[op: "while" cond: fc action: fa]
+    ]
+    if "until" = op [
+        fa: @[]
+        loop node\action [b][ addItem fa (foldNode b) ]
+        fc: @[]
+        loop node\cond [b][ addItem fc (foldNode b) ]
+        return #[op: "until" action: fa cond: fc]
+    ]
+    node
+]
+
+fold: function [ir][
+    out: @[]
+    loop ir [n][ addItem out (foldNode n) ]
+    out
+]
