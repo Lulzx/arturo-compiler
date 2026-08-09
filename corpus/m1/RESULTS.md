@@ -125,6 +125,23 @@ nothing usable; values that are never claimed are dropped at block end.
    literals are therefore emitted as `neg n`.
 7. **`-c` mis-compiles operator-like dictionary keys.** `#["+": "add"]`
    is fine interpreted, but raises a `let` arity error as bytecode.
+8. **An inline group that returns a block, written straight into an
+   `@[...]` literal, is spliced.** The intermediate value is pushed as an
+   extra element of the result block, so `@[a (f b)]` where `f b` returns a
+   block can come back with three elements instead of two. Every `emit`
+   column in the compiler binds its arguments to names first and builds
+   `@[...]` from plain variables.
+9. **The host `call` builtin applied to a kernel closure corrupts the
+   value stack when the closure's body recurses.** `call r\run @[env args]`
+   works when the run column is shallow (the `makeDict` and `call` rows),
+   but when the construct's body runs — `runSeq` → `runCall` → `applyVal` —
+   `applyVal`'s `argVals` binding is lost and the host raises a name error.
+   Constant folding also poisoned the stack: a fold's `runIR` left it dirty
+   and the *next* nested call under a construct dropped its arguments. The
+   kernel therefore calls the construct run helpers as plain globals, and
+   constant folding hands a pure call straight to the host (`delegate`)
+   instead of through `runIR`. corpus/06_if, 07_do, 13_while, 15_parens
+   pin the corrected behaviour on all four engines.
 
 ## Consequences for the compiler
 

@@ -43,6 +43,25 @@ eval(env, emit(n)) == eval(env, n)      ; for every node n
 — and by a harness that runs every corpus program all three ways
 plus on the real `arturo`, and compares.
 
+All three columns take the same `[env argv]`. A construct's `emit`
+column lowers its arguments to a flat `args` list inside one
+op-tagged dictionary; its `run` column consumes exactly that list,
+so `run` and `eval` are the same construct in the same shape, one
+in IR and one in source. The op name is the construct name, which
+is what lets `runNode` reach the rows: it has no per-op chains, it
+dispatches straight to the run columns (each of which is a shared
+helper, `runIf`/`runWhile`/…, so nothing is duplicated). Two host
+quirks shaped that dispatch. An inline group that returns a block,
+written into an `@[...]` literal, is mis-grouped — the intermediate
+is spliced in as an extra element — so every `emit` column binds
+its arguments to names first. And the host `call` builtin applied
+to a kernel closure one level up from `runSeq` corrupts the value
+stack, so a deeper `runCall` loses its `argVals`; `runNode` calls
+the helpers as plain globals instead. Constant folding hands a pure
+call straight to the host (`delegate`) rather than through `runIR`:
+the kernel's interpreter frames during a fold leave the stack dirty
+and the next nested call under a construct drops its arguments.
+
 The donated VM owns the primitives; the kernel owns structure:
 scoping, control flow, application.
 

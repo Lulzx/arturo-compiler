@@ -194,19 +194,20 @@ ir2art: function [node][
         ex: ir2art node\expr
         return node\name ++ ": " ++ ex
     ]
-    if "func" = op [
-        pr: renderValue node\params
-        bd: ir2artSeq node\body
+    if "function" = op [
+        pr: renderValue node\args\0
+        bd: ir2artSeq node\args\1
         return "function " ++ pr ++ " [" ++ bd ++ "]"
     ]
     if "if" = op [
-        cd: ir2art node\cond
-        ys: ir2artSeq node\yes
+        cd: ir2art node\args\0
+        ys: ir2artSeq node\args\1
         return "if " ++ cd ++ " [" ++ ys ++ "]"
     ]
     if "do" = op [
-        if key? node "expr" -> return "do " ++ (ir2art node\expr)
-        bd: ir2artSeq node\body
+        ; a body is emitted as a seq; an expression as a single node
+        if :dictionary = type node\args\0 -> return "do " ++ (ir2art node\args\0)
+        bd: ir2artSeq node\args\0
         return "do [" ++ bd ++ "]"
     ]
     if "block" = op [
@@ -221,17 +222,17 @@ ir2art: function [node][
         return "[" ++ inner ++ "]"
     ]
     if "return" = op [
-        ex: ir2art node\expr
+        ex: ir2art node\args\0
         return "return " ++ ex
     ]
     if "while" = op [
-        cd: ir2artSeq node\cond
-        ac: ir2artSeq node\action
+        cd: ir2artSeq node\args\0
+        ac: ir2artSeq node\args\1
         return "while [" ++ cd ++ "] [" ++ ac ++ "]"
     ]
     if "until" = op [
-        ac: ir2artSeq node\action
-        cd: ir2artSeq node\cond
+        ac: ir2artSeq node\args\0
+        cd: ir2artSeq node\args\1
         return "until [" ++ ac ++ "] [" ++ cd ++ "]"
     ]
     if "passthrough" = op -> return renderValue node\src
@@ -392,6 +393,18 @@ isConstNode: function [n][
     "const" = n\op
 ]
 
+; fold one argument of a construct op. A seq is a block of IR and
+; folds element-wise; a single emitted node folds itself; a raw
+; block (function params) is data and its elements pass through.
+foldArg: function [a][
+    if :block = type a [
+        out: @[]
+        loop a [el][ addItem out (foldNode el) ]
+        return out
+    ]
+    foldNode a
+]
+
 foldNode: function [node][
     if not? isIR node -> return node
     op: node\op
@@ -399,6 +412,7 @@ foldNode: function [node][
     if "load" = op -> return node
     if "intrinsic" = op -> return node
     if "passthrough" = op -> return node
+    if "block" = op -> return node
     if "define" = op [
         fe: foldNode node\expr
         return #[op: "define" name: node\name expr: fe]
@@ -417,7 +431,14 @@ foldNode: function [node][
                 allConst: true
                 loop fa [a][ if not? isConstNode a -> allConst: false ]
                 if allConst [
-                    res: runIR @[#[op: "call" fn: ff args: fa]]
+                    ; evaluate the pure call by handing it straight to
+                    ; the host. Not through runIR: the kernel's
+                    ; interpreter frames during a fold leave the host
+                    ; value stack dirty, and the next runIR call that
+                    ; is nested under a construct loses its arguments.
+                    vals: @[]
+                    loop fa [a][ addItem vals a\value ]
+                    res: delegate ff\name vals
                     ; an error is not a value. `div 10 0` aborts the
                     ; host at runtime; folding it into a const would
                     ; make the compiled program print an error node
@@ -430,37 +451,14 @@ foldNode: function [node][
         ]
         return #[op: "call" fn: ff args: fa]
     ]
-    if "func" = op [
-        fb: @[]
-        loop node\body [b][ addItem fb (foldNode b) ]
-        return #[op: "func" params: node\params body: fb]
-    ]
-    if "if" = op [
-        fc: foldNode node\cond
-        fy: @[]
-        loop node\yes [b][ addItem fy (foldNode b) ]
-        return #[op: "if" cond: fc yes: fy no: node\no]
-    ]
-    if "do" = op [
-        if key? node "expr" -> return #[op: "do" expr: foldNode node\expr]
-        fb: @[]
-        loop node\body [b][ addItem fb (foldNode b) ]
-        return #[op: "do" body: fb]
-    ]
-    if "return" = op -> return #[op: "return" expr: foldNode node\expr]
-    if "while" = op [
-        fc: @[]
-        loop node\cond [b][ addItem fc (foldNode b) ]
+    ; every construct op folds by folding its arguments — the shape
+    ; of an op is whatever its row's `emit` column declared, so one
+    ; recursion serves all of them instead of one branch per op.
+    r: ruleFor op
+    if not? null? r [
         fa: @[]
-        loop node\action [b][ addItem fa (foldNode b) ]
-        return #[op: "while" cond: fc action: fa]
-    ]
-    if "until" = op [
-        fa: @[]
-        loop node\action [b][ addItem fa (foldNode b) ]
-        fc: @[]
-        loop node\cond [b][ addItem fc (foldNode b) ]
-        return #[op: "until" action: fa cond: fc]
+        loop node\args [a][ addItem fa (foldArg a) ]
+        return #[op: op args: fa]
     ]
     node
 ]

@@ -250,6 +250,63 @@ evalIf: function [env condNode yesNode][
     null
 ]
 
+; The run behaviour of each construct, as a named helper. Each
+; row's `run` column points at one (`function [env argv][ runIf
+; env argv ]`) and runNode's construct dispatch calls the same
+; helper directly — so the meaning lives once, and the two
+; pointers cannot drift.
+runFunction: function [env argv][
+    #[nodek: "closure" params: argv\0 body: argv\1 ir: true env: env]
+]
+
+runIf: function [env argv][
+    cond: runNode env argv\0
+    if truthy cond -> return runSeq env argv\1
+    if not? null? argv\2 -> return runSeq env argv\2
+    null
+]
+
+runDo: function [env argv][
+    v: argv\0
+    ; a body is emitted as a seq; an expression as a single node
+    if :dictionary = type v [
+        w: runNode env v
+        if :block = type w -> return evalSeq env (lowerBlock w)
+        return w
+    ]
+    runSeq env v
+]
+
+runReturn: function [env argv][
+    RET\set: true
+    RET\value: runNode env argv\0
+    RET\value
+]
+
+runWhile: function [env argv][
+    while [true][
+        cond: runSeq env argv\0
+        if RET\set -> break
+        if not? truthy cond -> break
+        runSeq env argv\1
+        if RET\set -> break
+    ]
+    if RET\set -> return RET\value
+    null
+]
+
+runUntil: function [env argv][
+    while [true][
+        runSeq env argv\0
+        if RET\set -> break
+        cond: runSeq env argv\1
+        if RET\set -> break
+        if truthy cond -> break
+    ]
+    if RET\set -> return RET\value
+    null
+]
+
 evalWhile: function [env condBlock actionBlock][
     while [true][
         cond: evalSeq env (lowerBlock condBlock)
@@ -379,7 +436,10 @@ emitNode: function [env node][
         return #[op: "block" items: emitSeq env node\items]
     ]
     if :word = type node -> return #[op: "load" name: to :string node]
-    if :inline = type node -> return #[op: "do" body: emitSeq env (lowerBlock (to :block node))]
+    if :inline = type node [
+        bodyIR: emitSeq env (lowerBlock (to :block node))
+        return #[op: "do" args: @[bodyIR]]
+    ]
     if :block = type node -> return #[op: "block" items: node]
     if isPrimitive node -> return #[op: "const" value: node]
     #[op: "passthrough" src: node]
@@ -444,13 +504,6 @@ runSeq: function [env seq][
     result
 ]
 
-; run an expression; if the result is a block, execute it
-runBody: function [env node][
-    v: runNode env node
-    if :block = type v -> return runSeq env v
-    v
-]
-
 runNode: function [env node][
     if not? isIR node -> return node
     op: node\op
@@ -462,21 +515,6 @@ runNode: function [env node][
         define env node\name value
         return value
     ]
-    if "func" = op -> return #[nodek: "closure" params: node\params body: node\body ir: true env: env]
-    if "if" = op [
-        cond: runNode env node\cond
-        if truthy cond -> return runSeq env node\yes
-        if not? null? node\no -> return runSeq env node\no
-        return null
-    ]
-    if "do" = op [
-        if key? node "expr" [
-            v: runNode env node\expr
-            if :block = type v -> return evalSeq env (lowerBlock v)
-            return v
-        ]
-        return runSeq env node\body
-    ]
     if "block" = op [
         out: @[]
         loop node\items [it][
@@ -485,35 +523,19 @@ runNode: function [env node][
         ]
         return out
     ]
-    if "return" = op [
-        RET\set: true
-        RET\value: runNode env node\expr
-        return RET\value
-    ]
-    if "while" = op [
-        while [true][
-            cond: runSeq env node\cond
-            if RET\set -> break
-            if not? truthy cond -> break
-            runSeq env node\action
-            if RET\set -> break
-        ]
-        if RET\set -> return RET\value
-        return null
-    ]
-    if "until" = op [
-        while [true][
-            runSeq env node\action
-            if RET\set -> break
-            cond: runSeq env node\cond
-            if RET\set -> break
-            if truthy cond -> break
-        ]
-        if RET\set -> return RET\value
-        return null
-    ]
     if "call" = op -> return runCall env node
     if "passthrough" = op -> return node\src
+    ; construct ops: the row's `run` column is authoritative, and
+    ; it lives in a shared helper (`runIf` etc.) that both the row
+    ; and this branch point at. Called as a plain global — the
+    ; host `call` builtin frame one level up from runSeq corrupts
+    ; the value stack and a deeper runCall loses its `argVals`.
+    if "function" = op -> return runFunction env node\args
+    if "if" = op -> return runIf env node\args
+    if "do" = op -> return runDo env node\args
+    if "return" = op -> return runReturn env node\args
+    if "while" = op -> return runWhile env node\args
+    if "until" = op -> return runUntil env node\args
     node
 ]
 
@@ -579,10 +601,16 @@ runIRIn: function [env ir][
 ; thing to drift. A row says what a construct MEANS; how many
 ; arguments it takes is Arturo's to say.
 ;
-; `eval` and `emit` receive source-level argument nodes; `run`
-; receives IR. Same construct, three representations of its
-; arguments — which is exactly the distinction the table exists
-; to make explicit.
+; All three columns receive the same `[env argv]`. `eval` gets
+; source-level argument nodes, `emit` gets those nodes and
+; produces an op-tagged dictionary whose `args` is a flat list of
+; the emitted arguments, and `run` gets that list back. So `run`
+; and `eval` are the same construct in the same shape, one in IR
+; and one in source, which is exactly the distinction the table
+; exists to make explicit. The op name is the construct name, so
+; `runNode` reaches the rows the same way `runCall` does — a
+; construct's IR means what its own row says it means, nowhere
+; else.
 ;=======================================================
 RULES: #[]
 
@@ -594,70 +622,69 @@ defRule: function [name row][ RULES\[name]: row ]
 
 defRule "function" #[
     eval: function [env argv][ makeClosure env argv\0 argv\1 ]
-    emit: function [env argv][ #[op: "func" params: argv\0 body: emitSeq env (lowerBlock argv\1)] ]
-    run:  function [env argv][ #[nodek: "closure" params: argv\0 body: argv\1 ir: true env: env] ]
+    emit: function [env argv][
+        bodyIR: emitSeq env (lowerBlock argv\1)
+        ; host quirk: an inline group that returns a block, written
+        ; straight into an `@[...]` literal, is mis-grouped and the
+        ; intermediate gets spliced in as an extra element. Bind to
+        ; a name first — every emit column does.
+        #[op: "function" args: @[argv\0 bodyIR]]
+    ]
+    run:  function [env argv][ runFunction env argv ]
 ]
 
 defRule "if" #[
     eval: function [env argv][ evalIf env argv\0 argv\1 ]
-    emit: function [env argv][ #[op: "if" cond: emitNode env argv\0 yes: emitSeq env (lowerBlock argv\1) no: null] ]
-    run:  function [env argv][
-        cond: runNode env argv\0
-        if truthy cond -> return runBody env argv\1
-        null
+    emit: function [env argv][
+        condIR: emitNode env argv\0
+        yesIR: emitSeq env (lowerBlock argv\1)
+        noIR: null
+        #[op: "if" args: @[condIR yesIR noIR]]
     ]
+    run:  function [env argv][ runIf env argv ]
 ]
 
 defRule "do" #[
     eval: function [env argv][ evalBody env argv\0 ]
     emit: function [env argv][
         body: argv\0
-        if :block = type body -> return #[op: "do" body: emitSeq env (lowerBlock body)]
-        #[op: "do" expr: emitNode env body]
+        if :block = type body [
+            bodyIR: emitSeq env (lowerBlock body)
+            return #[op: "do" args: @[bodyIR]]
+        ]
+        exprIR: emitNode env body
+        #[op: "do" args: @[exprIR]]
     ]
-    run:  function [env argv][ runBody env argv\0 ]
+    run:  function [env argv][ runDo env argv ]
 ]
 
 defRule "return" #[
     eval: function [env argv][ evalReturn env argv\0 ]
-    emit: function [env argv][ #[op: "return" expr: emitNode env argv\0] ]
-    run:  function [env argv][
-        RET\set: true
-        RET\value: runNode env argv\0
-        RET\value
+    emit: function [env argv][
+        exprIR: emitNode env argv\0
+        #[op: "return" args: @[exprIR]]
     ]
+    run:  function [env argv][ runReturn env argv ]
 ]
 
 defRule "while" #[
     eval: function [env argv][ evalWhile env argv\0 argv\1 ]
-    emit: function [env argv][ #[op: "while" cond: emitSeq env (lowerBlock argv\0) action: emitSeq env (lowerBlock argv\1)] ]
-    run:  function [env argv][
-        while [true][
-            cond: runSeq env argv\0
-            if RET\set -> break
-            if not? truthy cond -> break
-            runSeq env argv\1
-            if RET\set -> break
-        ]
-        if RET\set -> return RET\value
-        null
+    emit: function [env argv][
+        condIR: emitSeq env (lowerBlock argv\0)
+        actionIR: emitSeq env (lowerBlock argv\1)
+        #[op: "while" args: @[condIR actionIR]]
     ]
+    run:  function [env argv][ runWhile env argv ]
 ]
 
 defRule "until" #[
     eval: function [env argv][ evalUntil env argv\0 argv\1 ]
-    emit: function [env argv][ #[op: "until" action: emitSeq env (lowerBlock argv\0) cond: emitSeq env (lowerBlock argv\1)] ]
-    run:  function [env argv][
-        while [true][
-            runSeq env argv\1
-            if RET\set -> break
-            cond: runSeq env argv\0
-            if RET\set -> break
-            if truthy cond -> break
-        ]
-        if RET\set -> return RET\value
-        null
+    emit: function [env argv][
+        actionIR: emitSeq env (lowerBlock argv\0)
+        condIR: emitSeq env (lowerBlock argv\1)
+        #[op: "until" args: @[actionIR condIR]]
     ]
+    run:  function [env argv][ runUntil env argv ]
 ]
 
 ; `makeDict` is the one row that is not an Arturo word. The

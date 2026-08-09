@@ -78,14 +78,6 @@ loop INTRINSICS [nm spec][
 mutatesThroughRef?: function [name][ key? MUTATES name ]
 
 ;-----------------------------------------------
-; Words the kernel handles lazily (kernel rules)
-;-----------------------------------------------
-SPECIAL_NAMES: #[
-    "function": true  "do": true  "if": true  "return": true
-    "while": true  "until": true
-]
-
-;-----------------------------------------------
 ; Dynamic arity table (builtins + user functions)
 ;-----------------------------------------------
 ARITY: #[]
