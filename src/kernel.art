@@ -90,6 +90,79 @@ delegate: function [name argVals][
     r
 ]
 
+
+;-----------------------------------------------
+; Mutation through a path reference.
+;
+; `pop 'c\stack` hands the host a REFERENCE, not a value: the
+; builtin writes back through it. Passing that pathliteral
+; straight to `delegate` sent it into a scope where `c` means
+; nothing, so the write went nowhere and the kernel diverged
+; from the host on every in-place update.
+;
+; Instead the base is bound locally, the reference is rebuilt
+; against that local, and the (mutated) container is written
+; back to the environment:
+;
+;   f 'base\seg... rest   ==   t: <base>;  f 't\seg... rest
+;                               base := t
+;
+; Only `:pathliteral` args are treated this way. A bare `'x` is
+; a `:literal` and is ambiguous — `get d 'tag` passes one as a
+; key — so those still go through as values.
+;-----------------------------------------------
+isPathRef: function [v][ :pathliteral = type v ]
+
+hasPathRef: function [argVals][
+    found: false
+    loop argVals [v][ if isPathRef v -> found: true ]
+    found
+]
+
+; "\\stack" / "\\a\\b" — the segments of a path reference, as text
+refSegText: function [parts][
+    out: ""
+    k: 1
+    while [k < size parts][
+        out: out ++ "\\" ++ (to :string parts\[k])
+        k: k + 1
+    ]
+    out
+]
+
+delegateThroughRef: function [env name argVals][
+    refAt: 0
+    seen: false
+    j: 0
+    loop argVals [v][
+        if not? seen [
+            if isPathRef v [ refAt: j  seen: true ]
+        ]
+        j: j + 1
+    ]
+    parts: to :block argVals\[refAt]
+    baseName: to :string parts\0
+    if not? bound? env baseName -> return #[nodek: "error" msg: ["unbound path reference" baseName]]
+
+    ; the local the rebuilt reference points at
+    __t: lookup env baseName
+
+    blk: @[]
+    el0: to :block name
+    if not? empty? el0 -> addItem blk el0\0
+    j2: 0
+    loop argVals [v][
+        if j2 = refAt -> addItem blk (first to :block ("'__t" ++ (refSegText parts)))
+        if j2 <> refAt -> addItem blk v
+        j2: j2 + 1
+    ]
+    r: null
+    err: try [r: do blk]
+    if :error = type err -> return #[nodek: "error" msg: err]
+    define env baseName __t
+    r
+]
+
 ;-----------------------------------------------
 ; Specials: lazy / structural constructs handled by name
 ;-----------------------------------------------
@@ -196,6 +269,26 @@ applyClosure: function [cl argVals][
     result
 ]
 
+;-----------------------------------------------
+; Build a dictionary from a flat [k v k v ...] block.
+;
+; NOT `to :dictionary kv`: a dictionary built that way hands
+; out COPIES of its values. `get d "inner"` returns a fresh
+; dict, so `d\inner\v: 1` — which lowers to
+; `set (get d 'inner) 'v 1` — mutated a copy and the write was
+; lost. A `#[]` seeded with `set` keeps the references, which
+; is what the host's own `#[...]` literal does.
+;-----------------------------------------------
+makeDictFrom: function [kv][
+    d: #[]
+    j: 0
+    while [j < size kv][
+        if (j + 1) < size kv -> set d kv\[j] kv\[j + 1]
+        j: j + 2
+    ]
+    d
+]
+
 evalCall: function [env node][
     fnNode: node\fn
 
@@ -204,7 +297,7 @@ evalCall: function [env node][
     if and? (isLoadNode fnNode) ["makeDict" = fnNode\name] [
         kv: @[]
         loop node\args [a][ addItem kv (evalNode env a :interpret) ]
-        return to :dictionary kv
+        return makeDictFrom kv
     ]
 
     ; kernel specials, recognised by name before evaluation
@@ -224,7 +317,10 @@ evalCall: function [env node][
 
     if and? (isNode fnVal) [not? null? fnVal\nodek] [
         if "closure" = fnVal\nodek -> return applyClosure fnVal argVals
-        if "hostword" = fnVal\nodek -> return delegate fnVal\name argVals
+        if "hostword" = fnVal\nodek [
+            if hasPathRef argVals -> return delegateThroughRef env fnVal\name argVals
+            return delegate fnVal\name argVals
+        ]
     ]
     #[nodek: "error" msg: ["cannot call" fnVal]]
 ]
@@ -426,7 +522,7 @@ runCall: function [env node][
         if "makeDict" = name [
             kv: @[]
             loop node\args [a][ addItem kv (runNode env a) ]
-            return to :dictionary kv
+            return makeDictFrom kv
         ]
         if isSpecialName name [
             if "function" = name -> return #[nodek: "closure" params: node\args\0 body: node\args\1 ir: true env: env]
@@ -472,7 +568,10 @@ runCall: function [env node][
 
     if and? (isNode fnVal) [not? null? fnVal\nodek] [
         if "closure" = fnVal\nodek -> return applyClosure fnVal argVals
-        if "hostword" = fnVal\nodek -> return delegate fnVal\name argVals
+        if "hostword" = fnVal\nodek [
+            if hasPathRef argVals -> return delegateThroughRef env fnVal\name argVals
+            return delegate fnVal\name argVals
+        ]
     ]
     #[nodek: "error" msg: ["cannot call" fnVal]]
 ]

@@ -50,14 +50,19 @@ escapeString: function [s][
 renderValue: function [v][
     if null? v -> return "null"
     t: type v
+    ; A negative literal splits as `-` + `1` inside a block on
+    ; the host, so it has to be rendered as an expression. `neg`
+    ; and not `(0 - n)`: the host's bytecode compiler silently
+    ; dies on a store bound to a negative constant, so
+    ; `x: (0 - 4)` compiles to a program that stops there, while
+    ; `x: neg 4` is fine. (`x: sub 10 4` works and `x: sub 4 10`
+    ; does not — it is the negative result, not the call.)
     if :integer = t [
-        ; a negative literal splits as `-` + `1` inside a block
-        ; on the host, so render it as a parenthesised expression
-        if 0 > v -> return "(0 - " ++ (to :string (0 - v)) ++ ")"
+        if 0 > v -> return "neg " ++ (to :string (0 - v))
         return to :string v
     ]
     if :floating = t [
-        if 0.0 > v -> return "(0 - " ++ (to :string (0 - v)) ++ ")"
+        if 0.0 > v -> return "neg " ++ (to :string (0 - v))
         return to :string v
     ]
     if :type = t -> return ":" ++ (to :string v)

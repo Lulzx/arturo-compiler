@@ -46,12 +46,17 @@ claim — the compiler reproduces itself.
     src/tests.art     the differential harness
     corpus/           one program per rule, then compositions
 
-Known limits, stated plainly: the emitted code names builtins as
-prefix words (`x * 2` becomes `mul x 2`), so a program that also
-binds a variable called `mul` will have the emitted call captured
-by it — the compiler needs output hygiene it does not yet have.
-The kernel does not model mutation through a path reference
-(`pop 'c\stack`) or a nested path assignment (`d\a\b: v`); both
-work on the host and through `-c`, so the compiler bootstraps,
-but interpret mode diverges on them. Read `SPEC.md` for the full
-design and `corpus/m1/RESULTS.md` for the pinned host behavior.
+Known limits, stated plainly, all of them the host's. Arturo
+0.10.0's bytecode compiler (`arturo -c`) silently drops a
+mutation made through a path reference — `append 'c\stack 4`
+writes nothing, though `append 'b 4` is fine — and it dies on a
+store bound to a negative constant, which is why negatives are
+emitted as `neg 4` and not `(0 - 4)`. Binding the result of an
+in-place `append` (`v: append 'b 4`) kills the host outright,
+source or bytecode, so the compiler cannot faithfully rewrite
+the first of those. Path-reference mutation is covered in
+`src/smoke.art` rather than the corpus for that reason: the
+compiled engine cannot agree with the other three.
+
+Read `SPEC.md` for the full design and `corpus/m1/RESULTS.md`
+for the pinned host behavior.

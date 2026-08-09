@@ -102,6 +102,25 @@ nothing usable; values that are never claimed are dropped at block end.
    the buggy pattern or pin it as a known divergence.
 2. **Silent exit 1** with no message on some errors (`x: print 7` then
    `print x`).
+3. **`to :dictionary` hands out copies.** `get d k` on a dictionary built
+   by `to :dictionary <block>` returns a *copy* of the value; on a `#[...]`
+   literal it returns the reference. So `d\a\b: v` — which lowers to
+   `set (get d 'a) 'b v` — writes into a copy and the update is lost. The
+   kernel builds dictionaries as `#[]` seeded with `set` instead.
+4. **`-c` drops mutation through a path reference.** `append 'c\stack 4`
+   and `pop 'c\stack` work when the source is interpreted but write
+   nothing once compiled to bytecode; `append 'b 4` through a plain
+   literal reference is fine either way.
+5. **Binding an in-place `append`'s result kills the process.**
+   `v: append 'b 4` exits silently, source or bytecode, even wrapped in
+   `do [...]`. `v: pop 'b` is fine. This is why 4 cannot simply be
+   rewritten to go through a plain reference and store back.
+6. **`-c` dies on a store bound to a negative constant.** `x: sub 4 10`
+   compiles to a program that stops there; `x: sub 10 4` is fine, and so
+   is `x: neg 6`. It is the negative result, not the call. Negative
+   literals are therefore emitted as `neg n`.
+7. **`-c` mis-compiles operator-like dictionary keys.** `#["+": "add"]`
+   is fine interpreted, but raises a `let` arity error as bytecode.
 
 ## Consequences for the compiler
 
@@ -116,3 +135,9 @@ nothing usable; values that are never claimed are dropped at block end.
 - **`if` is lazy, arity 2, no else.** The spec's `if` rule is updated.
 - **Nothing-returning calls** (e.g. `print`) must be modeled or
   `print print 5` diverges.
+- **Output hygiene.** The emitted program names builtins as prefix words
+  (`a * b` → `mul a b`, `d\k` → `get d 'k`), so a source that rebinds a
+  builtin word to a plain value would capture the compiler's own calls.
+  The binding is renamed instead (`_shadow_mul`), which leaves the word
+  meaning the builtin exactly as it did in the source. A `function`
+  binding is left alone — it does not shadow on the host either.

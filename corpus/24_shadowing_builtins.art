@@ -1,0 +1,17 @@
+; a variable may take a builtin word's name. The word then reads
+; the variable, but the infix symbol still means the builtin.
+; (Host: after `sub: 5`, `sub` is 5 and `10 - 3` is still 7.)
+sub: 5
+mul: "text"
+print sub
+print mul
+print 10 - 3
+print (0 - 1)
+print 2 * 3 + 4
+n: 0 - 4
+print n
+print n * (0 - 2)
+
+size: 3
+print size
+print size + 1

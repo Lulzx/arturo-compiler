@@ -33,5 +33,15 @@ go: function [][
     run "map [1 2 3] 'x [x * 2]"
     run "f: function [x] -> x * 2 f 21"
     run "r: 1..5 size r"
+
+    ; Mutation through paths. The kernel has to match the host
+    ; here: a dictionary field is a reference, and a `'c\\stack`
+    ; argument is written back through. Not in the corpus —
+    ; the host's `-c` drops both, so the compiled engine of the
+    ; differential harness cannot agree with the other three.
+    run "d: #[inner: #[v: 41]] d\\inner\\v: d\\inner\\v + 1 d\\inner\\v"
+    run "c: #[s: @[1 2 3]] append 'c\\s 4 size c\\s"
+    run "c: #[s: @[1 2 3]] pop 'c\\s c\\s"
+    run "c: #[a: #[b: @[]]] append 'c\\a\\b 7 c\\a\\b"
 ]
 go
