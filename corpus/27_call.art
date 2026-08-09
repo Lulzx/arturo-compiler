@@ -1,0 +1,24 @@
+; call — invoke a closure stored in a dictionary. This is the
+; shape the rule table dispatches through: a row holds eval,
+; emit and run columns as closures, and the dispatchers reach
+; them via the builtin `call`, which unpacks the argument
+; block into the closure's parameters.
+R: #[]
+R\plus: #[
+    eval: function [x y][ add x y ]
+    emit: function [x y][ add x y ]
+    run:  function [x y][ add x y ]
+]
+R\times: #[
+    eval: function [x y][ mul x y ]
+    emit: function [x y][ mul x y ]
+    run:  function [x y][ mul x y ]
+]
+
+print size R
+r: R\plus
+print call r\eval @[3 4]
+print call r\emit @[2 3]
+; a row pulled out through a nested path
+print call R\times\run @[6 7]
+print call R\times\eval @[3 4]

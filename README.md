@@ -24,6 +24,16 @@ Arity is deliberately not in the row. It is declared upstream and
 generated into `INTRINSICS`; a second copy is a second thing to
 drift. A row says what a construct *means*.
 
+`call` is a row too — the builtin that takes a function value and
+a block of arguments and applies them. It cannot stay delegated:
+the function value is usually a kernel closure, and the delegate
+refuses to hand kernel-internal values to the host, so the kernel
+applies it itself. That is also how the table is *executed*: the
+dispatchers reach their rows through `call r\eval @[env argv]`,
+pulling a closure out of a dictionary, and until this row existed
+that was a call the compiler could compile but the kernel could
+not run. `corpus/27_call.art` pins it across all four engines.
+
 The three columns are held to each other by construction —
 
 ```

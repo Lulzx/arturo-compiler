@@ -310,6 +310,22 @@ makeDictFrom: function [kv][
     d
 ]
 
+; Apply a function value to a block of evaluated arguments.
+; The shared tail of every call: the callee has been
+; evaluated to a value and the args have been evaluated, so
+; all that is left is the application itself. The `call`
+; row applies this to a block pulled from a dictionary.
+applyVal: function [env fnVal argVals][
+    if and? (isNode fnVal) [not? null? fnVal\nodek] [
+        if "closure" = fnVal\nodek -> return applyClosure fnVal argVals
+        if "hostword" = fnVal\nodek [
+            if hasPathRef argVals -> return delegateThroughRef env fnVal\name argVals
+            return delegate fnVal\name argVals
+        ]
+    ]
+    #[nodek: "error" msg: ["cannot call" fnVal]]
+]
+
 evalCall: function [env node][
     fnNode: node\fn
 
@@ -321,15 +337,7 @@ evalCall: function [env node][
     fnVal: evalNode env fnNode :interpret
     argVals: @[]
     loop node\args [a][ addItem argVals (evalNode env a :interpret) ]
-
-    if and? (isNode fnVal) [not? null? fnVal\nodek] [
-        if "closure" = fnVal\nodek -> return applyClosure fnVal argVals
-        if "hostword" = fnVal\nodek [
-            if hasPathRef argVals -> return delegateThroughRef env fnVal\name argVals
-            return delegate fnVal\name argVals
-        ]
-    ]
-    #[nodek: "error" msg: ["cannot call" fnVal]]
+    applyVal env fnVal argVals
 ]
 
 ;=======================================================
@@ -508,15 +516,7 @@ runCall: function [env node][
     fnVal: runNode env fnNode
     argVals: @[]
     loop node\args [a][ addItem argVals (runNode env a) ]
-
-    if and? (isNode fnVal) [not? null? fnVal\nodek] [
-        if "closure" = fnVal\nodek -> return applyClosure fnVal argVals
-        if "hostword" = fnVal\nodek [
-            if hasPathRef argVals -> return delegateThroughRef env fnVal\name argVals
-            return delegate fnVal\name argVals
-        ]
-    ]
-    #[nodek: "error" msg: ["cannot call" fnVal]]
+    applyVal env fnVal argVals
 ]
 
 ;=======================================================
@@ -668,5 +668,31 @@ defRule "makeDict" #[
         kv: @[]
         loop argv [a][ addItem kv (runNode env a) ]
         makeDictFrom kv
+    ]
+]
+
+; `call` is the builtin that takes a function VALUE and a
+; block of arguments and applies them. It cannot stay
+; delegated: the function value is usually a kernel
+; closure, and the delegate refuses to hand kernel-internal
+; values to the host — so the kernel applies it itself.
+;
+; This is the row the rule table is executed by. The
+; dispatchers reach their rows through `call r\eval @[...]`,
+; pulling a closure out of a dictionary and invoking it, and
+; until this row existed that was a call the kernel could
+; compile but not run. Its emit column rebuilds the plain
+; call to the builtin, which is what the source said.
+defRule "call" #[
+    eval: function [env argv][
+        fnVal: evalNode env argv\0 :interpret
+        argBlock: evalNode env argv\1 :interpret
+        applyVal env fnVal argBlock
+    ]
+    emit: function [env argv][ #[op: "call" fn: #[op: "intrinsic" name: "call"] args: emitSeq env argv] ]
+    run:  function [env argv][
+        fnVal: runNode env argv\0
+        argBlock: runNode env argv\1
+        applyVal env fnVal argBlock
     ]
 ]
