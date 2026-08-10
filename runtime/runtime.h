@@ -98,6 +98,7 @@ IR *ir_op(const char *op, IR **args, int n);   /* if/do/return/while/until */
 IR *ir_seq(IR **items, int n);                 /* internal __seq of statements */
 
 /* ---- evaluation -------------------------------------------------------- */
+void runtime_set_args(int argc, char **argv);
 Value runSeq(Env *e, IR **seq, int n);
 Value runNode(Env *e, IR *node);
 

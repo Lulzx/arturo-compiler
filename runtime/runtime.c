@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
 
 /* ---- error handling ----------------------------------------------------- */
 static void die(const char *msg) {
@@ -264,6 +265,9 @@ static Value b_last(Env*e,Value*a,int n){
 static int dict_find(Value d, const char *k);
 static Value applyAction(Env *parent, Value params, Value action, Value el);
 static Value evalSeq(Env *e, Value **it, int n);
+static Value evalExpr(Env *e, Value **it, int n, int *ip);
+static int  path_is_dyn(Value v);
+static int  starts_stmt(Value v);
 
 /* resolve a pathliteral `'a\b\c` to the container dict holding the final
  * segment plus that segment's index, so a mutating builtin can write back.
@@ -446,6 +450,352 @@ static Value b_call(Env*e,Value*a,int n){
     return applyFunc(e,fn,argv,args.u.block.n);
 }
 
+/* ---- builtins the compiler's own source needs ---------------------------- */
+
+/* render a value as a C string (Arturo's `to :string`). */
+static char *val_str(Value v){
+    char b[64];
+    switch (v.k) {
+        case V_INT:    snprintf(b,64,"%ld",v.u.i); return strdup(b);
+        case V_FLOAT:  snprintf(b,64,"%g",v.u.f); return strdup(b);
+        case V_STR:    return strdup(v.u.s);
+        case V_CHAR:   { char c[2]={v.u.c,0}; return strdup(c); }
+        case V_BOOL:   return strdup(v.u.b?"true":"false");
+        case V_NULL:   return strdup("null");
+        case V_FUNC:   return strdup("function");
+        case V_BUILTIN:return strdup(v.u.s);
+        case V_RANGE:  snprintf(b,64,"%ld..%ld",v.u.range.lo,v.u.range.hi); return strdup(b);
+        case V_BLOCK: {
+            size_t cap=32, len=0; char *out=xmalloc(cap); out[0]=0;
+            for(int i=0;i<v.u.block.n;i++){
+                char *s=val_str(*v.u.block.items[i]); size_t need=len+strlen(s)+2;
+                if(need>cap){ cap=need*2; out=xrealloc(out,cap); }
+                if(i){ out[len++]=' '; } strcpy(out+len,s); len+=strlen(s); free(s);
+            }
+            out[len]=0; return out;
+        }
+        case V_DICT: {
+            size_t cap=32, len=0; char *out=xmalloc(cap); out[0]=0;
+            strcpy(out,"#["); len=2;
+            for(int i=0;i<v.u.dict->n;i++){
+                char *s=val_str(v.u.dict->vals[i]);
+                size_t need=len+strlen(v.u.dict->keys[i])+1+strlen(s)+1+1;
+                if(need>cap){ cap=need*2; out=xrealloc(out,cap); }
+                if(i){ out[len++]=' '; } sprintf(out+len,"%s:",v.u.dict->keys[i]);
+                len+=strlen(v.u.dict->keys[i])+1; strcpy(out+len,s); len+=strlen(s); free(s);
+            }
+            out[len++]=']'; out[len]=0; return out;
+        }
+        case V_PATH: {
+            size_t cap=16, len=0; char *out=xmalloc(cap); out[0]=0;
+            for(int i=0;i<v.u.path.nsegs;i++){
+                size_t add=strlen(v.u.path.segs[i])+1; if(len+add>cap){cap=(len+add)*2;out=xrealloc(out,cap);}
+                if(i) out[len++]='\\'; strcpy(out+len,v.u.path.segs[i]); len+=strlen(v.u.path.segs[i]);
+            }
+            out[len]=0; return out;
+        }
+    }
+    return strdup("null");
+}
+
+static Value one_elt(Value v);
+
+/* `to :type value` — the workhorse conversion (237 call sites in the compiler). */
+static Value b_to(Env*e,Value*a,int n){
+    const char *ty=a[0].u.s; Value v=a[1];
+    if(!strcmp(ty,":string")){ char *s=val_str(v); Value r=v_str(s); free(s); return r; }
+    if(!strcmp(ty,":word")||!strcmp(ty,":label")||!strcmp(ty,":literal")||!strcmp(ty,":symbol"))
+        { char *s=val_str(v); Value r=v_str(s); free(s); return r; }
+    if(!strcmp(ty,":integer")){
+        if(v.k==V_STR) return v_int(atol(v.u.s));
+        if(v.k==V_FLOAT) return v_int((long)v.u.f);
+        if(v.k==V_INT) return v;
+        if(v.k==V_BOOL) return v_int(v.u.b?1:0);
+        die("to :integer"); return v_null();
+    }
+    if(!strcmp(ty,":floating")){
+        if(v.k==V_STR) return v_float(atof(v.u.s));
+        if(v.k==V_INT) return v_float((double)v.u.i);
+        if(v.k==V_FLOAT) return v;
+        die("to :floating"); return v_null();
+    }
+    if(!strcmp(ty,":logical")){
+        if(v.k==V_STR) return v_bool(!strcmp(v.u.s,"true")||!strcmp(v.u.s,"1"));
+        if(v.k==V_INT) return v_bool(v.u.i!=0);
+        return v_bool(v_truthy(v));
+    }
+    if(!strcmp(ty,":char")){
+        if(v.k==V_STR) return v_char(v.u.s[0]);
+        if(v.k==V_INT) return v_char((char)v.u.i);
+        if(v.k==V_CHAR) return v;
+        die("to :char"); return v_null();
+    }
+    if(!strcmp(ty,":block")){
+        if(v.k==V_BLOCK) return v;
+        if(v.k==V_STR) return one_elt(v);   /* single-char? keep whole string as one elem */
+        return one_elt(v);
+    }
+    if(!strcmp(ty,":dictionary")){
+        if(v.k==V_DICT) return v;
+        die("to :dictionary"); return v_null();
+    }
+    if(!strcmp(ty,":array")){ /* array is block-like */
+        if(v.k==V_BLOCK) return v;
+        return one_elt(v);
+    }
+    return v;
+}
+/* a block holding a single element. */
+static Value one_elt(Value v){ Value **it=(Value**)xmalloc(sizeof(Value*)); it[0]=(Value*)xmalloc(sizeof(Value)); it[0][0]=v; return v_block(it,1); }
+
+/* `replace s from to` — replace all occurrences of `from` with `to`. */
+static Value b_replace(Env*e,Value*a,int n){
+    const char *s=a[0].u.s, *from=a[1].u.s, *to=a[2].u.s;
+    if(!*from) return v_str(s);
+    int cnt=0; for(const char*p=s;(p=strstr(p,from));p+=strlen(from)) cnt++;
+    if(!cnt) return v_str(s);
+    size_t fl=strlen(from), tl=strlen(to), sl=strlen(s);
+    char *out=xmalloc(sl + cnt*(tl-fl) + 1);
+    char *o=out;
+    const char *p;
+    while((p=strstr(s,from))){
+        size_t pre=p-s; memcpy(o,s,pre); o+=pre; memcpy(o,to,tl); o+=tl;
+        s=p+fl;
+    }
+    strcpy(o,s);
+    Value r=v_str(out); free(out); return r;
+}
+
+/* `joinWith coll sep` — render coll's elements joined by sep. */
+static Value b_joinWith(Env*e,Value*a,int n){
+    Value coll=a[0]; const char *sep=(n>1 && a[1].k==V_STR)?a[1].u.s:"";
+    if(coll.k==V_STR) return coll;
+    if(coll.k!=V_BLOCK) die("joinWith: expected block");
+    size_t total=1;
+    for(int i=0;i<coll.u.block.n;i++){ char*s=val_str(*coll.u.block.items[i]); total+=strlen(s); free(s); if(i) total+=strlen(sep); }
+    char *out=xmalloc(total+1); size_t len=0; out[0]=0;
+    for(int i=0;i<coll.u.block.n;i++){
+        char*s=val_str(*coll.u.block.items[i]);
+        if(i){ strcpy(out+len,sep); len+=strlen(sep); }
+        strcpy(out+len,s); len+=strlen(s); free(s);
+    }
+    out[len]=0; Value r=v_str(out); free(out); return r;
+}
+
+/* `fold coll init [acc x][ body ]` — left fold. */
+static Value b_fold(Env*e,Value*a,int n){
+    Value coll=a[0], init=a[1], params=a[2], action=a[3];
+    int cnt=coll.k==V_RANGE?(int)(coll.u.range.hi-coll.u.range.lo+1):coll.u.block.n;
+    Value acc=init;
+    for(int i=0;i<cnt;i++){
+        Value el=coll.k==V_RANGE?v_int(coll.u.range.lo+i):*coll.u.block.items[i];
+        Env *child=env_new(e);
+        if(params.k==V_BLOCK && params.u.block.n>=1) env_set(child,(*params.u.block.items[0]).u.s,acc);
+        if(params.k==V_BLOCK && params.u.block.n>=2) env_set(child,(*params.u.block.items[1]).u.s,el);
+        acc=evalSeq(child,action.u.block.items,action.u.block.n);
+    }
+    return acc;
+}
+
+static Value b_lower(Env*e,Value*a,int n){
+    const char*s=a[0].u.s; char*out=strdup(s);
+    for(char*p=out;*p;p++) *p=(char)tolower((unsigned char)*p);
+    Value r=v_str(out); free(out); return r;
+}
+static Value b_upper(Env*e,Value*a,int n){
+    const char*s=a[0].u.s; char*out=strdup(s);
+    for(char*p=out;*p;p++) *p=(char)toupper((unsigned char)*p);
+    Value r=v_str(out); free(out); return r;
+}
+/* `index coll needle` — 0-based index of first occurrence, -1 if absent. */
+static Value b_index(Env*e,Value*a,int n){
+    if(a[0].k==V_STR){
+        const char *s=a[0].u.s, *nd=a[1].u.s;
+        const char *p=strstr(s,nd);
+        return v_int(p?(long)(p-s):-1);
+    }
+    if(a[0].k==V_BLOCK){
+        Value **it=a[0].u.block.items; int m=a[0].u.block.n;
+        for(int i=0;i<m;i++){ /* compare by value-str for simplicity */
+            char *sv=val_str(*it[i]), *nv=val_str(a[1]);
+            int eq=!strcmp(sv,nv); free(sv); free(nv);
+            if(eq) return v_int(i);
+        }
+        return v_int(-1);
+    }
+    die("index"); return v_null();
+}
+/* `slice coll from to` — inclusive slice (Arturo semantics). */
+static Value b_slice(Env*e,Value*a,int n){
+    long from=as_int(a[1]), to=as_int(a[2]);
+    if(a[0].k==V_BLOCK){
+        int m=a[0].u.block.n;
+        if(from<0) from=0; if(to>=m) to=m-1;
+        int cnt=(int)(to-from+1); if(cnt<0) cnt=0;
+        Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
+        for(int i=0;i<cnt;i++) items[i]=a[0].u.block.items[from+i];
+        return v_block(items,cnt);
+    }
+    if(a[0].k==V_STR){
+        const char*s=a[0].u.s; long m=(long)strlen(s);
+        if(from<0) from=0; if(to>=m) to=m-1;
+        long cnt=to-from+1; if(cnt<0) cnt=0;
+        char *out=xmalloc(cnt+1); memcpy(out,s+from,cnt); out[cnt]=0;
+        Value r=v_str(out); free(out); return r;
+    }
+    die("slice"); return v_null();
+}
+/* `split s sep` — split a string into a block of substrings. */
+static Value b_split(Env*e,Value*a,int n){
+    const char *s=a[0].u.s, *sep=a[1].u.s;
+    if(!*sep){ /* split into chars */
+        int m=(int)strlen(s); Value **items=(Value**)xmalloc((m+1)*sizeof(Value*));
+        for(int i=0;i<m;i++){ char c[2]={s[i],0}; items[i]=(Value*)xmalloc(sizeof(Value)); items[i][0]=v_str(c); }
+        return v_block(items,m);
+    }
+    int cnt=1; for(const char*p=s; (p=strstr(p,sep)); p+=strlen(sep)) cnt++;
+    Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
+    int m=0; const char *start=s, *p;
+    while((p=strstr(start,sep))){
+        long len=p-start; char *tok=xmalloc(len+1); memcpy(tok,start,len); tok[len]=0;
+        items[m]=(Value*)xmalloc(sizeof(Value)); items[m][0]=v_str(tok); free(tok); m++;
+        start=p+strlen(sep);
+    }
+    items[m]=(Value*)xmalloc(sizeof(Value)); items[m][0]=v_str(start); m++;
+    return v_block(items,m);
+}
+/* `take coll n` / `drop coll n` */
+static Value b_take(Env*e,Value*a,int n){
+    long c=as_int(a[1]);
+    if(a[0].k==V_BLOCK){
+        int m=a[0].u.block.n; if(c>m)c=m; if(c<0)c=0;
+        Value **items=(Value**)xmalloc((c+1)*sizeof(Value*));
+        for(int i=0;i<c;i++) items[i]=a[0].u.block.items[i];
+        return v_block(items,c);
+    }
+    if(a[0].k==V_STR){
+        const char*s=a[0].u.s; long m=(long)strlen(s); if(c>m)c=m; if(c<0)c=0;
+        char *out=xmalloc(c+1); memcpy(out,s,c); out[c]=0;
+        Value r=v_str(out); free(out); return r;
+    }
+    die("take"); return v_null();
+}
+static Value b_drop(Env*e,Value*a,int n){
+    long c=as_int(a[1]);
+    if(a[0].k==V_BLOCK){
+        int m=a[0].u.block.n; if(c>m)c=m; if(c<0)c=0;
+        int cnt=m-(int)c; Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
+        for(int i=0;i<cnt;i++) items[i]=a[0].u.block.items[c+i];
+        return v_block(items,cnt);
+    }
+    if(a[0].k==V_STR){
+        const char*s=a[0].u.s; long m=(long)strlen(s); if(c>m)c=m; if(c<0)c=0;
+        long cnt=m-c; char *out=xmalloc(cnt+1); memcpy(out,s+c,cnt); out[cnt]=0;
+        Value r=v_str(out); free(out); return r;
+    }
+    die("drop"); return v_null();
+}
+static Value b_reverse(Env*e,Value*a,int n){
+    if(a[0].k==V_STR){
+        const char*s=a[0].u.s; long m=(long)strlen(s);
+        char *out=xmalloc(m+1); for(long i=0;i<m;i++) out[i]=s[m-1-i]; out[m]=0;
+        Value r=v_str(out); free(out); return r;
+    }
+    if(a[0].k==V_BLOCK){
+        int m=a[0].u.block.n; Value **items=(Value**)xmalloc((m+1)*sizeof(Value*));
+        for(int i=0;i<m;i++) items[i]=a[0].u.block.items[m-1-i];
+        return v_block(items,m);
+    }
+    die("reverse"); return v_null();
+}
+/* `ensure pred msg` — assert; die on failure. */
+static Value b_ensure(Env*e,Value*a,int n){
+    if(!v_truthy(a[0])){ const char *m=(n>1&&a[1].k==V_STR)?a[1].u.s:"assertion failed"; die(m); }
+    return a[0];
+}
+/* `array coll` — block to an array (block-like here). */
+static Value b_array(Env*e,Value*a,int n){
+    Value v=a[0];
+    if(v.k==V_BLOCK) return v;
+    return one_elt(v);
+}
+/* `case key [match1 -> result1, match2 -> result2, ...]` — the arms form a
+ * FLAT block: each arm is `match "->" resultExpr...`, where resultExpr is the
+ * tokens from after "->" until the next arm starts. The emitter wraps
+ * multi-token results in a nested block, so a top-level token that is a
+ * ":type" word or "else" begins a new arm (results never contain those). */
+static Value b_case(Env*e,Value*a,int n){
+    Value key=a[0]; Value pairs=a[1];
+    if(pairs.k!=V_BLOCK) die("case: expected arms block");
+    Value **it=pairs.u.block.items; int pn=pairs.u.block.n;
+    int i=0;
+    while(i<pn){
+        /* match token */
+        Value mv=*it[i];
+        int arrow=i+1;
+        if(arrow>=pn || it[arrow]->k!=V_STR || strcmp(it[arrow]->u.s,"->")) i++;
+        int rs=arrow+1;               /* result start */
+        int re=rs;                    /* result end (exclusive) */
+        while(re<pn){
+            Value t=*it[re];
+            if(t.k==V_STR && (t.u.s[0]==':' || !strcmp(t.u.s,"else"))) break;
+            re++;
+        }
+        int hit;
+        if(mv.k==V_STR && !strcmp(mv.u.s,"else")) hit=1;
+        else hit = v_truthy(b_equal(e,(Value[]){key,mv},2));   /* value equality */
+        if(hit){
+            if(re<=rs) return v_null();
+            return evalSeq(e, it+rs, re-rs);   /* result is a small statement seq */
+        }
+        i = re;
+    }
+    return v_null();
+}
+/* `read path` — read a file as a string. */
+static Value b_read(Env*e,Value*a,int n){
+    const char *path=a[0].u.s;
+    FILE *f=fopen(path,"rb");
+    if(!f){ /* return empty on missing (bundle `read` does) */
+        return v_str("");
+    }
+    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+    char *buf=xmalloc(sz+1); fread(buf,1,sz,f); buf[sz]=0; fclose(f);
+    Value r=v_str(buf); free(buf); return r;
+}
+/* `write path content` */
+static Value b_write(Env*e,Value*a,int n){
+    const char *path=a[0].u.s;
+    char *s=val_str(a[1]);
+    FILE *f=fopen(path,"wb");
+    if(!f){ free(s); die("write: cannot open"); return v_null(); }
+    fwrite(s,1,strlen(s),f); fclose(f); free(s);
+    return v_null();
+}
+/* `execute cmd` — run a shell command and return its captured stdout. */
+static Value b_execute(Env*e,Value*a,int n){
+    char *s=val_str(a[0]);
+    FILE *p=popen(s,"r"); free(s);
+    if(!p) return v_str("");
+    size_t cap=256, len=0; char *buf=xmalloc(cap); buf[0]=0;
+    char tmp[256];
+    while(fgets(tmp,sizeof tmp,p)){ size_t t=strlen(tmp); if(len+t+1>cap){cap=(len+t)*2;buf=xrealloc(buf,cap);} memcpy(buf+len,tmp,t); len+=t; }
+    buf[len]=0; pclose(p);
+    Value r=v_str(buf); free(buf); return r;
+}
+/* `args` — the command-line arguments as a block of strings. The generated
+ * main() calls runtime_set_args() before running the program. */
+static int  g_argc = 0;
+static char **g_argv = NULL;
+void runtime_set_args(int argc, char **argv){ g_argc = argc; g_argv = argv; }
+
+static Value b_args(Env*e,Value*a,int n){
+    int c = g_argc>0 ? g_argc-1 : 0;              /* skip program name */
+    Value **items = (Value**)xmalloc((c+1)*sizeof(Value*));
+    for(int i=0;i<c;i++){ items[i]=(Value*)xmalloc(sizeof(Value)); items[i][0]=v_str(g_argv[i+1]); }
+    return v_block(items, c);
+}
+
 static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"print",b_print},{"add",b_add},{"sub",b_sub},{"mul",b_mul},{"div",b_div},
     {"fdiv",b_fdiv},{"mod",b_mod},{"pow",b_pow},{"neg",b_neg},{"inc",b_inc},
@@ -455,6 +805,11 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"get",b_get},{"empty?",b_empty},{"call",b_call},{"type",b_type},
     {"concat",b_concat},{"range",b_range},{"key?",b_key},
     {"map",b_map},{"select",b_select},{"loop",b_loop},
+    {"to",b_to},{"replace",b_replace},{"joinWith",b_joinWith},{"fold",b_fold},
+    {"lower",b_lower},{"upper",b_upper},{"index",b_index},{"slice",b_slice},
+    {"split",b_split},{"take",b_take},{"drop",b_drop},{"reverse",b_reverse},
+    {"ensure",b_ensure},{"array",b_array},{"case",b_case},
+    {"read",b_read},{"write",b_write},{"execute",b_execute},{"args",b_args},
     {NULL,NULL}
 };
 
@@ -549,7 +904,19 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
             free(args); die("unknown function in action"); return v_null();
         }
         if (binop_name(v.u.s)) { (*ip)++; return v; }   /* lone operator: data */
-        if (env_bound(e, v.u.s)) { (*ip)++; return env_get(e, v.u.s); }
+        if (env_bound(e, v.u.s)) {
+            Value bv = env_get(e, v.u.s);
+            if (bv.k==V_FUNC || bv.k==V_BUILTIN) {      /* callable: apply to args */
+                (*ip)++;
+                Value *args=(Value*)xmalloc((n+1)*sizeof(Value));
+                int m=0;
+                while (*ip<n && !is_binop(*it[*ip]) && !starts_stmt(*it[*ip]))
+                    args[m++]=evalExpr(e,it,n,ip);
+                Value out=applyFunc(e,bv,args,m);
+                free(args); return out;
+            }
+            (*ip)++; return bv;                         /* plain variable */
+        }
         (*ip)++; return v;                              /* string constant */
     }
     if (v.k == V_PATH && path_is_dyn(v)) { (*ip)++; return path_read(e, v); }  /* path read */
@@ -622,10 +989,14 @@ static Value evalSeq(Env *e, Value **it, int n) {
     while (i < n) {
         Value h = *it[i];
         if (h.k == V_PATH && path_is_dyn(h)) {          /* `path\[k]: val` */
-            int i2 = i+1;
-            Value val = evalExpr(e, it, n, &i2);
-            path_write(e, h, val);
-            i = i2; continue;
+            if (i+1 < n) {                              /* path followed by value: WRITE */
+                int i2 = i+1;
+                Value val = evalExpr(e, it, n, &i2);
+                path_write(e, h, val);
+                i = i2; continue;
+            }
+            r = path_read(e, h);                        /* bare path: READ expr */
+            i++; continue;
         }
         if (h.k == V_STR && !strncmp(h.u.s,"@LBL:",5)) { /* define `x: val` */
             const char *nm = h.u.s+5; i++;
