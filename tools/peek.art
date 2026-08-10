@@ -1,0 +1,6 @@
+import ./"../src/ir.art"
+show: function [][
+    ir: fold (compileToIR (read "corpus/21_arrows.art"))
+    loop ir [n][ print (to :string n) ]
+]
+show

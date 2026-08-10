@@ -1,0 +1,7 @@
+import ./"../src/cbackend.art"
+show: function [][
+    c: compileToC (read "corpus/07_do.art")
+    write c "/tmp/cvdo.c"
+    print ["size:" size c]
+]
+show
