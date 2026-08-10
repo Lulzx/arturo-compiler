@@ -790,10 +790,15 @@ static char **g_argv = NULL;
 void runtime_set_args(int argc, char **argv){ g_argc = argc; g_argv = argv; }
 
 static Value b_args(Env*e,Value*a,int n){
+    /* Arturo's `args` is a dict `#[values: [...]]`; the compiler reads
+     * `args\values\0`. */
     int c = g_argc>0 ? g_argc-1 : 0;              /* skip program name */
     Value **items = (Value**)xmalloc((c+1)*sizeof(Value*));
     for(int i=0;i<c;i++){ items[i]=(Value*)xmalloc(sizeof(Value)); items[i][0]=v_str(g_argv[i+1]); }
-    return v_block(items, c);
+    Value vals = v_block(items, c);
+    char **keys=(char**)xmalloc(sizeof(char*)); keys[0]=(char*)xmalloc(7); memcpy(keys[0],"values",7);
+    Value *vv=(Value*)xmalloc(sizeof(Value)); vv[0]=vals;
+    return v_dict(keys, vv, 1);
 }
 
 static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
@@ -988,6 +993,18 @@ static Value evalSeq(Env *e, Value **it, int n) {
     int i = 0;
     while (i < n) {
         Value h = *it[i];
+        if (h.k == V_BLOCK && h.u.block.n>=3 && (*h.u.block.items[0]).k==V_STR
+            && !strcmp((*h.u.block.items[0]).u.s,"set")) {
+            /* complex path write `[set, base, keyblock] value` */
+            Value **sit=h.u.block.items; int sn=h.u.block.n;
+            int si=1;
+            Value base = evalExpr(e, sit, sn, &si);   /* the dict (by ref) */
+            Value key  = evalExpr(e, sit, sn, &si);   /* computed key */
+            i++;                                       /* past the head block */
+            Value val = evalExpr(e, it, n, &i);
+            b_set(e, (Value[]){base,key,val}, 3);
+            continue;
+        }
         if (h.k == V_PATH && path_is_dyn(h)) {          /* `path\[k]: val` */
             if (i+1 < n) {                              /* path followed by value: WRITE */
                 int i2 = i+1;

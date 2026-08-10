@@ -145,6 +145,70 @@ cIf: function [n][
     "ir_op(\"if\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ "}, 2)"
 ]
 
+; ---- complex (computed-key) paths -----------------------------------------
+; A dynamic path with a simple key (`\[k]`, `spec\arity`) emits as a flat
+; v_path value and the runtime's path_read/path_write resolves it. A key that
+; must be evaluated at run time (`\[spec\alias]`, `\[c\i + 1]`) CANNOT be a flat
+; string: the runtime's block-as-code evaluator must compute it. Such a path
+; emits as a get/set call-BLOCK that the evaluator runs. Reads become
+; `[get, base, [key...]]`; writes `[set, base, [key...]]` (value follows).
+
+; a segment that is a static key (literal/label, or a plain word, or a block of
+; one of those) needs no runtime evaluation → it can stay a flat path segment.
+cPathSimpleSeg?: function [seg][
+    ts: type seg
+    if or? (= :literal ts) (= :label ts) [ return true ]
+    if :word = ts [ return true ]
+    if :block = ts [
+        ; a `\[k]` key is simple (a bare variable word); a `\[i + 1]` or
+        ; `\[c\i]` key is an EXPRESSION and must be evaluated at run time.
+        if 1 <> size seg [ return false ]
+        return cPathSimpleSeg? (first seg)
+    ]
+    false
+]
+cPathAllSimple: function [v][
+    blk: to :block v
+    loop 1..dec (size blk) [j][
+        if not? cPathSimpleSeg? blk\[j] [ return false ]
+    ]
+    true
+]
+
+; a path segment → an ir_block whose tokens evaluate to the key string at run
+; time (used as the get/set key argument).
+cPathKeyBlock: function [seg][
+    if :block = type seg [
+        toks: to :block seg
+        if 0 = size toks [ return "ir_block((IR*[]){}, 0)" ]
+        parts: map toks [tk][ cNode tk ]
+        return "ir_block((IR*[]){" ++ (joinWith parts ", ") ++ "}, " ++ (to :string (size toks)) ++ ")"
+    ]
+    "ir_block((IR*[]){" ++ (cNode seg) ++ "}, 1)"
+]
+
+; `base\[k1]\[k2]` (read) → `[get, [get, base, [k1]], [k2]]`, a block value the
+; evaluator runs to produce the read.
+cPathComplexRead: function [v][
+    blk: to :block v
+    baseName: to :string blk\0
+    expr: "ir_const(v_str(" ++ (quoteC baseName) ++ "))"
+    loop 1..dec (size blk) [j][
+        kb: cPathKeyBlock blk\[j]
+        expr: "ir_block((IR*[]){ir_const(v_str(\"get\")), " ++ expr ++ ", " ++ kb ++ "}, 3)"
+    ]
+    expr
+]
+
+; `base\[key]: val` (write) → a block value `[set, base, [key]]`; the runtime's
+; evalSeq consumes the following token as the value.
+cPathComplexWrite: function [v][
+    blk: to :block v
+    baseName: to :string blk\0
+    kb: cPathKeyBlock blk\1
+    "ir_block((IR*[]){ir_const(v_str(\"set\")), ir_const(v_str(" ++ (quoteC baseName) ++ ")), " ++ kb ++ "}, 3)"
+]
+
 cNode: function [n][
     ; a raw `:block` VALUE is a STATEMENT SEQUENCE (a `do` body, a `while`/`if`
     ; body or condition): its items are evaluated in order and the last is the
@@ -161,7 +225,11 @@ cNode: function [n][
     t: type n
     ; a dynamic path (rvalue `spec\arity` or lvalue `res\[k]`) resolves at run
     ; time, not as a constant. `:pathliteral` (`'c\stack`) is data and stays const.
-    if or? (= :path t) (= :pathlabel t) [ return cPathNode n ]
+    if or? (= :path t) (= :pathlabel t) [
+        if cPathAllSimple n [ return cPathNode n ]
+        if :path = t [ return cPathComplexRead n ]
+        return cPathComplexWrite n
+    ]
     ; a label heads a define (`x: val`) inside a block-as-code action body; it is
     ; tagged so the runtime's interpreter can tell it from a variable read.
     if :label = t [ return "ir_const(v_str(" ++ (quoteC ("@LBL:" ++ (to :string n))) ++ "))" ]
