@@ -15,7 +15,9 @@
 /* ---- values ---------------------------------------------------------- */
 typedef enum {
     V_NULL, V_INT, V_FLOAT, V_STR, V_CHAR, V_BOOL,
-    V_BLOCK, V_DICT, V_FUNC, V_BUILTIN, V_RANGE, V_PATH
+    V_BLOCK, V_DICT, V_FUNC, V_BUILTIN, V_RANGE, V_PATH,
+    V_WORD, V_LABEL, V_LITERAL, V_SYMBOL, V_TYPE, V_INLINE,
+    V_PATHLABEL, V_PATHLITERAL, V_REGEX, V_ATTRIBUTE, V_ATTRIBUTELABEL
 } VKind;
 
 typedef struct Value Value;
@@ -32,7 +34,7 @@ struct Value {
         char        c;          /* V_CHAR */
         int         b;          /* V_BOOL */
         struct { long lo; long hi; } range;   /* V_RANGE */
-        struct { char **segs; int nsegs; } path;  /* V_PATH */
+        struct { char **segs; int nsegs; Value *segv; } path;  /* V_PATH (segv=segment Values for to :block) */
         struct { Value **items; int n; } block;    /* V_BLOCK */
         Dict       *dict;       /* V_DICT */
         struct { IR *params; IR **body; int nbody; Env *closure; } fn; /* V_FUNC */
@@ -58,6 +60,10 @@ Value v_block(Value **items, int n);
 Value v_dict(char **keys, Value *vals, int n);
 Value v_range(long lo, long hi);
 Value v_path(char **segs, int n);
+Value v_pathv(Value *segv, int n);   /* path built from segment Values (lexer) */
+Value v_token(VKind k, const char *s);  /* word/label/literal/symbol/type/... */
+/* lex an Arturo source string into a block of tokens (the `to :block` lexer) */
+Value lex_source(const char *s);
 Value v_func(IR *params, IR **body, int nbody, Env *closure);
 
 /* value access / printing */
