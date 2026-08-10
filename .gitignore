@@ -1,3 +1,5 @@
 runtime/*.o
 runtime/*.a
 tmp/
+*.bcode
+native_compiler
