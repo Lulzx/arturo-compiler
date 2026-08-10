@@ -1,0 +1,154 @@
+;=======================================================
+; cbackend.art — the C backend (real fix)
+;
+; v2: compileToIR + fold -> emit C source that rebuilds the
+; IR tree with the native runtime's builders and runs it.
+; The per-program step is `gcc -c` + link against the
+; prebuilt runtime.a -> instant, standalone native binary.
+;=======================================================
+
+import ./"ir.art"
+
+; escape a string for a C double-quoted literal: backslash first,
+; then the double-quote. `replace` scans left to right, so escaping
+; the backslash first keeps the freshly-added \" pairs from doubling.
+escapeC: function [s][
+    s: replace s "\\" "\\\\"
+    replace s "\"" "\\\""
+]
+quoteC: function [s][ "\"" ++ (escapeC s) ++ "\"" ]
+
+; render an Arturo constant as a C runtime expression.
+cValue: function [v][
+    t: type v
+    case t [
+        :integer -> "v_int(" ++ (to :string v) ++ ")"
+        :floating -> "v_float(" ++ (to :string v) ++ ")"
+        :logical -> "v_bool(" ++ (to :string (to :integer v)) ++ ")"
+        :char    -> "v_char('" ++ (to :string v) ++ "')"
+        :string  -> "v_str(" ++ (quoteC v) ++ ")"
+        :word    -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
+        :label   -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
+        :literal -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
+        :symbol  -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
+        :pathliteral -> cPath v
+        :type    -> "v_str(" ++ (quoteC (":" ++ (to :string v))) ++ ")"
+        :null    -> "v_null()"
+    ]
+]
+
+; a path literal `'c\stack` -> a C v_path() carrying its segments as strings.
+cPath: function [v][
+    parts: map (to :block v) [seg][ quoteC (to :string seg) ]
+    segc: joinWith parts ", "
+    "v_path((char*[]){" ++ segc ++ "}, " ++ (to :string (size (to :block v))) ++ ")"
+]
+
+; ---- recursive emitter -----------------------------------------------------
+
+; a raw seq (Arturo block of IR nodes) -> an internal __seq node.
+; NB `map`/`joinWith` over an empty block yield a phantom null in this host,
+; so every list must be size-guarded before joining.
+cSeq: function [items][
+    if 0 = size items [ return "ir_seq((IR*[]){}, 0)" ]
+    parts: map items [st][ cNode st ]
+    bodyc: joinWith parts ", "
+    "ir_seq((IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size items)) ++ ")"
+]
+
+; an evaluated block VALUE (op:"block"): items become a V_BLOCK
+cBlock: function [items][
+    if 0 = size items [ return "ir_block((IR*[]){}, 0)" ]
+    parts: map items [st][ cNode st ]
+    bodyc: joinWith parts ", "
+    "ir_block((IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size items)) ++ ")"
+]
+
+; a call node
+cCall: function [n][
+    args: n\args
+    if 0 = size args [ return "ir_call(" ++ (cNode n\fn) ++ ", (IR*[]){}, 0)" ]
+    parts: map args [a][ cNode a ]
+    argc: joinWith parts ", "
+    "ir_call(" ++ (cNode n\fn) ++ ", (IR*[]){" ++ argc ++ "}, " ++ (to :string (size args)) ++ ")"
+]
+
+; a function node: args = [params, bodySeq]
+cFunction: function [n][
+    args: n\args
+    params: args\0
+    body: args\1
+    if 0 = size params [
+        if 0 = size body [ return "ir_fn(ir_block((IR*[]){}, 0), (IR*[]){}, 0)" ]
+        parts: map body [st][ cNode st ]
+        bodyc: joinWith parts ", "
+        return "ir_fn(ir_block((IR*[]){}, 0), (IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size body)) ++ ")"
+    ]
+    parts: map params [w][ "ir_load(" ++ (quoteC (to :string w)) ++ ")" ]
+    paramc: joinWith parts ", "
+    paramsIR: "ir_block((IR*[]){" ++ paramc ++ "}, " ++ (to :string (size params)) ++ ")"
+    parts: map body [st][ cNode st ]
+    bodyc: joinWith parts ", "
+    "ir_fn(" ++ paramsIR ++ ", (IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size body)) ++ ")"
+]
+
+; an if node: args = [cond, yesSeq, maybeElseOrNull]
+cIf: function [n][
+    args: n\args
+    condc: cNode args\0
+    yesc: cNode args\1
+    if 2 < size args [
+        elsev: args\2
+        if :null = type elsev [
+            return "ir_op(\"if\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ "}, 2)"
+        ]
+        return "ir_op(\"if\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ ", " ++ (cNode elsev) ++ "}, 3)"
+    ]
+    "ir_op(\"if\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ "}, 2)"
+]
+
+cNode: function [n][
+    if :block = type n [ return cSeq n ]
+    ; an inline (parenthesized) block like `(size n)` in an action: emit it as a
+    ; block VALUE so the runtime's block-as-code evaluator evaluates it as a
+    ; sub-expression (it sees the words as code, not data).
+    if :inline = type n [ return cBlock (to :block n) ]
+    ; a raw primitive (integer, string, word, ...) is a constant node
+    if not? :dictionary = type n [ return "ir_const(" ++ (cValue n) ++ ")" ]
+    op: n\op
+    case op [
+        "const"        -> "ir_const(" ++ (cValue n\value) ++ ")"
+        "passthrough"  -> "ir_passthrough(" ++ (cValue n\src) ++ ")"
+        "load"         -> "ir_load(" ++ (quoteC (to :string n\name)) ++ ")"
+        "intrinsic"    -> "ir_intrinsic(" ++ (quoteC (to :string n\name)) ++ ")"
+        "define"       -> "ir_define(" ++ (quoteC (to :string n\name)) ++ ", " ++ (cNode n\expr) ++ ")"
+        "block"        -> cBlock n\items
+        "call"         -> cCall n
+        "function"     -> cFunction n
+        "do"           -> "ir_op(\"do\", (IR*[]){" ++ (cNode n\args\0) ++ "}, 1)"
+        "if"           -> cIf n
+        "while"        -> "ir_op(\"while\", (IR*[]){" ++ (cNode n\args\0) ++ ", " ++ (cNode n\args\1) ++ "}, 2)"
+        "until"        -> "ir_op(\"until\", (IR*[]){" ++ (cNode n\args\0) ++ ", " ++ (cNode n\args\1) ++ "}, 2)"
+        "return"       -> "ir_op(\"return\", (IR*[]){" ++ (cNode n\args\0) ++ "}, 1)"
+    ]
+]
+
+; ---- full C program ---------------------------------------------------------
+compileToC: function [src][
+    ir: fold (compileToIR src)
+    stmtc: map ir [n][ "\t\t" ++ (cNode n) ]
+    stmts: joinWith stmtc ",\n"
+    header: "/* generated by the compiler's C backend; links runtime.a */\n#include \"runtime.h\"\n\nint main(void){\n\tEnv *e = env_new(NULL);\n\tIR *seq[] = {\n"
+    footer: "\n\t};\n\trunSeq(e, seq, " ++ (to :string (size ir)) ++ ");\n\treturn 0;\n}\n"
+    header ++ stmts ++ footer
+]
+
+; emit C to a file, compile it, and link runtime.a into a native binary
+compileToNativeC: function [src outName][
+    c: compileToC src
+    cPath: outName ++ ".c"
+    write c cPath
+    execute ("cc -c -Iruntime " ++ cPath ++ " -o " ++ outName ++ ".o 2>&1")
+    execute ("cc " ++ outName ++ ".o runtime/runtime.a -lm -o " ++ outName ++ " 2>&1")
+    outName
+]
