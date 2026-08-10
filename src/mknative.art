@@ -67,7 +67,7 @@ go: function [][
     ; silently yields empty output. `implicit:` forces these symbols in.
     ; (A FULL VM would avoid this, but the full build pulls in the net/ssl
     ; modules and fails to link OpenSSL in the bundle clone.)
-    write "entry: \"native_compiler.art\"\nimplicit: [\"to\", \"ensure\", \"function\", \"if\", \"greater?\", \"equal?\", \"return\", \"neg\", \"any?\", \"array\", \"is?\", \"inc\", \"mul\", \"dec\"]\n" "tmp/native_build/bundle.info.art"
+    write "entry: \"native_compiler.art\"\nimplicit: [\"to\", \"ensure\", \"function\", \"if\", \"greater?\", \"equal?\", \"return\", \"neg\", \"any?\", \"array\", \"is?\", \"inc\", \"mul\", \"dec\", \"add\", \"sub\", \"div\", \"fdiv\", \"mod\", \"pow\", \"less?\", \"lessOrEqual?\", \"greaterOrEqual?\", \"notEqual?\"]\n" "tmp/native_build/bundle.info.art"
     print "native compiler source bytes:"
     print (to :string (size nativeSrc))
     print "bundling into a native binary (clones + Nim-builds a mini VM)..."
