@@ -263,6 +263,7 @@ static Value b_last(Env*e,Value*a,int n){
 }
 static int dict_find(Value d, const char *k);
 static Value applyAction(Env *parent, Value params, Value action, Value el);
+static Value evalSeq(Env *e, Value **it, int n);
 
 /* resolve a pathliteral `'a\b\c` to the container dict holding the final
  * segment plus that segment's index, so a mutating builtin can write back.
@@ -364,6 +365,21 @@ static Value b_select(Env*e,Value*a,int n){
 }
 static Value b_loop(Env*e,Value*a,int n){
     Value coll=a[0], params=a[1], body=a[2];
+    if (coll.k==V_DICT){
+        /* `loop dict [k v]` binds key+value; `[v]` binds value */
+        Dict *dd=coll.u.dict;
+        for(int i=0;i<dd->n;i++){
+            Env *child=env_new(e);
+            if(params.k==V_BLOCK && params.u.block.n==1)
+                env_set(child, (*params.u.block.items[0]).u.s, dd->vals[i]);
+            else if(params.k==V_BLOCK && params.u.block.n>=2){
+                env_set(child, (*params.u.block.items[0]).u.s, v_str(dd->keys[i]));
+                env_set(child, (*params.u.block.items[1]).u.s, dd->vals[i]);
+            }
+            evalSeq(child, body.u.block.items, body.u.block.n);
+        }
+        return v_null();
+    }
     int cnt = coll.k==V_RANGE ? (int)(coll.u.range.hi-coll.u.range.lo+1) : coll.u.block.n;
     for(int i=0;i<cnt;i++){
         Value el = coll.k==V_RANGE ? v_int(coll.u.range.lo+i) : *coll.u.block.items[i];
@@ -482,6 +498,27 @@ static Value apply_binop(Value a, const char *sym, Value b) {
     return v_null();
 }
 
+/* structural skip: advance the pointer over an expression WITHOUT evaluating it,
+ * so a conditionally-skipped `if cond -> body` body doesn't trigger builtin
+ * side effects (print). Mirrors evalExpr/parsePrimary traversal only. */
+static int  starts_stmt(Value v);
+static void skipExpr(Env *e, Value **it, int n, int *ip);
+static void skipPrimary(Env *e, Value **it, int n, int *ip) {
+    Value v = *it[*ip];
+    if (v.k == V_BLOCK) { (*ip)++; return; }            /* block value: one token */
+    if (v.k == V_STR && rt_builtin_known(v.u.s) && !env_bound(e, v.u.s)) {
+        (*ip)++;                                        /* function head */
+        while (*ip<n && !is_binop(*it[*ip]) && !starts_stmt(*it[*ip]))
+            skipExpr(e, it, n, ip);
+        return;
+    }
+    (*ip)++;
+}
+static void skipExpr(Env *e, Value **it, int n, int *ip) {
+    skipPrimary(e, it, n, ip);
+    while (*ip<n && is_binop(*it[*ip])) { (*ip)++; skipPrimary(e, it, n, ip); }
+}
+
 /* ---- block-as-code evaluator -------------------------------------------
  * A stored block VALUE (map/select/loop action, or `do` on a block) is run as
  * code. Elements are values; a string element is either an infix operator, a
@@ -491,17 +528,22 @@ static Value apply_binop(Value a, const char *sym, Value b) {
 static Value evalExpr(Env *e, Value **it, int n, int *ip);
 static Value parsePrimary(Env *e, Value **it, int n, int *ip);
 static Value runBlockValue(Env *e, Value block);
+static int  path_is_dyn(Value v);
+static Value path_read(Env *e, Value p);
 
 static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
     Value v = *it[*ip];
     if (v.k == V_BLOCK) { (*ip)++; return runBlockValue(e, v); }  /* inline (sub)expr */
     if (v.k == V_STR) {
         if (rt_builtin_known(v.u.s) && !env_bound(e, v.u.s)) {
-            /* function head: apply to the maximal following expression(s) */
+            /* function head: apply to the following expression(s), stopping at a
+             * statement boundary (a define head, `if`, or a dynamic path write)
+             * so a call in statement position doesn't swallow later statements */
             (*ip)++;
             Value *args = (Value*)xmalloc((n+1)*sizeof(Value));
             int m = 0;
-            while (*ip < n && !is_binop(*it[*ip])) args[m++] = evalExpr(e, it, n, ip);
+            while (*ip < n && !is_binop(*it[*ip]) && !starts_stmt(*it[*ip]))
+                args[m++] = evalExpr(e, it, n, ip);
             Value out;
             if (rt_builtin(v.u.s, e, args, m, &out)) { free(args); return out; }
             free(args); die("unknown function in action"); return v_null();
@@ -510,6 +552,7 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
         if (env_bound(e, v.u.s)) { (*ip)++; return env_get(e, v.u.s); }
         (*ip)++; return v;                              /* string constant */
     }
+    if (v.k == V_PATH && path_is_dyn(v)) { (*ip)++; return path_read(e, v); }  /* path read */
     (*ip)++;
     return v;
 }
@@ -522,10 +565,92 @@ static Value evalExpr(Env *e, Value **it, int n, int *ip) {
     }
     return left;
 }
+/* ---- dynamic paths in block-as-code --------------------------------------
+ * A dynamic path value has "@DYN" as seg[0], the base variable name as seg[1],
+ * then segments: a ":"-prefixed name is a literal key, a bare name is a variable
+ * whose value (string/int) is the key. Reads resolve in expression position;
+ * a dynamic path heading a statement is an assignment. */
+static int path_is_dyn(Value v){ return v.k==V_PATH && v.u.path.nsegs>=1 && !strcmp(v.u.path.segs[0],"@DYN"); }
+/* a token that starts a NEW statement in a flattened action body: a define head
+ * (`@LBL:name`), the `if` keyword, or a dynamic path write (`acc\[k]: v`). A
+ * function call in statement position must stop argument collection here. */
+static int starts_stmt(Value v){
+    if (v.k == V_PATH) return path_is_dyn(v);
+    if (v.k == V_STR){
+        if (!strncmp(v.u.s,"@LBL:",5)) return 1;
+        if (!strcmp(v.u.s,"if")) return 1;
+    }
+    return 0;
+}
+static const char *seg_key(Env *e, const char *s){
+    if (s[0]==':') return s+1;
+    Value v = env_get(e, s);
+    if (v.k==V_STR) return v.u.s;
+    static char buf[64];
+    snprintf(buf,sizeof buf,"%ld",(long)v.u.i);
+    return buf;
+}
+static Value index_at(Value cur, const char *key, Env *e){
+    if (cur.k==V_DICT){ int i=dict_find(cur,key); return i>=0?cur.u.dict->vals[i]:v_null(); }
+    if (cur.k==V_BLOCK){ long idx=atol(key); if(idx<0||idx>=cur.u.block.n)return v_null(); return *cur.u.block.items[idx]; }
+    if (cur.k==V_RANGE){ long idx=atol(key); return (idx>=cur.u.range.lo&&idx<=cur.u.range.hi)?v_int(idx):v_null(); }
+    return v_null();
+}
+static Value path_read(Env *e, Value p){
+    Value cur = env_get(e, p.u.path.segs[1]);
+    for (int s=2;s<p.u.path.nsegs;s++) cur = index_at(cur, seg_key(e, p.u.path.segs[s]), e);
+    return cur;
+}
+static void path_write(Env *e, Value p, Value val){
+    Value cur = env_get(e, p.u.path.segs[1]);
+    for (int s=2; s<p.u.path.nsegs-1; s++) cur = index_at(cur, seg_key(e, p.u.path.segs[s]), e);
+    const char *last = seg_key(e, p.u.path.segs[p.u.path.nsegs-1]);
+    if (cur.k==V_DICT){
+        Dict *dd=cur.u.dict; int i=dict_find(cur,last);
+        if (i>=0){ dd->vals[i]=val; return; }
+        dd->keys=(char**)xrealloc(dd->keys,(dd->n+1)*sizeof(char*));
+        dd->vals=(Value*)xrealloc(dd->vals,(dd->n+1)*sizeof(Value));
+        dd->keys[dd->n]=(char*)xmalloc(strlen(last)+1); strcpy(dd->keys[dd->n],last);
+        dd->vals[dd->n]=val; dd->n++; return;
+    }
+    if (cur.k==V_BLOCK){ long idx=atol(last); if(idx>=0&&idx<cur.u.block.n) *cur.u.block.items[idx]=val; }
+}
+
 static Value evalSeq(Env *e, Value **it, int n) {
     Value r = v_null();
     int i = 0;
-    while (i < n) r = evalExpr(e, it, n, &i);
+    while (i < n) {
+        Value h = *it[i];
+        if (h.k == V_PATH && path_is_dyn(h)) {          /* `path\[k]: val` */
+            int i2 = i+1;
+            Value val = evalExpr(e, it, n, &i2);
+            path_write(e, h, val);
+            i = i2; continue;
+        }
+        if (h.k == V_STR && !strncmp(h.u.s,"@LBL:",5)) { /* define `x: val` */
+            const char *nm = h.u.s+5; i++;
+            r = evalExpr(e, it, n, &i);
+            env_set(e, nm, r);
+            continue;
+        }
+        if (h.k == V_STR && !strcmp(h.u.s,"if")) {       /* `if cond -> x` / `if cond [b]` */
+            int ci = i+1;
+            Value cond = evalExpr(e, it, n, &ci);
+            if (ci<n && it[ci]->k==V_STR && !strcmp(it[ci]->u.s,"->")) {
+                ci++;
+                if (v_truthy(cond)) { r = evalExpr(e, it, n, &ci); }   /* run */
+                else               { skipExpr(e, it, n, &ci); }        /* skip w/o side effects */
+                i = ci; continue;
+            }
+            if (ci<n && it[ci]->k==V_BLOCK) {
+                Value blk = *it[ci]; ci++;
+                if (v_truthy(cond)) r = runBlockValue(e, blk);
+                i = ci; continue;
+            }
+            r = cond; i = ci; continue;
+        }
+        r = evalExpr(e, it, n, &i);
+    }
     return r;
 }
 static Value runBlockValue(Env *e, Value block) {

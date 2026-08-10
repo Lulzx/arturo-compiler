@@ -44,6 +44,35 @@ cPath: function [v][
     "v_path((char*[]){" ++ segc ++ "}, " ++ (to :string (size (to :block v))) ++ ")"
 ]
 
+; a dynamic path expression (`spec\arity` read, `res\[k]` write) is NOT a
+; constant and CANNOT be resolved at block-build time (loop params are not yet
+; bound). It emits as a v_path VALUE whose segments are tagged: "@DYN" marks it
+; dynamic (vs a pathliteral which is data), a bare name is a variable segment,
+; and a ":"-prefixed name is a literal key. The runtime's block-as-code
+; evaluator resolves it lazily, per iteration — as a read in expression position
+; or a write when it heads a statement.
+cPathSegKey: function [seg][
+    ts: type seg
+    if :literal = ts [ return quoteC (":" ++ (to :string seg)) ]
+    if :label = ts   [ return quoteC (":" ++ (to :string seg)) ]
+    if :block = ts   [ return cPathSegKey (first seg) ]
+    quoteC (to :string seg)   ; a word → bare variable name
+]
+cPathNode: function [v][
+    blk: to :block v
+    tail: blk\1
+    tailSegs: @[tail]
+    if :block = type tail [ tailSegs: tail ]
+    basec: quoteC (to :string blk\0)
+    segc: map tailSegs [seg][ cPathSegKey seg ]
+    all: @[quoteC "@DYN" basec]
+    loop segc [s][ all: all ++ @[s] ]
+    joined: joinWith all ", "
+    ; wrapped in ir_const so it is an IR node inside a block, resolving to the
+    ; V_PATH value (unresolved) when the block value is built.
+    "ir_const(v_path((char*[]){" ++ joined ++ "}, " ++ (to :string (size all)) ++ "))"
+]
+
 ; ---- recursive emitter -----------------------------------------------------
 
 ; a raw seq (Arturo block of IR nodes) -> an internal __seq node.
@@ -56,10 +85,19 @@ cSeq: function [items][
     "ir_seq((IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size items)) ++ ")"
 ]
 
+; an item inside a block VALUE (op:"block"): a nested raw `:block` is DATA (a
+; value), so it emits as a block VALUE — NOT a statement sequence. Everything
+; else defers to cNode.
+cBlockItem: function [st][
+    if :block = type st [ return cBlock st ]
+    if :inline = type st [ return cBlock (to :block st) ]
+    cNode st
+]
+
 ; an evaluated block VALUE (op:"block"): items become a V_BLOCK
 cBlock: function [items][
     if 0 = size items [ return "ir_block((IR*[]){}, 0)" ]
-    parts: map items [st][ cNode st ]
+    parts: map items [st][ cBlockItem st ]
     bodyc: joinWith parts ", "
     "ir_block((IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size items)) ++ ")"
 ]
@@ -108,29 +146,71 @@ cIf: function [n][
 ]
 
 cNode: function [n][
+    ; a raw `:block` VALUE is a STATEMENT SEQUENCE (a `do` body, a `while`/`if`
+    ; body or condition): its items are evaluated in order and the last is the
+    ; result. (Nested block VALUES inside it are op:"block" DICTS, handled by the
+    ; `case op "block"` arm, and stay DATA.) A raw `:block` nested as a data item
+    ; inside an action-body block VALUE reaches cNode via the block-value item
+    ; emitter cBlockItem (below), which treats it as data, so it never arrives
+    ; here as the statement-sequence case.
     if :block = type n [ return cSeq n ]
     ; an inline (parenthesized) block like `(size n)` in an action: emit it as a
     ; block VALUE so the runtime's block-as-code evaluator evaluates it as a
     ; sub-expression (it sees the words as code, not data).
     if :inline = type n [ return cBlock (to :block n) ]
+    t: type n
+    ; a dynamic path (rvalue `spec\arity` or lvalue `res\[k]`) resolves at run
+    ; time, not as a constant. `:pathliteral` (`'c\stack`) is data and stays const.
+    if or? (= :path t) (= :pathlabel t) [ return cPathNode n ]
+    ; a label heads a define (`x: val`) inside a block-as-code action body; it is
+    ; tagged so the runtime's interpreter can tell it from a variable read.
+    if :label = t [ return "ir_const(v_str(" ++ (quoteC ("@LBL:" ++ (to :string n))) ++ "))" ]
     ; a raw primitive (integer, string, word, ...) is a constant node
-    if not? :dictionary = type n [ return "ir_const(" ++ (cValue n) ++ ")" ]
+    if not? :dictionary = t [ return "ir_const(" ++ (cValue n) ++ ")" ]
     op: n\op
+    ; HOST QUIRK: a deep cNode result passed INLINE into a `++` corrupts sibling
+    ; block items (the value-stack leak), so the deep-call arms live in helper
+    ; functions that bind the result to a name before concatenating.
     case op [
         "const"        -> "ir_const(" ++ (cValue n\value) ++ ")"
         "passthrough"  -> "ir_passthrough(" ++ (cValue n\src) ++ ")"
         "load"         -> "ir_load(" ++ (quoteC (to :string n\name)) ++ ")"
         "intrinsic"    -> "ir_intrinsic(" ++ (quoteC (to :string n\name)) ++ ")"
-        "define"       -> "ir_define(" ++ (quoteC (to :string n\name)) ++ ", " ++ (cNode n\expr) ++ ")"
+        "define"       -> cDefine n
         "block"        -> cBlock n\items
         "call"         -> cCall n
         "function"     -> cFunction n
-        "do"           -> "ir_op(\"do\", (IR*[]){" ++ (cNode n\args\0) ++ "}, 1)"
+        "do"           -> cDo n
         "if"           -> cIf n
-        "while"        -> "ir_op(\"while\", (IR*[]){" ++ (cNode n\args\0) ++ ", " ++ (cNode n\args\1) ++ "}, 2)"
-        "until"        -> "ir_op(\"until\", (IR*[]){" ++ (cNode n\args\0) ++ ", " ++ (cNode n\args\1) ++ "}, 2)"
-        "return"       -> "ir_op(\"return\", (IR*[]){" ++ (cNode n\args\0) ++ "}, 1)"
+        "while"        -> cWhile n
+        "until"        -> cUntil n
+        "return"       -> cReturn n
     ]
+]
+
+; the deep-call arms, extracted so their result is bound before concatenation
+; (avoids the host value-stack corruption when a deep cNode is inlined in `++`).
+cDefine: function [n][
+    e: cNode n\expr
+    "ir_define(" ++ (quoteC (to :string n\name)) ++ ", " ++ e ++ ")"
+]
+cDo: function [n][
+    a: cNode n\args\0
+    "ir_op(\"do\", (IR*[]){" ++ a ++ "}, 1)"
+]
+cWhile: function [n][
+    a: cNode n\args\0
+    b: cNode n\args\1
+    "ir_op(\"while\", (IR*[]){" ++ a ++ ", " ++ b ++ "}, 2)"
+]
+cUntil: function [n][
+    a: cNode n\args\0
+    b: cNode n\args\1
+    "ir_op(\"until\", (IR*[]){" ++ a ++ ", " ++ b ++ "}, 2)"
+]
+cReturn: function [n][
+    a: cNode n\args\0
+    "ir_op(\"return\", (IR*[]){" ++ a ++ "}, 1)"
 ]
 
 ; ---- full C program ---------------------------------------------------------
