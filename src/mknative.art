@@ -1,0 +1,80 @@
+;=======================================================
+; mknative.art — build a standalone native compiler binary
+;
+; The compiler is written in core-Arturo. This script builds
+; the self-contained compiler source (front + kernel + ir +
+; backend, imports stripped), appends a compile-main, and
+; hands it to `arturo -b`, which Nim-builds a trimmed mini VM
+; around it into a native executable: a compiler that runs with
+; no access to the Arturo VM or src/. The bundle's static symbol
+; analyzer under-covers the compiler's `to`-conversions, so we
+; force the needed symbols in via bundle.info.art `implicit:`.
+;
+; The produced binary reads <in.art> <out.art> and renders
+; the program to core-Arturo text, exactly like compiler.art.
+;=======================================================
+
+import ./"backend.art"
+
+; the self-contained compiler source, identical to the one
+; bootstrap.art builds — keep in sync with that list
+buildSelfCompiler: function [][
+    out: @[]
+    files: ["src/intrinsics.art" "src/semantics.art" "src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
+    loop files [f][
+        src: read f
+        src: replace src "import ./\"" ++ f ++ "\"\n" ""
+        src: replace src "import ./\"intrinsics.art\"\n" ""
+        src: replace src "import ./\"semantics.art\"\n" ""
+        src: replace src "import ./\"front.art\"\n" ""
+        src: replace src "import ./\"kernel.art\"\n" ""
+        src: replace src "import ./\"ir.art\"\n" ""
+        addItem out src
+    ]
+    joinWith out "\n"
+]
+
+; a compile-main: read <in.art> <out.art>, render, write.
+; NB: backslashes must be `\\` in the literal — `args\values` would eat
+; the `\` as a `\v` escape; and every result is bound to a name first,
+; so the deep renderProgram call does not corrupt the host value stack.
+;
+; CRUCIAL: we must read the input via `read.binary`, NOT `read`. In a
+; bundled binary, `read` serves only EMBEDDED resources (getBundledResource)
+; and returns "" for any runtime path — so `read inPath` would hand the
+; compiler an empty program. `read.binary` opens the real file with raw
+; `f.open`, bypassing the bundle, and `to :string` yields the same bytes
+; `read` would give on the host. `write` is unaffected (it works in bundles).
+MAIN: "\nif 1 < size args\\values [\n    inPath: args\\values\\0\n    outPath: args\\values\\1\n    b: read.binary inPath\n    src: to :string b\n    art: renderProgram src\n    write art outPath\n    print outPath\n]\n"
+
+go: function [][
+    print "== building the native compiler =="
+    ; bundle from a directory so we can ship a bundle.info.art.
+    execute "mkdir -p tmp/native_build"
+    nativeSrc: buildSelfCompiler ++ MAIN
+    write nativeSrc "tmp/native_build/native_compiler.art"
+    ; bundle.info.art is read via execDictionary(isDictionary=true): bare
+    ; `key: value` pairs on their own lines. NB: `{ ... }` is a STRING
+    ; literal in Arturo, NOT a dict — braces here would turn the whole
+    ; file into one string and `full`/`entry` would never be read.
+    ;
+    ; We build a MINI VM (default) and patch coverage via `implicit:`.
+    ; The static analyzer only records words that resolve to stdlib
+    ; symbols it walks past. The compiler's `to`-conversions (`to :string`,
+    ; `to :block`, ... — 70+ sites) are a blind spot: the analyzer adds
+    ; `to` implicitly only when the `define` keyword is present, and the
+    ; compiler never calls `define`. Without `to` the whole pipeline
+    ; silently yields empty output. `implicit:` forces these symbols in.
+    ; (A FULL VM would avoid this, but the full build pulls in the net/ssl
+    ; modules and fails to link OpenSSL in the bundle clone.)
+    write "entry: \"native_compiler.art\"\nimplicit: [\"to\", \"ensure\", \"function\", \"if\", \"greater?\", \"equal?\", \"return\", \"neg\", \"any?\", \"array\", \"is?\", \"inc\", \"mul\", \"dec\"]\n" "tmp/native_build/bundle.info.art"
+    print "native compiler source bytes:"
+    print (to :string (size nativeSrc))
+    print "bundling into a native binary (clones + Nim-builds a mini VM)..."
+    execute "arturo -b tmp/native_build 2>&1"
+    ; the bundle names the binary after the entry base name and drops
+    ; it in the cwd where `arturo -b` ran (the repo root), not in the
+    ; build dir. Move it where mknative promises it.
+    print "done: native_compiler"
+]
+go

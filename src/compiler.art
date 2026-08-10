@@ -20,14 +20,36 @@ compileFile: function [inPath outPath][
     art
 ]
 
+; strip a trailing ".art" so the native binary takes the base name.
+; (parenthesized `(size p) - 4`: bare `size p - 4` groups as `size (p - 4)`)
+stripArtExt: function [p][
+    if 3 < size p [
+        if ".art" = slice p ((size p) - 4) (dec (size p)) [
+            return slice p 0 ((size p) - 5)
+        ]
+    ]
+    p
+]
+
 go: function [][
-    if 0 < size args\values [
+    ; the `-b` / `--native` flag arrives in `args`, not `args\values`
+    native: false
+    if key? args "b" -> if true = args\b -> native: true
+    if key? args "native" -> if true = args\native -> native: true
+
+    ; NB: `if 2 <= size ...` mis-groups on this host (the `2` leaks as the
+    ; `if` action); `1 < size` / `1 >= size` are the safe forms
+    if 1 < size args\values [
         inPath: args\values\0
         outPath: args\values\1
         compileFile inPath outPath
+        if native [
+            print "== native binary =="
+            compileToNative (read inPath) (stripArtExt outPath)
+        ]
     ]
-    if 0 >= size args\values [
-        print "usage: arturo src/compiler.art <in.art> <out.art>"
+    if 1 >= size args\values [
+        print "usage: arturo src/compiler.art <in.art> <out.art> [-b]"
     ]
 ]
 go

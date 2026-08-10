@@ -44,6 +44,17 @@ runCompiled: function [src outPath][
     runBcode bcode
 ]
 
+; v1 native: source -> IR -> source -> `arturo -b` -> native executable.
+; The bundle names the binary after the source file's base name, so writing
+; <outName>.art yields a binary named <outName>. The donated host (via `-b`,
+; which Nim-builds a trimmed VM around the program) does all native codegen.
+compileToNative: function [src outName][
+    art: renderProgram src
+    write art (outName ++ ".art")
+    execute ("arturo -b " ++ outName ++ ".art 2>&1")
+    outName
+]
+
 ; run a source program on the raw host (the authority)
 runHost: function [srcPath][
     execute ("arturo --no-color " ++ srcPath ++ " 2>&1")
