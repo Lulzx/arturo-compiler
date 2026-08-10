@@ -1,0 +1,6 @@
+import ./"../src/cbackend.art"
+doit: function [inPath outName][
+    c: compileToC (read inPath)
+    write c (outName ++ ".c")
+]
+doit "corpus/12_loops.art" "tmp/oracle/c12"

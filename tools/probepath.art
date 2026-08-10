@@ -1,0 +1,5 @@
+zzprobe: function [][
+    print "multi-seg literal path:"
+    loop (to :block 'a\b\c) [s][ print "  " ++ (to :string (type s)) ++ " :: " ++ (to :string s) ]
+]
+zzprobe

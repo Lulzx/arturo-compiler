@@ -1,5 +1,2 @@
 import ./"../src/cbackend.art"
-doit: function [inPath outName][
-    compileToNativeC (read inPath) outName
-]
-doit (args\values\0) (args\values\1)
+doit: function [inPath outName][ compileToNativeC (read inPath) outName ]

@@ -1,0 +1,4 @@
+import ./"../src/cbackend.art"
+src: read "/tmp/nullprog.art"
+c: compileToC src
+print "ok-size:" ++ (to :string (size c))

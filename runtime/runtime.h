@@ -89,6 +89,7 @@ struct IR {
 IR *ir_const(Value v);
 IR *ir_load(const char *name);
 IR *ir_intrinsic(const char *name);
+IR *ir_word(const char *name);   /* bare word in value position: load-if-bound, else call zero-arity builtin */
 IR *ir_define(const char *name, IR *expr);
 IR *ir_call(IR *fn, IR **args, int n);
 IR *ir_passthrough(Value src);

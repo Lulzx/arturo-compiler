@@ -1,0 +1,6 @@
+import ./"../src/cbackend.art"
+doit: function [inPath][
+    c: compileToC (read inPath)
+    write c "tmp/frontfull.c"
+]
+doit "src/front.art"

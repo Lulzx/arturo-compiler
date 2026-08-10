@@ -10,10 +10,16 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+#include <setjmp.h>
 
 /* ---- error handling ----------------------------------------------------- */
+/* `try` uses setjmp/longjmp: die() unwinds to the nearest active try frame
+ * instead of exiting when one is set. A linked stack of jmp_bufs lets nested
+ * trys nest correctly. */
+static jmp_buf *g_try_jmp = NULL;
 static void die(const char *msg) {
     fprintf(stderr, "runtime error: %s\n", msg);
+    if (g_try_jmp) longjmp(*g_try_jmp, 1);
     exit(1);
 }
 void rt_error(const char *msg) { die(msg); }
@@ -146,6 +152,11 @@ static IR *ir_new(const char *op) {
 IR *ir_const(Value v){ IR*n=ir_new("const"); n->v=v; return n; }
 IR *ir_load(const char *name){ IR*n=ir_new("load"); n->name=name; return n; }
 IR *ir_intrinsic(const char *name){ IR*n=ir_new("intrinsic"); n->name=name; return n; }
+/* `ir_word` — a bare word in VALUE position (the IR's `[op:intrinsic name:X]`
+ * node when it is NOT a call callee). On the host a bare word resolves var-first
+ * (a bound parameter like `arity`/`env` loads its value), else a zero-arity
+ * builtin (`args`, `break`) is called. */
+IR *ir_word(const char *name){ IR*n=ir_new("word"); n->name=name; return n; }
 IR *ir_define(const char *name, IR *expr){ IR*n=ir_new("define"); n->name=name; n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
 IR *ir_call(IR *fn, IR **args, int n){ IR*x=ir_new("call"); x->fn=fn; x->args=args; x->nargs=n; return x; }
 IR *ir_passthrough(Value src){ IR*n=ir_new("passthrough"); n->v=src; return n; }
@@ -155,9 +166,10 @@ IR *ir_op(const char *op, IR **args, int n){ IR*x=ir_new(op); x->args=args; x->n
 /* a seq: internal __seq node wrapping a list of statements */
 IR *ir_seq(IR **items, int n){ IR*x=ir_new("__seq"); x->args=items; x->nargs=n; return x; }
 
-/* ---- return signal ------------------------------------------------------- */
+/* ---- return / break signals ------------------------------------------------------- */
 static int   rt_ret_set = 0;
 static Value rt_ret_val;
+static int   rt_brk_set = 0;   /* `break` inside a loop body */
 
 /* ---- apply a function value to evaluated args ----------------------------- */
 static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
@@ -249,6 +261,7 @@ static Value b_size(Env*e,Value*a,int n){
     if (v.k==V_STR) return num2((long)strlen(v.u.s));
     if (v.k==V_DICT) return num2(v.u.dict->n);
     if (v.k==V_RANGE) return num2(v.u.range.hi - v.u.range.lo + 1);
+    if (v.k==V_NULL) return num2(0);
     die("size: unsupported"); return v_null();
 }
 static Value b_first(Env*e,Value*a,int n){
@@ -268,6 +281,8 @@ static Value evalSeq(Env *e, Value **it, int n);
 static Value evalExpr(Env *e, Value **it, int n, int *ip);
 static int  path_is_dyn(Value v);
 static int  starts_stmt(Value v);
+static char *val_str(Value v);
+static int  value_eq(Value a, Value b);
 
 /* resolve a pathliteral `'a\b\c` to the container dict holding the final
  * segment plus that segment's index, so a mutating builtin can write back.
@@ -319,6 +334,38 @@ static Value b_append(Env*e,Value*a,int n){
     }
     die("append: unsupported"); return v_null();
 }
+/* `insert dest index value` — insert `value` into block `dest` at `index`
+ * (in place). `insert 'c (size c) v` is the compiler's addItem: appending a
+ * single element without `append`'s block-flattening. */
+static Value b_insert(Env*e,Value*a,int n){
+    /* a one-segment path is a bare variable reference `'c`: write back to the
+     * env var itself (the compiler's addItem uses `insert 'c (size c) v`). */
+    if (a[0].k==V_PATH && a[0].u.path.nsegs==1){
+        const char *vn=a[0].u.path.segs[0];
+        Value t[3]={env_get(e,vn),a[1],a[2]};
+        Value r=b_insert(e,t,3);
+        env_set(e,vn,r);
+        return r;
+    }
+    if (a[0].k==V_PATH){
+        Value cont; int idx=path_target(e,a[0],&cont,&idx);
+        if (idx<0) die("insert: path not found");
+        Value v=cont.u.dict->vals[idx];
+        Value t[3]={v,a[1],a[2]};
+        Value r = b_insert(e, t, 3);
+        cont.u.dict->vals[idx]=r;
+        return r;
+    }
+    if (a[0].k!=V_BLOCK) die("insert: expected block");
+    long at = as_int(a[1]);
+    Value v=a[0];
+    if (at<0) at=0; if (at>v.u.block.n) at=v.u.block.n;
+    Value **items=(Value**)xmalloc((v.u.block.n+1)*sizeof(Value*));
+    for(int i=0;i<at;i++) items[i]=v.u.block.items[i];
+    items[at]=(Value*)xmalloc(sizeof(Value)); items[at][0]=a[2];
+    for(int i=at;i<v.u.block.n;i++) items[i+1]=v.u.block.items[i];
+    return v_block(items,v.u.block.n+1);
+}
 static Value b_pop(Env*e,Value*a,int n){
     /* pop the last element of a block, returning it and shrinking in place */
     if (a[0].k==V_PATH){
@@ -369,6 +416,7 @@ static Value b_select(Env*e,Value*a,int n){
 }
 static Value b_loop(Env*e,Value*a,int n){
     Value coll=a[0], params=a[1], body=a[2];
+    rt_brk_set=0;
     if (coll.k==V_DICT){
         /* `loop dict [k v]` binds key+value; `[v]` binds value */
         Dict *dd=coll.u.dict;
@@ -381,14 +429,67 @@ static Value b_loop(Env*e,Value*a,int n){
                 env_set(child, (*params.u.block.items[1]).u.s, dd->vals[i]);
             }
             evalSeq(child, body.u.block.items, body.u.block.n);
+            if (rt_brk_set) break;
         }
+        rt_brk_set=0;
         return v_null();
     }
     int cnt = coll.k==V_RANGE ? (int)(coll.u.range.hi-coll.u.range.lo+1) : coll.u.block.n;
     for(int i=0;i<cnt;i++){
         Value el = coll.k==V_RANGE ? v_int(coll.u.range.lo+i) : *coll.u.block.items[i];
         applyAction(e,params,body,el);
+        if (rt_brk_set) break;
     }
+    rt_brk_set=0;
+    return v_null();
+}
+
+/* `break` — exit the innermost loop. Sets a signal the enclosing while/until/
+ * loop checks after each body evaluation. */
+static Value b_break(Env*e,Value*a,int n){ rt_brk_set=1; return v_null(); }
+/* `null? x` — true iff x is null */
+static Value b_isNull(Env*e,Value*a,int n){ return v_bool(a[0].k==V_NULL); }
+/* `contains? coll x` — membership for a block, substring for a string */
+static Value b_contains(Env*e,Value*a,int n){
+    Value c=a[0];
+    if (c.k==V_BLOCK){
+        for (int i=0;i<c.u.block.n;i++) if (value_eq(*c.u.block.items[i], a[1])) return v_bool(1);
+        return v_bool(0);
+    }
+    if (c.k==V_STR){
+        const char *h=c.u.s, *n=val_str(a[1]);
+        return v_bool(strstr(h,n)!=NULL);
+    }
+    return v_bool(0);
+}
+/* `greaterOrEqual? a b` — a >= b (numeric or string compare) */
+static Value b_ge(Env*e,Value*a,int n){
+    if (a[0].k==V_STR) return v_bool(strcmp(a[0].u.s, a[1].u.s)>=0);
+    return v_bool(as_float(a[0]) >= as_float(a[1]));
+}
+/* `join block` — concatenate a block's elements into one string (no separator) */
+static Value b_join(Env*e,Value*a,int n){
+    Value v=a[0];
+    if (v.k!=V_BLOCK) { char *s=val_str(v); return v_str(s); }
+    size_t cap=16,len=0; char *buf=xmalloc(cap); buf[0]=0;
+    for (int i=0;i<v.u.block.n;i++){
+        char *s=val_str(*v.u.block.items[i]);
+        size_t t=strlen(s); if (len+t+1>cap){ cap=(len+t)*2; buf=xrealloc(buf,cap); }
+        memcpy(buf+len,s,t); len+=t; free(s);
+    }
+    buf[len]=0; Value r=v_str(buf); free(buf); return r;
+}
+/* `try [blk]` — evaluate blk; on a runtime error return null instead of dying */
+static Value b_try(Env*e,Value*a,int n){
+    if (a[0].k!=V_BLOCK) return v_null();
+    jmp_buf jb; jmp_buf *prev = g_try_jmp;
+    g_try_jmp = &jb;
+    if (setjmp(jb)==0){
+        Value r = evalSeq(e, a[0].u.block.items, a[0].u.block.n);
+        g_try_jmp = prev;
+        return r;
+    }
+    g_try_jmp = prev;
     return v_null();
 }
 
@@ -431,7 +532,10 @@ static Value b_get(Env*e,Value*a,int n){
         return (i>=a[0].u.range.lo && i<=a[0].u.range.hi) ? v_int(i) : v_null();
     }
     Value d=a[0]; const char *k=a[1].u.s;
-    if (d.k!=V_DICT) die("get: expected dict");
+    if (d.k!=V_DICT){
+        fprintf(stderr, "get: expected dict, got kind %d, key '%s'\n", d.k, k);
+        die("get: expected dict");
+    }
     int i=dict_find(d,k);
     return i>=0 ? d.u.dict->vals[i] : v_null();
 }
@@ -496,6 +600,19 @@ static char *val_str(Value v){
         }
     }
     return strdup("null");
+}
+
+/* structural equality: numbers compare by value, everything else by string form
+ * (blocks/dicts compare by their flattened rendering — good enough for the
+ * compiler's membership checks on scalar items). */
+static int value_eq(Value a, Value b){
+    if (a.k==V_INT && b.k==V_INT) return a.u.i==b.u.i;
+    if (a.k==V_INT || b.k==V_INT) return as_float(a)==as_float(b);
+    if (a.k==V_STR && b.k==V_STR) return !strcmp(a.u.s,b.u.s);
+    if (a.k==V_BOOL && b.k==V_BOOL) return a.u.b==b.u.b;
+    if (a.k==V_NULL && b.k==V_NULL) return 1;
+    if (a.k==V_CHAR && b.k==V_CHAR) return a.u.c==b.u.c;
+    char *sa=val_str(a), *sb=val_str(b); int r=!strcmp(sa,sb); free(sa); free(sb); return r;
 }
 
 static Value one_elt(Value v);
@@ -763,10 +880,11 @@ static Value b_read(Env*e,Value*a,int n){
     char *buf=xmalloc(sz+1); fread(buf,1,sz,f); buf[sz]=0; fclose(f);
     Value r=v_str(buf); free(buf); return r;
 }
-/* `write path content` */
+/* `write content path` — content FIRST (Arturo's actual signature; the compiler
+ * emits `write <content> <path>`). */
 static Value b_write(Env*e,Value*a,int n){
-    const char *path=a[0].u.s;
-    char *s=val_str(a[1]);
+    char *s=val_str(a[0]);
+    const char *path=a[1].u.s;
     FILE *f=fopen(path,"wb");
     if(!f){ free(s); die("write: cannot open"); return v_null(); }
     fwrite(s,1,strlen(s),f); fclose(f); free(s);
@@ -798,7 +916,8 @@ static Value b_args(Env*e,Value*a,int n){
     Value vals = v_block(items, c);
     char **keys=(char**)xmalloc(sizeof(char*)); keys[0]=(char*)xmalloc(7); memcpy(keys[0],"values",7);
     Value *vv=(Value*)xmalloc(sizeof(Value)); vv[0]=vals;
-    return v_dict(keys, vv, 1);
+    Value r=v_dict(keys, vv, 1);
+    return r;
 }
 
 static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
@@ -815,12 +934,21 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"split",b_split},{"take",b_take},{"drop",b_drop},{"reverse",b_reverse},
     {"ensure",b_ensure},{"array",b_array},{"case",b_case},
     {"read",b_read},{"write",b_write},{"execute",b_execute},{"args",b_args},
+    {"insert",b_insert},{"break",b_break},{"null?",b_isNull},{"contains?",b_contains},
+    {"greaterOrEqual?",b_ge},{"join",b_join},{"try",b_try},
     {NULL,NULL}
 };
 
 int rt_builtin(const char *name, Env *e, Value *args, int n, Value *out) {
     for (int i=0; BUILTINS[i].name; i++)
         if (!strcmp(BUILTINS[i].name, name)) { *out = BUILTINS[i].fn(e,args,n); return 1; }
+    return 0;
+}
+/* zero-arity builtins: when a bare word names one and it is NOT bound as a
+ * variable, the host CALLS it (`args`, `break`) rather than yielding a value. */
+static int rt_zero_arity(const char *name){
+    static const char *z[] = {"args","break",NULL};
+    for (int i=0; z[i]; i++) if (!strcmp(z[i], name)) return 1;
     return 0;
 }
 int rt_builtin_known(const char *name) {
@@ -1073,6 +1201,7 @@ static Value callIntrinsic(Env *e, IR *node) {
     for (int i=0;i<node->nargs;i++) argv[i] = runNode0(e, node->args[i]);
     Value out;
     if (rt_builtin(name, e, argv, node->nargs, &out)) return out;
+    fprintf(stderr,"[unknown intrinsic: %s]\n", name);
     die("unknown intrinsic"); return v_null();
 }
 
@@ -1089,6 +1218,20 @@ static Value runNode0(Env *e, IR *node) {
         return v;
     }
     if (!strcmp(node->op,"intrinsic")) return v_str(node->name); /* hostword marker */
+    if (!strcmp(node->op,"word")) {
+        /* bare word in value position: load the binding if one exists, else call
+         * a zero-arity builtin, else a builtin function value, else null. */
+        Value v = env_get(e, node->name);
+        if (v.k != V_NULL) return v;
+        if (rt_builtin_known(node->name)) {
+            if (rt_zero_arity(node->name)) {
+                Value out, zargv[1];
+                if (rt_builtin(node->name, e, zargv, 0, &out)) return out;
+            }
+            Value b; memset(&b,0,sizeof b); b.k=V_BUILTIN; b.u.s=(char*)node->name; return b;
+        }
+        return v_null();
+    }
     if (!strcmp(node->op,"passthrough")) return node->v;
     if (!strcmp(node->op,"__seq")) return runSeq(e, node->args, node->nargs);
 
@@ -1131,15 +1274,17 @@ static Value runNode0(Env *e, IR *node) {
         rt_ret_set=1; rt_ret_val = runNode0(e, node->args[0]); return rt_ret_val;
     }
     if (!strcmp(node->op,"while")) {
+        rt_brk_set=0;
         while (1) {
             Value cond = runNode0(e, node->args[0]); if (rt_ret_set) break;
             if (!v_truthy(cond)) break;
-            runNode0(e, node->args[1]); if (rt_ret_set) break;
+            runNode0(e, node->args[1]); if (rt_ret_set || rt_brk_set) break;
         }
         if (rt_ret_set) return rt_ret_val;
         return v_null();
     }
     if (!strcmp(node->op,"until")) {
+        rt_brk_set=0;
         while (1) {
             runNode0(e, node->args[0]); if (rt_ret_set) break;
             Value cond = runNode0(e, node->args[1]); if (rt_ret_set) break;

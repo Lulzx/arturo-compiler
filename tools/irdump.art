@@ -1,0 +1,7 @@
+import ./"../src/backend.art"
+go: function [p][
+    src: read p
+    ir: fold (compileToIR src)
+    print (to :string ir)
+]
+go (args\values\0)

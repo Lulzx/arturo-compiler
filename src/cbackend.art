@@ -18,6 +18,14 @@ escapeC: function [s][
 ]
 quoteC: function [s][ "\"" ++ (escapeC s) ++ "\"" ]
 
+; A null VALUE is a leaf constant. It must be emitted directly and NEVER passed
+; to an emitter function: on this host, calling an imported function with a null
+; argument corrupts the value stack — the call returns the function object
+; instead of its result (and the corruption propagates up through the whole
+; emission). So every cNode/cValue call site guards null first, emitting the
+; constant inline. This is why null is absent from cNode's cases below.
+cNullConst: "ir_const(v_null())"
+
 ; render an Arturo constant as a C runtime expression.
 cValue: function [v][
     t: type v
@@ -80,7 +88,11 @@ cPathNode: function [v][
 ; so every list must be size-guarded before joining.
 cSeq: function [items][
     if 0 = size items [ return "ir_seq((IR*[]){}, 0)" ]
-    parts: map items [st][ cNode st ]
+    parts: map items [st][
+        r: cNullConst
+        if not? :null = type st [ r: cNode st ]
+        r
+    ]
     bodyc: joinWith parts ", "
     "ir_seq((IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size items)) ++ ")"
 ]
@@ -89,6 +101,7 @@ cSeq: function [items][
 ; value), so it emits as a block VALUE — NOT a statement sequence. Everything
 ; else defers to cNode.
 cBlockItem: function [st][
+    if :null = type st [ return cNullConst ]
     if :block = type st [ return cBlock st ]
     if :inline = type st [ return cBlock (to :block st) ]
     cNode st
@@ -97,18 +110,82 @@ cBlockItem: function [st][
 ; an evaluated block VALUE (op:"block"): items become a V_BLOCK
 cBlock: function [items][
     if 0 = size items [ return "ir_block((IR*[]){}, 0)" ]
-    parts: map items [st][ cBlockItem st ]
+    parts: map items [st][
+        r: cNullConst
+        if not? :null = type st [ r: cBlockItem st ]
+        r
+    ]
     bodyc: joinWith parts ", "
     "ir_block((IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size items)) ++ ")"
 ]
 
 ; a call node
+; an intrinsic used as a CALL CALLEE: bare ir_intrinsic, so the runtime's call
+; handler (callIntrinsic) dispatches it by name. (In VALUE position an intrinsic
+; must be a zero-arity call, not this marker — see cNode's intrinsic arm.)
+cCallee: function [fn][
+    if :dictionary = type fn [
+        if fn\op = "intrinsic" [
+            return "ir_intrinsic(" ++ (quoteC (to :string fn\name)) ++ ")"
+        ]
+    ]
+    cNode fn
+]
+; the mutating builtins take a REFERENCE as arg 0 (`insert 'c ...`, `append
+; 'c\stack`, `pop 'box\list`). A `[op:passthrough src:<:literal>]` receiver is a
+; single quoted word `'x` — a write-back reference to a variable. Elsewhere a
+; `:literal` is a plain string (a dict key, e.g. `get args "values"`), so the
+; reference must be decided here, by the callee, not in the generic passthrough
+; arm. A `:pathliteral` receiver (`'a\b`) already emits as a real v_path.
+cMutating?: function [fn][
+    if :dictionary = type fn [
+        if fn\op = "intrinsic" [
+            nm: to :string fn\name
+            if nm = "insert" [ return true ]
+            if nm = "append" [ return true ]
+            if nm = "pop"    [ return true ]
+            if nm = "set"    [ return true ]
+            if nm = "inc"    [ return true ]
+            if nm = "dec"    [ return true ]
+        ]
+    ]
+    false
+]
+cRefNode: function [a][
+    if :dictionary = type a [
+        if a\op = "passthrough" [
+            if :literal = type a\src [
+                return "ir_passthrough(v_path((char*[]){" ++ (quoteC (to :string a\src)) ++ "}, 1))"
+            ]
+        ]
+    ]
+    cNode a
+]
 cCall: function [n][
     args: n\args
-    if 0 = size args [ return "ir_call(" ++ (cNode n\fn) ++ ", (IR*[]){}, 0)" ]
-    parts: map args [a][ cNode a ]
+    fnc: cCallee n\fn
+    mut?: cMutating? n\fn
+    if 0 = size args [ return "ir_call(" ++ fnc ++ ", (IR*[]){}, 0)" ]
+    ; build each arg as a bound temp before accumulating: a deep cNode result
+    ; (a nested call, a block) built through a long `++` chain leaks the host
+    ; value stack if it is inlined or mapped inline, corrupting siblings.
+    parts: @[]
+    argi: 0
+    loop args [a][
+        if :null = type a [ parts: parts ++ @[cNullConst] ]
+        if not? :null = type a [
+            pa: cNode a
+            ; only arg 0 of a mutating builtin is the reference receiver; the
+            ; later args (e.g. `set`'s key, `insert`'s value) are plain values.
+            if and? mut? 0 = argi [ pa: cRefNode a ]
+            parts: parts ++ @[pa]
+        ]
+        argi: argi + 1
+    ]
     argc: joinWith parts ", "
-    "ir_call(" ++ (cNode n\fn) ++ ", (IR*[]){" ++ argc ++ "}, " ++ (to :string (size args)) ++ ")"
+    copen: "ir_call(" ++ fnc ++ ", (IR*[]){"
+    cclose: "}, " ++ (to :string (size args)) ++ ")"
+    copen ++ argc ++ cclose
 ]
 
 ; a function node: args = [params, bodySeq]
@@ -118,14 +195,22 @@ cFunction: function [n][
     body: args\1
     if 0 = size params [
         if 0 = size body [ return "ir_fn(ir_block((IR*[]){}, 0), (IR*[]){}, 0)" ]
-        parts: map body [st][ cNode st ]
+        parts: map body [st][
+            r: cNullConst
+            if not? :null = type st [ r: cNode st ]
+            r
+        ]
         bodyc: joinWith parts ", "
         return "ir_fn(ir_block((IR*[]){}, 0), (IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size body)) ++ ")"
     ]
     parts: map params [w][ "ir_load(" ++ (quoteC (to :string w)) ++ ")" ]
     paramc: joinWith parts ", "
     paramsIR: "ir_block((IR*[]){" ++ paramc ++ "}, " ++ (to :string (size params)) ++ ")"
-    parts: map body [st][ cNode st ]
+    parts: map body [st][
+        r: cNullConst
+        if not? :null = type st [ r: cNode st ]
+        r
+    ]
     bodyc: joinWith parts ", "
     "ir_fn(" ++ paramsIR ++ ", (IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size body)) ++ ")"
 ]
@@ -140,7 +225,8 @@ cIf: function [n][
         if :null = type elsev [
             return "ir_op(\"if\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ "}, 2)"
         ]
-        return "ir_op(\"if\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ ", " ++ (cNode elsev) ++ "}, 3)"
+        elsec: cNode elsev
+        return "ir_op(\"if\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ ", " ++ elsec ++ "}, 3)"
     ]
     "ir_op(\"if\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ "}, 2)"
 ]
@@ -178,10 +264,15 @@ cPathAllSimple: function [v][
 ; a path segment → an ir_block whose tokens evaluate to the key string at run
 ; time (used as the get/set key argument).
 cPathKeyBlock: function [seg][
+    if :null = type seg [ return cNullConst ]
     if :block = type seg [
         toks: to :block seg
         if 0 = size toks [ return "ir_block((IR*[]){}, 0)" ]
-        parts: map toks [tk][ cNode tk ]
+        parts: map toks [tk][
+            r: cNullConst
+            if not? :null = type tk [ r: cNode tk ]
+            r
+        ]
         return "ir_block((IR*[]){" ++ (joinWith parts ", ") ++ "}, " ++ (to :string (size toks)) ++ ")"
     ]
     "ir_block((IR*[]){" ++ (cNode seg) ++ "}, 1)"
@@ -209,7 +300,42 @@ cPathComplexWrite: function [v][
     "ir_block((IR*[]){ir_const(v_str(\"set\")), ir_const(v_str(" ++ (quoteC baseName) ++ ")), " ++ kb ++ "}, 3)"
 ]
 
+; a path SEGMENT used as a `get` key (for a passthrough path read). A numeric
+; literal (`\0`) is an int (block index); a named literal (`\foo`) is a string
+; (dict key); a word is a variable read; a `[...]` block is a computed key.
+cPathKeyNode: function [seg][
+    ts: type seg
+    if :block = ts [ return cPathKeyBlock seg ]
+    if :word = ts [ return cNode seg ]
+    if :label = ts [ return "ir_const(v_str(" ++ (quoteC (to :string seg)) ++ "))" ]
+    if :literal = ts [
+        s: to :string seg
+        if 0 < size (match s {/^[0-9]+$/}) [ return "ir_const(v_int(" ++ s ++ "))" ]
+        return "ir_const(v_str(" ++ (quoteC s) ++ "))"
+    ]
+    cNode seg
+]
+
+; a dynamic path read in VALUE position (the `src` of a passthrough, e.g. a
+; dict value `params: argv\0`): the ART backend renders this as `get argv 0`,
+; so emit the same get-CALL — runNode resolves it to the read value. Nested
+; segments (`a\0\1`) become nested gets.
+cPathReadCall: function [v][
+    blk: to :block v
+    baseName: to :string blk\0
+    expr: "ir_load(" ++ (quoteC baseName) ++ ")"
+    loop 1..dec (size blk) [j][
+        kc: cPathKeyNode blk\[j]
+        expr: "ir_call(ir_intrinsic(\"get\"), (IR*[]){" ++ expr ++ ", " ++ kc ++ "}, 2)"
+    ]
+    expr
+]
+
 cNode: function [n][
+    ; A null VALUE must never reach here: every caller guards first (passing a
+    ; null arg to this imported function would corrupt the host and return the
+    ; function object). This guard is a final backstop only.
+    if :null = type n [ return cNullConst ]
     ; a raw `:block` VALUE is a STATEMENT SEQUENCE (a `do` body, a `while`/`if`
     ; body or condition): its items are evaluated in order and the last is the
     ; result. (Nested block VALUES inside it are op:"block" DICTS, handled by the
@@ -233,17 +359,40 @@ cNode: function [n][
     ; a label heads a define (`x: val`) inside a block-as-code action body; it is
     ; tagged so the runtime's interpreter can tell it from a variable read.
     if :label = t [ return "ir_const(v_str(" ++ (quoteC ("@LBL:" ++ (to :string n))) ++ "))" ]
-    ; a raw primitive (integer, string, word, ...) is a constant node
+    ; a raw primitive (integer, string, word, ...) is a constant node. The null
+    ; case was handled above; cValue is never handed a null.
     if not? :dictionary = t [ return "ir_const(" ++ (cValue n) ++ ")" ]
     op: n\op
     ; HOST QUIRK: a deep cNode result passed INLINE into a `++` corrupts sibling
     ; block items (the value-stack leak), so the deep-call arms live in helper
-    ; functions that bind the result to a name before concatenating.
+    ; functions that bind the result to a name before concatenating. Likewise a
+    ; null constant value (a `const`/`passthrough` node holding null) is emitted
+    ; inline rather than through cValue. (A `case` arm whose RHS is a literal
+    ; block would return the block as DATA, so these null checks are early
+    ; returns, not case arms.)
+    if op = "const" [
+        if :null = type n\value [ return cNullConst ]
+        return "ir_const(" ++ (cValue n\value) ++ ")"
+    ]
+    if op = "passthrough" [
+        if :null = type n\src [ return "ir_passthrough(v_null())" ]
+        ts: type n\src
+        ; a dynamic path read in value position (`params: argv\0`) resolves as a
+        ; get-call, exactly as the ART backend renders it. A `:pathliteral`
+        ; (`'c\stack`) is data and stays a passthrough carrying a v_path value.
+        if :path = ts [ return cPathReadCall n\src ]
+        if :pathlabel = ts [ return cPathReadCall n\src ]
+        return "ir_passthrough(" ++ (cValue n\src) ++ ")"
+    ]
     case op [
-        "const"        -> "ir_const(" ++ (cValue n\value) ++ ")"
-        "passthrough"  -> "ir_passthrough(" ++ (cValue n\src) ++ ")"
         "load"         -> "ir_load(" ++ (quoteC (to :string n\name)) ++ ")"
-        "intrinsic"    -> "ir_intrinsic(" ++ (quoteC (to :string n\name)) ++ ")"
+        ; an intrinsic in VALUE position is a bare word: resolve var-first, else
+        ; call a zero-arity builtin (`args`, `break`), else a builtin function
+        ; value. `ir_word` does this at runtime; a bound param named like a
+        ; construct (`arity`, `env`) loads its value, and `args` as the base of
+        ; `args\values` is called. As a CALL CALLEE it must stay bare
+        ; ir_intrinsic — cCallee handles that.
+        "intrinsic"    -> "ir_word(" ++ (quoteC (to :string n\name)) ++ ")"
         "define"       -> cDefine n
         "block"        -> cBlock n\items
         "call"         -> cCall n
@@ -259,7 +408,8 @@ cNode: function [n][
 ; the deep-call arms, extracted so their result is bound before concatenation
 ; (avoids the host value-stack corruption when a deep cNode is inlined in `++`).
 cDefine: function [n][
-    e: cNode n\expr
+    e: cNullConst
+    if not? :null = type n\expr [ e: cNode n\expr ]
     "ir_define(" ++ (quoteC (to :string n\name)) ++ ", " ++ e ++ ")"
 ]
 cDo: function [n][
@@ -277,14 +427,19 @@ cUntil: function [n][
     "ir_op(\"until\", (IR*[]){" ++ a ++ ", " ++ b ++ "}, 2)"
 ]
 cReturn: function [n][
-    a: cNode n\args\0
+    a: cNullConst
+    if not? :null = type n\args\0 [ a: cNode n\args\0 ]
     "ir_op(\"return\", (IR*[]){" ++ a ++ "}, 1)"
 ]
 
 ; ---- full C program ---------------------------------------------------------
 compileToC: function [src][
     ir: fold (compileToIR src)
-    stmtc: map ir [n][ "\t\t" ++ (cNode n) ]
+    stmtc: map ir [n][
+        r: cNullConst
+        if not? :null = type n [ r: cNode n ]
+        "\t\t" ++ r
+    ]
     stmts: joinWith stmtc ",\n"
     header: "/* generated by the compiler's C backend; links runtime.a */\n#include \"runtime.h\"\n\nint main(int argc, char **argv){\n\truntime_set_args(argc, argv);\n\tEnv *e = env_new(NULL);\n\tIR *seq[] = {\n"
     footer: "\n\t};\n\trunSeq(e, seq, " ++ (to :string (size ir)) ++ ");\n\treturn 0;\n}\n"

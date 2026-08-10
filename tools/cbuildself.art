@@ -1,0 +1,20 @@
+import ./"../src/backend.art"
+buildSelfCompiler: function [][
+    out: @[]
+    files: ["src/intrinsics.art" "src/semantics.art" "src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
+    loop files [f][
+        src: read f
+        src: replace src "import ./\"" ++ f ++ "\"\n" ""
+        src: replace src "import ./\"intrinsics.art\"\n" ""
+        src: replace src "import ./\"semantics.art\"\n" ""
+        src: replace src "import ./\"front.art\"\n" ""
+        src: replace src "import ./\"kernel.art\"\n" ""
+        src: replace src "import ./\"ir.art\"\n" ""
+        addItem out src
+    ]
+    joinWith out "\n"
+]
+MAIN: "\nif 1 < size args\\values [\n    inPath: args\\values\\0\n    outPath: args\\values\\1\n    b: read.binary inPath\n    src: to :string b\n    art: renderProgram src\n    write art outPath\n    print outPath\n]\n"
+src: buildSelfCompiler ++ MAIN
+write src "tmp/native_compiler_src.art"
+print (size src)

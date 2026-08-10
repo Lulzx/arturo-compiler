@@ -1,0 +1,17 @@
+import ./"../src/ir.art"
+import ./"../src/front.art"
+zzprobe: function [][
+    ir: fold (compileToIR (read "src/front.art"))
+    found: 0
+    loop ir [n][
+        if and? :dictionary = type n "define" = n\op [
+            s: to :string n
+            if 0 < index s "BUILTIN_ARITY" [
+                print s
+                inc 'found
+            ]
+        ]
+    ]
+    print "found: " ++ (to :string found)
+]
+zzprobe

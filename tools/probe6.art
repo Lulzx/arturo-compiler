@@ -1,0 +1,7 @@
+import ./"../src/cbackend.art"
+doit: function [n][
+    src: slice (read "/Users/lulzx/work/arturo-compiler/tmp/selfcompiler.art") 0 n
+    c: compileToC src
+    print "n=" ++ (to :string n) ++ " size:" ++ (to :string (size c))
+]
+doit (to :integer (args\values\0))

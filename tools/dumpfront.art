@@ -1,0 +1,11 @@
+import ./"../src/backend.art"
+go: function [][
+    ir: fold (compileToIR (read "src/front.art"))
+    loop ir [n][
+        s: to :string n
+        if 0 < index s "name:loop" [
+            print s
+        ]
+    ]
+]
+go

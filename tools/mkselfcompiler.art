@@ -1,0 +1,12 @@
+import ./"../src/backend.art"
+out: @[]
+files: ["src/intrinsics.art" "src/semantics.art" "src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
+loop files [f][
+    src: read f
+    loop files [g][
+        src: replace src ("import ./\"" ++ g ++ "\"\n") ""
+    ]
+    addItem out src
+]
+write (joinWith out "\n") "tmp/selfcompiler_body.art"
+print "wrote body"
