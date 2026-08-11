@@ -1,0 +1,17 @@
+import ./"../src/cbackend.art"
+buildSelfCompiler: function [][
+    out: @[]
+    files: ["intrinsics.art" "semantics.art" "front.art" "kernel.art" "ir.art" "backend.art"]
+    loop files [f][
+        src: read ("src/" ++ f)
+        loop files [g][ src: replace src ("import ./\"" ++ g ++ "\"\n") "" ]
+        addItem out src
+    ]
+    joinWith out "\n"
+]
+TMAIN: "\nsrc: read \"corpus/05_functions.art\"\nir: compileToIR src\nex: ir\\0\\expr\nprint \"args size: [\" ++ (to :string (size ex\\args)) ++ \"]\"\nprint \"args0: [\" ++ (to :string ex\\args\\0) ++ \"]\"\nprint \"args1 size: [\" ++ (to :string (size ex\\args\\1)) ++ \"]\"\nloop ex\\args\\1 [st][ print \"  body st: [\" ++ (to :string st) ++ \"]\" ]\n"
+doit: function [src outName][ compileToNativeC src outName ]
+src: buildSelfCompiler ++ TMAIN
+write src "tmp/nc_test.art"
+doit src "tmp/nc_test"
+print "built"

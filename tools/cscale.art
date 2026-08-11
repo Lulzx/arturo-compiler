@@ -1,0 +1,4 @@
+import ./"../src/cbackend.art"
+src: read (args\values\0)
+c: compileToC src
+print "type=" ++ (to :string (type c)) ++ " len=" ++ (to :string (size c))

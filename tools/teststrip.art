@@ -1,0 +1,11 @@
+src: read "src/front.art"
+loop ["intrinsics.art" "semantics.art" "front.art" "kernel.art" "ir.art"] [g][
+    t: ("import ./\"" ++ g ++ "\"\n")
+    n: (to :string (size (match src t)))
+    src2: replace src t ""
+    print "g=" ++ g ++ " matches=" ++ n ++ " sizediff=" ++ (to :string (- (size src) (size src2)))
+    src: src2
+]
+print "remaining import ./ lines:"
+loop (match src "import ./(\")") [][]
+print (match src "import ./\"")

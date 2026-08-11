@@ -1,0 +1,4 @@
+import ./"../src/cbackend.art"
+doit: function [src][ compileToC src ]
+w: doit "b: read \"file\"\nprint b"
+print w

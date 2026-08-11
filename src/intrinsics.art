@@ -172,7 +172,6 @@ INTRINSICS: #[
     "flatten": #[arity: 1 alias: "" infix?: false refs: @[true] muts: @[true]]
     "floating?": #[arity: 1 alias: "" infix?: false refs: @[false] muts: @[false]]
     "floor": #[arity: 1 alias: "" infix?: false refs: @[false] muts: @[false]]
-    "fold": #[arity: 3 alias: "" infix?: false refs: @[false false false] muts: @[false false false]]
     "friday?": #[arity: 1 alias: "" infix?: false refs: @[false] muts: @[false]]
     "function": #[arity: 2 alias: "$" infix?: false refs: @[true false] muts: @[false false]]
     "function?": #[arity: 1 alias: "" infix?: false refs: @[false] muts: @[false]]

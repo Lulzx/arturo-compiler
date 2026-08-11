@@ -40,8 +40,8 @@ The three columns are held to each other by construction —
 eval(env, emit(n)) == eval(env, n)      ; for every node n
 ```
 
-— and by a harness that runs every corpus program all three ways
-plus on the real `arturo`, and compares.
+— and by a harness that runs every corpus program four ways
+(`host` on the real `arturo`, `kernel` interpret, `compiled` via `ir2art`+host, and `runIR` in-kernel) and compares.
 
 All three columns take the same `[env argv]`. A construct's `emit`
 column lowers its arguments to a flat `args` list inside one
@@ -128,45 +128,54 @@ to stay small. Purity is deliberately not generated: Arturo does
 not state it, so generating it would mean dressing guesses up as
 extracted facts.
 
+## Prerequisites
+
+`arturo` 0.10.0 (the revision pinned in `corpus/m1/RESULTS.md`). To regenerate `src/intrinsics.art` from an Arturo checkout, pass its path to the generator — see above.
+
 ## Run it
 
-    arturo src/compiler.art <in.art> <out.art>   # emit -> fold -> print
-    arturo -c <out.art> && arturo -x <out.art.bcode>
+    arturo src/compiler.art <in.art> <out.art>          # emit -> fold -> print
+    arturo src/compiler.art <in.art> <out.art> -b       # also emit native binary via cbackend (--native)
+    arturo -c <out.art> && arturo -x <out.art.bcode>    # or host bytecode
+    ./native_compiler                                    # prebuilt binary at repo root (gitignored)
 
 ## Test it
 
-    arturo src/tests.art       # differential: host vs kernel vs compiled
+    arturo src/tests.art       # differential: host vs kernel vs compiled vs runIR
     arturo src/smoke.art       # interpret mode
     arturo src/bootstrap.art   # the compiler compiles itself
 
-The harness runs every corpus program three ways — on the real
-`arturo`, through the kernel interpreter, and through the emitted
-IR rendered back to source and recompiled by the host. All three
-agree.
+The harness runs every corpus program four ways — `host` (real `arturo`), `kernel` (interpret), `compiled` (emit -> fold -> `ir2art` -> host), and `runIR` (emit -> fold -> in-kernel `runIR`). All four agree. Each file runs in its own process via `src/one_test.art` to isolate host value-stack contamination.
 
 The bootstrap goes one further. Stage 1 (the compiler in `src/`)
 emits stage 2, a self-contained compiler that runs on the donated
 VM with no access to `src/`. Stage 2 then renders every corpus
 program exactly as stage 1 did, and re-emits the compiler itself:
-stage 3 is byte-identical to stage 2. That fixpoint is the whole
-claim — the compiler reproduces itself.
+stage 3 is byte-identical to stage 2. Stage 2 compiled to host
+bytecode (`arturo -c`) and run by `-x` re-emits the compiler
+byte-identically too — the donation end-to-end, with no
+source-level interpretation left in the loop. That fixpoint is the
+whole claim — the compiler reproduces itself.
 
 ## Files
 
     src/intrinsics.art  GENERATED — every builtin's declared signature
     src/semantics.art   what Arturo does not declare and we decide
     tools/extract_intrinsics.art  the generator
-    src/front.art     strip, lex, lower — the grouping, pinned to ast.nim
-    src/kernel.art    the rule table and its three dispatchers, plus runIR
-    src/ir.art        IR, the printer, constant folding
-    src/backend.art   runIR; shell out to -c / -x
-    src/tests.art     the differential harness
-    corpus/           one program per rule, then compositions
-
-Every construct the compiler emits survives `arturo -c`, which
-takes the bootstrap one step further: stage 2 compiled to host
-bytecode and run by `-x` re-emits the compiler byte-identically
-too, with no source-level interpretation anywhere in the loop.
+    src/front.art       strip, lex, lower — grouping, pinned to ast.nim
+    src/kernel.art      the rule table and its three dispatchers, plus runIR
+    src/ir.art          IR, the printer, constant folding
+    src/backend.art     runIR; shell out to -c / -x
+    src/cbackend.art    C emitter for -b / --native
+    src/mknative.art    link helper for native binary
+    src/tests.art / one_test.art / inv.art / ir_runner.art / kernel_runner.art / smoke.art / bootstrap.art
+                        harnesses (differential, invariant, runners)
+    src/compiler.art    entry point (emit -> fold -> print, with -b)
+    corpus/             one program per rule, then compositions (27_call.art pins `call`)
+    corpus/m1/          host probes and RESULTS.md
+    runtime/            donated VM objects (*.o/*.a, gitignored)
+    tmp/                scratch (*.bcode etc., gitignored)
+    native_compiler     prebuilt native binary (gitignored)
 
 Getting there meant designing around seven bugs in the host —
 `-c` dropping mutation made through a path reference, dying on a

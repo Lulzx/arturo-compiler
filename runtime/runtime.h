@@ -24,6 +24,16 @@ typedef struct Value Value;
 typedef struct IR IR;
 typedef struct Env Env;
 typedef struct Dict Dict;   /* shared, heap-allocated dictionary body */
+typedef struct Block Block; /* shared, heap-allocated block body (Arturo ref type) */
+
+/* a block is a heap body referenced by every copy of its value, so an
+ * `insert`/`append`/`pop` through one copy is visible through all of them —
+ * Arturo ref semantics (the compiler's addItem relies on this). */
+struct Block {
+    Value **items;
+    int n;
+    int cap;
+};
 
 struct Value {
     VKind k;
@@ -35,7 +45,7 @@ struct Value {
         int         b;          /* V_BOOL */
         struct { long lo; long hi; } range;   /* V_RANGE */
         struct { char **segs; int nsegs; Value *segv; } path;  /* V_PATH (segv=segment Values for to :block) */
-        struct { Value **items; int n; } block;    /* V_BLOCK */
+        struct { Block *b; } block;    /* V_BLOCK — shared body, see Block above */
         Dict       *dict;       /* V_DICT */
         struct { IR *params; IR **body; int nbody; Env *closure; } fn; /* V_FUNC */
     } u;

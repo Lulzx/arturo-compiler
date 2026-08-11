@@ -1,0 +1,4 @@
+import ./"../src/cbackend.art"
+doit: function [src outName][ compileToNativeC src outName ]
+doit (read "tmp/t_lex.art") "tmp/t_lex"
+print "built"

@@ -6,6 +6,7 @@
  */
 #include "runtime.h"
 #include <stdio.h>
+#include <execinfo.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -36,6 +37,14 @@ static void *xrealloc(void *p, size_t n) {
     if (!q) { die("out of memory"); }
     return q;
 }
+/* grow a shared block body to hold at least `need` elements */
+static void block_grow(Block *b, int need){
+    if (b->cap >= need) return;
+    int ncap = b->cap ? b->cap : 4;
+    while (ncap < need) ncap *= 2;
+    b->items = (Value**)xrealloc(b->items, (size_t)ncap*sizeof(Value*));
+    b->cap = ncap;
+}
 
 /* ---- value constructors ------------------------------------------------- */
 Value v_null(void)  { Value v; memset(&v,0,sizeof v); v.k=V_NULL;  return v; }
@@ -50,7 +59,9 @@ Value v_str(const char *s) {
 }
 Value v_block(Value **items, int n) {
     Value v; memset(&v,0,sizeof v); v.k=V_BLOCK;
-    v.u.block.items = items; v.u.block.n = n; return v;
+    Block *b=(Block*)xmalloc(sizeof *b);
+    b->items=items; b->n=n; b->cap=n;   /* takes ownership of the caller's array */
+    v.u.block.b=b; return v;
 }
 Value v_dict(char **keys, Value *vals, int n) {
     Value v; memset(&v,0,sizeof v); v.k=V_DICT;
@@ -127,7 +138,7 @@ static void print_scalar(Value v) {
 static void print_embedded(Value v) {
     if (v.k == V_BLOCK) {
         printf("[");
-        for (int i=0;i<v.u.block.n;i++){ if(i)printf(" "); print_embedded(*v.u.block.items[i]); }
+        for (int i=0;i<v.u.block.b->n;i++){ if(i)printf(" "); print_embedded(*v.u.block.b->items[i]); }
         printf("]");
     } else {
         print_scalar(v);
@@ -136,7 +147,7 @@ static void print_embedded(Value v) {
 void v_print(Value v) {
     if (v.k == V_BLOCK) {
         /* host prints each element followed by a space (trailing space kept) */
-        for (int i=0;i<v.u.block.n;i++){ print_embedded(*v.u.block.items[i]); printf(" "); }
+        for (int i=0;i<v.u.block.b->n;i++){ print_embedded(*v.u.block.b->items[i]); printf(" "); }
     } else {
         print_scalar(v);
     }
@@ -160,7 +171,27 @@ Value env_get(Env *e, const char *name) {
     for (Env *f=e;f;f=f->parent) { int i=env_find(f,name); if (i>=0) return f->vals[i]; }
     return v_null();
 }
+/* `x: value` — updates the nearest existing binding (walking parent scopes),
+ * matching the host's loop-body assignment (`loop xs [x][ cnt: cnt + 1 ]`
+ * accumulates cnt). The compiler's @LBL action-body defines use this. */
 void env_set(Env *e, const char *name, Value v) {
+    for (Env *f=e; f; f=f->parent) {
+        int i = env_find(f, name);
+        if (i>=0) { f->vals[i]=v; return; }
+    }
+    e->names = (char**)xrealloc(e->names, (e->n+1)*sizeof(char*));
+    e->vals  = (Value*)xrealloc(e->vals, (e->n+1)*sizeof(Value));
+    e->names[e->n] = (char*)xmalloc(strlen(name)+1); strcpy(e->names[e->n], name);
+    e->vals[e->n] = v; e->n++;
+}
+
+/* `x: value` at FUNCTION scope and parameter binding — LOCAL only. The host
+ * shadows: `f: function [][ y: 5 ]` does NOT touch an outer y, `x: x + 1` on a
+ * param updates the param, and a closure's `z: z + 1` does NOT reach the
+ * capturing scope. env_set's parent walk would clobber an outer binding of the
+ * same name (the compiler's `c`/`parts`/`ctx` locals collided with the global
+ * `c` and the crash was `get <stack> "stack"`). */
+static void env_define_local(Env *e, const char *name, Value v) {
     int i = env_find(e, name);
     if (i>=0) { e->vals[i]=v; return; }
     e->names = (char**)xrealloc(e->names, (e->n+1)*sizeof(char*));
@@ -209,7 +240,7 @@ static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
             IR *p = params->args[i];
             const char *nm = NULL;
             if (p->op && !strcmp(p->op,"load")) nm=p->name;
-            if (nm && i<n) env_set(child, nm, argv[i]);
+            if (nm && i<n) env_define_local(child, nm, argv[i]);
         }
     }
     rt_ret_set=0;
@@ -224,11 +255,13 @@ static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
 static long as_int(Value v) {
     if (v.k==V_INT) return v.u.i;
     if (v.k==V_FLOAT) return (long)v.u.f;
+    if (v.k==V_BOOL) return v.u.b?1:0;
     die("expected number"); return 0;
 }
 static double as_float(Value v) {
     if (v.k==V_FLOAT) return v.u.f;
     if (v.k==V_INT) return (double)v.u.i;
+    if (v.k==V_BOOL) return v.u.b?1.0:0.0;
     die("expected number"); return 0;
 }
 static Value num2(long i){ return v_int(i); }
@@ -245,19 +278,21 @@ static Value b_neg(Env*e,Value*a,int n){ if(a[0].k==V_FLOAT)return numf(-a[0].u.
 static Value b_inc(Env*e,Value*a,int n){ return num2(as_int(a[0])+1); }
 static Value b_dec(Env*e,Value*a,int n){ return num2(as_int(a[0])-1); }
 static Value b_print(Env*e,Value*a,int n){ v_print(a[0]); return v_null(); }
+/* string-like kinds carry a name in u.s and compare by that name */
+#define IS_STRLIKE(k) ((k)==V_STR||(k)==V_WORD||(k)==V_LABEL||(k)==V_LITERAL||(k)==V_SYMBOL||(k)==V_TYPE||(k)==V_ATTRIBUTE||(k)==V_ATTRIBUTELABEL)
 static Value b_equal(Env*e,Value*a,int n){
     if (a[0].k==V_INT && a[1].k==V_INT) return v_bool(a[0].u.i==a[1].u.i);
-    if (a[0].k==V_STR  && a[1].k==V_STR) return v_bool(!strcmp(a[0].u.s,a[1].u.s));
     if (a[0].k==V_BOOL && a[1].k==V_BOOL) return v_bool(a[0].u.b==a[1].u.b);
     if (a[0].k==V_FLOAT && (a[1].k==V_FLOAT||a[1].k==V_INT)) return v_bool(as_float(a[0])==as_float(a[1]));
     if ((a[0].k==V_INT||a[0].k==V_FLOAT) && a[1].k==V_FLOAT) return v_bool(as_float(a[0])==as_float(a[1]));
+    if (IS_STRLIKE(a[0].k) && IS_STRLIKE(a[1].k)) return v_bool(!strcmp(a[0].u.s,a[1].u.s));
     return v_bool(0);
 }
 static Value b_notEqual(Env*e,Value*a,int n){
     if (a[0].k==V_INT && a[1].k==V_INT) return v_bool(a[0].u.i!=a[1].u.i);
-    if (a[0].k==V_STR  && a[1].k==V_STR) return v_bool(strcmp(a[0].u.s,a[1].u.s)!=0);
     if (a[0].k==V_BOOL && a[1].k==V_BOOL) return v_bool(a[0].u.b!=a[1].u.b);
     if ((a[0].k==V_INT||a[0].k==V_FLOAT) && (a[1].k==V_INT||a[1].k==V_FLOAT)) return v_bool(as_float(a[0])!=as_float(a[1]));
+    if (IS_STRLIKE(a[0].k) && IS_STRLIKE(a[1].k)) return v_bool(strcmp(a[0].u.s,a[1].u.s)!=0);
     if (a[0].k!=a[1].k) return v_bool(1);
     return v_bool(0);
 }
@@ -278,14 +313,27 @@ static Value b_type(Env*e,Value*a,int n){
     char buf[64]; sprintf(buf,":%s",type_name(a[0]));
     return v_str(buf);
 }
-static Value b_greater(Env*e,Value*a,int n){ return v_bool(as_float(a[0])>as_float(a[1])); }
-static Value b_less(Env*e,Value*a,int n){ return v_bool(as_float(a[0])<as_float(a[1])); }
-static Value b_and(Env*e,Value*a,int n){ return v_bool(v_truthy(a[0])&&v_truthy(a[1])); }
-static Value b_or(Env*e,Value*a,int n){ return v_bool(v_truthy(a[0])||v_truthy(a[1])); }
+static Value b_greater(Env*e,Value*a,int n){ if (a[0].k==V_STR) return v_bool(strcmp(a[0].u.s, a[1].u.s)>0); return v_bool(as_float(a[0])>as_float(a[1])); }
+static Value b_less(Env*e,Value*a,int n){ if (a[0].k==V_STR) return v_bool(strcmp(a[0].u.s, a[1].u.s)<0); return v_bool(as_float(a[0])<as_float(a[1])); }
+static Value runBlockValue(Env *e, Value block);   /* forward (defined later) */
+/* Arturo's `and? a [b]` / `or? a [b]` evaluate the SECOND arg lazily: a block
+ * arg is run as code (so `and? (c\i<n-1) [isInfixSymbol ...]` actually calls
+ * isInfixSymbol), and a falsy first arg short-circuits `and?` without running
+ * it. A plain-value second arg is compared directly. */
+static Value b_and(Env*e,Value*a,int n){
+    if (!v_truthy(a[0])) return v_bool(0);
+    Value s=a[1]; if (s.k==V_BLOCK) s=runBlockValue(e,s);
+    return v_bool(v_truthy(s));
+}
+static Value b_or(Env*e,Value*a,int n){
+    if (v_truthy(a[0])) return v_bool(1);
+    Value s=a[1]; if (s.k==V_BLOCK) s=runBlockValue(e,s);
+    return v_bool(v_truthy(s));
+}
 static Value b_not(Env*e,Value*a,int n){ return v_bool(!v_truthy(a[0])); }
 static Value b_size(Env*e,Value*a,int n){
     Value v=a[0];
-    if (v.k==V_BLOCK) return num2(v.u.block.n);
+    if (v.k==V_BLOCK) return num2(v.u.block.b->n);
     if (v.k==V_STR) return num2((long)strlen(v.u.s));
     if (v.k==V_DICT) return num2(v.u.dict->n);
     if (v.k==V_RANGE) return num2(v.u.range.hi - v.u.range.lo + 1);
@@ -294,16 +342,17 @@ static Value b_size(Env*e,Value*a,int n){
 }
 static Value b_first(Env*e,Value*a,int n){
     Value v=a[0];
-    if (v.k==V_BLOCK) return v.u.block.n? *v.u.block.items[0] : v_null();
+    if (v.k==V_BLOCK) return v.u.block.b->n? *v.u.block.b->items[0] : v_null();
     if (v.k==V_STR) return v_str((char[]){v.u.s[0],0});
     die("first: unsupported"); return v_null();
 }
 static Value b_last(Env*e,Value*a,int n){
     Value v=a[0];
-    if (v.k==V_BLOCK) return v.u.block.n? *v.u.block.items[v.u.block.n-1] : v_null();
+    if (v.k==V_BLOCK) return v.u.block.b->n? *v.u.block.b->items[v.u.block.b->n-1] : v_null();
     die("last: unsupported"); return v_null();
 }
 static int dict_find(Value d, const char *k);
+static const char *key_text(Value v);   /* forward: defined with the dict builtins */
 static Value applyAction(Env *parent, Value params, Value action, Value el);
 static Value evalSeq(Env *e, Value **it, int n);
 static Value evalExpr(Env *e, Value **it, int n, int *ip);
@@ -327,10 +376,12 @@ static int path_target(Env *e, Value p, Value *cont, int *idx) {
     return *idx;
 }
 static Value block_append(Value v, Value el){
-    Value **items=(Value**)xmalloc((v.u.block.n+1)*sizeof(Value*));
-    for(int i=0;i<v.u.block.n;i++) items[i]=v.u.block.items[i];
-    items[v.u.block.n]=(Value*)xmalloc(sizeof(Value)); items[v.u.block.n][0]=el;
-    return v_block(items,v.u.block.n+1);
+    /* mutate the shared body in place so all copies see the append */
+    Block *b=v.u.block.b;
+    block_grow(b, b->n+1);
+    b->items[b->n]=(Value*)xmalloc(sizeof(Value)); b->items[b->n][0]=el;
+    b->n++;
+    return v;
 }
 static Value b_append(Env*e,Value*a,int n){
     /* a path reference writes back through the resolved container */
@@ -344,7 +395,22 @@ static Value b_append(Env*e,Value*a,int n){
         return r;
     }
     Value v=a[0];
-    if (v.k==V_BLOCK) return block_append(v,a[1]);
+    if (v.k==V_BLOCK){
+        /* the host's append FLATTENS a block argument (`append [1] [2 3]` ->
+         * `[1 2 3]`; the compiler's `parts ++ @[pa]` relies on it). The compiler
+         * uses `insert` (addItem) for a single-element append. */
+        if (a[1].k==V_BLOCK && a[1].u.block.b){
+            Block *src=a[1].u.block.b;
+            Block *b=v.u.block.b;
+            block_grow(b, b->n+src->n);
+            for (int i=0;i<src->n;i++){
+                b->items[b->n]=(Value*)xmalloc(sizeof(Value)); b->items[b->n][0]=*src->items[i];
+                b->n++;
+            }
+            return v;
+        }
+        return block_append(v,a[1]);
+    }
     if (v.k==V_STR){
         /* string append: concatenate the second arg (as text) onto the string */
         const char *s = v.u.s;
@@ -370,7 +436,8 @@ static Value b_insert(Env*e,Value*a,int n){
      * env var itself (the compiler's addItem uses `insert 'c (size c) v`). */
     if (a[0].k==V_PATH && a[0].u.path.nsegs==1){
         const char *vn=a[0].u.path.segs[0];
-        Value t[3]={env_get(e,vn),a[1],a[2]};
+        Value cur=env_get(e,vn);
+        Value t[3]={cur,a[1],a[2]};
         Value r=b_insert(e,t,3);
         env_set(e,vn,r);
         return r;
@@ -387,12 +454,13 @@ static Value b_insert(Env*e,Value*a,int n){
     if (a[0].k!=V_BLOCK) die("insert: expected block");
     long at = as_int(a[1]);
     Value v=a[0];
-    if (at<0) at=0; if (at>v.u.block.n) at=v.u.block.n;
-    Value **items=(Value**)xmalloc((v.u.block.n+1)*sizeof(Value*));
-    for(int i=0;i<at;i++) items[i]=v.u.block.items[i];
-    items[at]=(Value*)xmalloc(sizeof(Value)); items[at][0]=a[2];
-    for(int i=at;i<v.u.block.n;i++) items[i+1]=v.u.block.items[i];
-    return v_block(items,v.u.block.n+1);
+    Block *b=v.u.block.b;
+    if (at<0) at=0; if (at>b->n) at=b->n;
+    block_grow(b, b->n+1);
+    for(int i=b->n;i>at;i--) b->items[i]=b->items[i-1];
+    b->items[at]=(Value*)xmalloc(sizeof(Value)); b->items[at][0]=a[2];
+    b->n++;
+    return v;
 }
 static Value b_pop(Env*e,Value*a,int n){
     /* pop the last element of a block, returning it and shrinking in place */
@@ -400,16 +468,17 @@ static Value b_pop(Env*e,Value*a,int n){
         Value cont; int idx=path_target(e,a[0],&cont,&idx);
         if (idx<0) die("pop: path not found");
         Value v=cont.u.dict->vals[idx];
-        if (v.u.block.n==0) die("pop: empty block");
-        Value r=*v.u.block.items[v.u.block.n-1];
-        Value **items=(Value**)xmalloc((v.u.block.n-1)*sizeof(Value*));
-        for(int i=0;i<v.u.block.n-1;i++) items[i]=v.u.block.items[i];
-        cont.u.dict->vals[idx]=v_block(items,v.u.block.n-1);
+        Block *b=v.u.block.b;
+        if (b->n==0) die("pop: empty block");
+        Value r=*b->items[b->n-1];
+        b->n--;
         return r;
     }
     Value v=a[0];
-    if (v.u.block.n==0) die("pop: empty block");
-    Value r=*v.u.block.items[v.u.block.n-1];
+    Block *b=v.u.block.b;
+    if (b->n==0) die("pop: empty block");
+    Value r=*b->items[b->n-1];
+    b->n--;
     return r;
 }
 /* `++` concat: strings concatenate; blocks append */
@@ -420,24 +489,24 @@ static Value b_concat(Env*e,Value*a,int n){
 static Value b_range(Env*e,Value*a,int n){
     return v_range(as_int(a[0]), as_int(a[1]));
 }
-static Value b_key(Env*e,Value*a,int n){ return v_bool(dict_find(a[0], a[1].u.s)>=0); }
+static Value b_key(Env*e,Value*a,int n){
+    return v_bool(dict_find(a[0], key_text(a[1]))>=0); }
 static Value b_map(Env*e,Value*a,int n){
     Value coll=a[0], params=a[1], action=a[2];
-    int cnt = coll.k==V_RANGE ? (int)(coll.u.range.hi-coll.u.range.lo+1) : coll.u.block.n;
+    int cnt = coll.k==V_RANGE ? (int)(coll.u.range.hi-coll.u.range.lo+1) : coll.u.block.b->n;
     Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
     for(int i=0;i<cnt;i++){
-        Value el = coll.k==V_RANGE ? v_int(coll.u.range.lo+i) : *coll.u.block.items[i];
+        Value el = coll.k==V_RANGE ? v_int(coll.u.range.lo+i) : *coll.u.block.b->items[i];
         items[i]=(Value*)xmalloc(sizeof(Value)); items[i][0]=applyAction(e,params,action,el);
     }
-    return v_block(items,cnt);
-}
+    return v_block(items,cnt);}
 static Value b_select(Env*e,Value*a,int n){
     Value coll=a[0], params=a[1], pred=a[2];
-    int cnt = coll.k==V_RANGE ? (int)(coll.u.range.hi-coll.u.range.lo+1) : coll.u.block.n;
+    int cnt = coll.k==V_RANGE ? (int)(coll.u.range.hi-coll.u.range.lo+1) : coll.u.block.b->n;
     Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
     int m=0;
     for(int i=0;i<cnt;i++){
-        Value el = coll.k==V_RANGE ? v_int(coll.u.range.lo+i) : *coll.u.block.items[i];
+        Value el = coll.k==V_RANGE ? v_int(coll.u.range.lo+i) : *coll.u.block.b->items[i];
         if (v_truthy(applyAction(e,params,pred,el))){ items[m]=(Value*)xmalloc(sizeof(Value)); items[m][0]=el; m++; }
     }
     return v_block(items,m);
@@ -450,21 +519,34 @@ static Value b_loop(Env*e,Value*a,int n){
         Dict *dd=coll.u.dict;
         for(int i=0;i<dd->n;i++){
             Env *child=env_new(e);
-            if(params.k==V_BLOCK && params.u.block.n==1)
-                env_set(child, (*params.u.block.items[0]).u.s, dd->vals[i]);
-            else if(params.k==V_BLOCK && params.u.block.n>=2){
-                env_set(child, (*params.u.block.items[0]).u.s, v_str(dd->keys[i]));
-                env_set(child, (*params.u.block.items[1]).u.s, dd->vals[i]);
+            if(params.k==V_BLOCK && params.u.block.b->n==1)
+                env_define_local(child, (*params.u.block.b->items[0]).u.s, dd->vals[i]);
+            else if(params.k==V_BLOCK && params.u.block.b->n>=2){
+                env_define_local(child, (*params.u.block.b->items[0]).u.s, v_str(dd->keys[i]));
+                env_define_local(child, (*params.u.block.b->items[1]).u.s, dd->vals[i]);
             }
-            evalSeq(child, body.u.block.items, body.u.block.n);
+            evalSeq(child, body.u.block.b->items, body.u.block.b->n);
             if (rt_brk_set) break;
         }
         rt_brk_set=0;
         return v_null();
     }
-    int cnt = coll.k==V_RANGE ? (int)(coll.u.range.hi-coll.u.range.lo+1) : coll.u.block.n;
+    if (coll.k==V_STR){
+        /* `loop "abc" [ch][...]` iterates the string's characters */
+        const char *s=coll.u.s; int L=(int)strlen(s);
+        for(int i=0;i<L;i++){
+            applyAction(e,params,body,v_char(s[i]));
+            if (rt_brk_set) break;
+        }
+        rt_brk_set=0;
+        return v_null();
+    }
+    if (coll.k!=V_BLOCK && coll.k!=V_RANGE){
+        die("loop: unsupported collection"); return v_null();
+    }
+    int cnt = coll.k==V_RANGE ? (int)(coll.u.range.hi-coll.u.range.lo+1) : coll.u.block.b->n;
     for(int i=0;i<cnt;i++){
-        Value el = coll.k==V_RANGE ? v_int(coll.u.range.lo+i) : *coll.u.block.items[i];
+        Value el = coll.k==V_RANGE ? v_int(coll.u.range.lo+i) : *coll.u.block.b->items[i];
         applyAction(e,params,body,el);
         if (rt_brk_set) break;
     }
@@ -481,7 +563,7 @@ static Value b_isNull(Env*e,Value*a,int n){ return v_bool(a[0].k==V_NULL); }
 static Value b_contains(Env*e,Value*a,int n){
     Value c=a[0];
     if (c.k==V_BLOCK){
-        for (int i=0;i<c.u.block.n;i++) if (value_eq(*c.u.block.items[i], a[1])) return v_bool(1);
+        for (int i=0;i<c.u.block.b->n;i++) if (value_eq(*c.u.block.b->items[i], a[1])) return v_bool(1);
         return v_bool(0);
     }
     if (c.k==V_STR){
@@ -495,13 +577,18 @@ static Value b_ge(Env*e,Value*a,int n){
     if (a[0].k==V_STR) return v_bool(strcmp(a[0].u.s, a[1].u.s)>=0);
     return v_bool(as_float(a[0]) >= as_float(a[1]));
 }
+/* `lessOrEqual? a b` — a <= b (`=<` is the infix spelling) */
+static Value b_le(Env*e,Value*a,int n){
+    if (a[0].k==V_STR) return v_bool(strcmp(a[0].u.s, a[1].u.s)<=0);
+    return v_bool(as_float(a[0]) <= as_float(a[1]));
+}
 /* `join block` — concatenate a block's elements into one string (no separator) */
 static Value b_join(Env*e,Value*a,int n){
     Value v=a[0];
     if (v.k!=V_BLOCK) { char *s=val_str(v); return v_str(s); }
     size_t cap=16,len=0; char *buf=xmalloc(cap); buf[0]=0;
-    for (int i=0;i<v.u.block.n;i++){
-        char *s=val_str(*v.u.block.items[i]);
+    for (int i=0;i<v.u.block.b->n;i++){
+        char *s=val_str(*v.u.block.b->items[i]);
         size_t t=strlen(s); if (len+t+1>cap){ cap=(len+t)*2; buf=xrealloc(buf,cap); }
         memcpy(buf+len,s,t); len+=t; free(s);
     }
@@ -513,7 +600,7 @@ static Value b_try(Env*e,Value*a,int n){
     jmp_buf jb; jmp_buf *prev = g_try_jmp;
     g_try_jmp = &jb;
     if (setjmp(jb)==0){
-        Value r = evalSeq(e, a[0].u.block.items, a[0].u.block.n);
+        Value r = evalSeq(e, a[0].u.block.b->items, a[0].u.block.b->n);
         g_try_jmp = prev;
         return r;
     }
@@ -523,7 +610,14 @@ static Value b_try(Env*e,Value*a,int n){
 
 /* dict helpers */
 static int dict_find(Value d, const char *k){
-    for(int i=0;i<d.u.dict->n;i++) if(!strcmp(d.u.dict->keys[i],k)) return i;
+    /* a non-dict (a word's u.dict aliases its string pointer) must never be
+     * walked as a Dict — that reads garbage and `key?`/`isIR` spuriously
+     * succeed. `key? x 'k` on a non-dict is just false. */
+    if(d.k!=V_DICT || !d.u.dict) return -1;
+    for(int i=0;i<d.u.dict->n;i++){
+        if(!d.u.dict->keys[i]) return -1;
+        if(!strcmp(d.u.dict->keys[i],k)) return i;
+    }
     return -1;
 }
 static Value b_makeDict(Env*e,Value*a,int n){
@@ -534,10 +628,11 @@ static Value b_makeDict(Env*e,Value*a,int n){
         keys[m]=(char*)xmalloc(strlen(a[i].u.s)+1); strcpy(keys[m],a[i].u.s);
         vals[m]=a[i+1]; m++;
     }
-    return v_dict(keys,vals,m);
+    Value dres = v_dict(keys,vals,m);
+    return dres;
 }
 static Value b_set(Env*e,Value*a,int n){
-    Value d=a[0]; const char *k=a[1].u.s; Value val=a[2];
+    Value d=a[0]; const char *k=key_text(a[1]); Value val=a[2];
     if (d.k!=V_DICT) die("set: expected dict");
     Dict *dd=d.u.dict;
     int i=dict_find(d,k);
@@ -548,20 +643,28 @@ static Value b_set(Env*e,Value*a,int n){
     dd->vals[dd->n]=val; dd->n++;
     return d;
 }
+/* the emitter passes a dict KEY as a v_path single-segment value (`get c 'stack`
+ * emits `get c v_path({"stack"})`); a key is a string, a literal, or a path
+ * whose final segment names the field. */
+static const char *key_text(Value v){
+    if (v.k==V_STR || v.k==V_LITERAL || v.k==V_WORD || v.k==V_LABEL) return v.u.s;
+    if ((v.k==V_PATH || v.k==V_PATHLITERAL || v.k==V_PATHLABEL) && v.u.path.nsegs>=1)
+        return v.u.path.segs[v.u.path.nsegs-1];
+    return v.u.s;
+}
 static Value b_get(Env*e,Value*a,int n){
     /* integer index into a block: `c\stack\1` */
     if (a[1].k==V_INT && a[0].k==V_BLOCK){
         int i=(int)a[1].u.i;
-        if (i<0 || i>=a[0].u.block.n) return v_null();
-        return *a[0].u.block.items[i];
+        if (i<0 || i>=a[0].u.block.b->n) return v_null();
+        return *a[0].u.block.b->items[i];
     }
     if (a[1].k==V_INT && a[0].k==V_RANGE){
         long i=a[1].u.i;
         return (i>=a[0].u.range.lo && i<=a[0].u.range.hi) ? v_int(i) : v_null();
     }
-    Value d=a[0]; const char *k=a[1].u.s;
+    Value d=a[0]; const char *k=key_text(a[1]);
     if (d.k!=V_DICT){
-        fprintf(stderr, "get: expected dict, got kind %d, key '%s'\n", d.k, k);
         die("get: expected dict");
     }
     int i=dict_find(d,k);
@@ -569,17 +672,20 @@ static Value b_get(Env*e,Value*a,int n){
 }
 static Value b_empty(Env*e,Value*a,int n){
     Value v=a[0];
-    if (v.k==V_BLOCK) return v_bool(v.u.block.n==0);
+    if (v.k==V_BLOCK) return v_bool(v.u.block.b->n==0);
     if (v.k==V_STR) return v_bool(strlen(v.u.s)==0);
     if (v.k==V_DICT) return v_bool(v.u.dict->n==0);
     return v_bool(0);
 }
 /* call: apply a function value to a block of evaluated args */
 static Value b_call(Env*e,Value*a,int n){
+    if (a[1].k != V_BLOCK) {
+        die("call: args not a block"); return v_null();
+    }
     Value fn=a[0]; Value args=a[1];
-    Value *argv=(Value*)xmalloc((args.u.block.n+1)*sizeof(Value));
-    for(int i=0;i<args.u.block.n;i++) argv[i]=*args.u.block.items[i];
-    return applyFunc(e,fn,argv,args.u.block.n);
+    Value *argv=(Value*)xmalloc((args.u.block.b->n+1)*sizeof(Value));
+    for(int i=0;i<args.u.block.b->n;i++) argv[i]=*args.u.block.b->items[i];
+    return applyFunc(e,fn,argv,args.u.block.b->n);
 }
 
 /* ---- builtins the compiler's own source needs ---------------------------- */
@@ -650,8 +756,8 @@ static char *val_str(Value v){
             /* host `to :string` of a block wraps the elements in brackets */
             size_t cap=32, len=0; char *out=xmalloc(cap); out[0]=0;
             out[len++]='[';
-            for(int i=0;i<v.u.block.n;i++){
-                char *s=val_str(*v.u.block.items[i]); size_t need=len+strlen(s)+2;
+            for(int i=0;i<v.u.block.b->n;i++){
+                char *s=val_str(*v.u.block.b->items[i]); size_t need=len+strlen(s)+2;
                 if(need>cap){ cap=need*2; out=xrealloc(out,cap); }
                 if(i){ out[len++]=' '; } strcpy(out+len,s); len+=strlen(s); free(s);
             }
@@ -691,8 +797,8 @@ static char *val_str(Value v){
         case V_INLINE: {
             /* an inline is a group: render its elements like a block body */
             size_t cap=16, len=0; char *out=xmalloc(cap); out[0]=0;
-            for(int i=0;i<v.u.block.n;i++){
-                char *s=val_str(*v.u.block.items[i]); size_t need=len+strlen(s)+2;
+            for(int i=0;i<v.u.block.b->n;i++){
+                char *s=val_str(*v.u.block.b->items[i]); size_t need=len+strlen(s)+2;
                 if(need>cap){ cap=need*2; out=xrealloc(out,cap); }
                 if(i){ out[len++]=' '; } strcpy(out+len,s); len+=strlen(s); free(s);
             }
@@ -749,7 +855,7 @@ static Value b_to(Env*e,Value*a,int n){
     }
     if(!strcmp(ty,":block")){
         if(v.k==V_BLOCK) return v;
-        if(v.k==V_INLINE) return v_block_cpy(v.u.block.items, v.u.block.n);
+        if(v.k==V_INLINE) return v_block_cpy(v.u.block.b->items, v.u.block.b->n);
         if(v.k==V_STR) return lex_source(v.u.s);
         if(v.k==V_PATH||v.k==V_PATHLABEL||v.k==V_PATHLITERAL){
             /* decompose a path into [base seg1 seg2 ...] with segment VALUES */
@@ -783,6 +889,9 @@ static Value v_block_cpy(Value **items, int n){
 
 /* `replace s from to` — replace all occurrences of `from` with `to`. */
 static Value b_replace(Env*e,Value*a,int n){
+    if (a[0].k!=V_STR || a[1].k!=V_STR || a[2].k!=V_STR){
+        fprintf(stderr,"[REPLACE-BAD] n=%d k0=%d k1=%d k2=%d s0='%s' from='%s' to='%s'\n", n, a[0].k, a[1].k, a[2].k, a[0].k==V_STR?a[0].u.s:"?", a[1].k==V_STR?a[1].u.s:"?", a[2].k==V_STR?a[2].u.s:"?"); fflush(stderr);
+    }
     const char *s=a[0].u.s, *from=a[1].u.s, *to=a[2].u.s;
     if(!*from) return v_str(s);
     int cnt=0; for(const char*p=s;(p=strstr(p,from));p+=strlen(from)) cnt++;
@@ -805,29 +914,14 @@ static Value b_joinWith(Env*e,Value*a,int n){
     if(coll.k==V_STR) return coll;
     if(coll.k!=V_BLOCK) die("joinWith: expected block");
     size_t total=1;
-    for(int i=0;i<coll.u.block.n;i++){ char*s=val_str(*coll.u.block.items[i]); total+=strlen(s); free(s); if(i) total+=strlen(sep); }
+    for(int i=0;i<coll.u.block.b->n;i++){ char*s=val_str(*coll.u.block.b->items[i]); total+=strlen(s); free(s); if(i) total+=strlen(sep); }
     char *out=xmalloc(total+1); size_t len=0; out[0]=0;
-    for(int i=0;i<coll.u.block.n;i++){
-        char*s=val_str(*coll.u.block.items[i]);
+    for(int i=0;i<coll.u.block.b->n;i++){
+        char*s=val_str(*coll.u.block.b->items[i]);
         if(i){ strcpy(out+len,sep); len+=strlen(sep); }
         strcpy(out+len,s); len+=strlen(s); free(s);
     }
     out[len]=0; Value r=v_str(out); free(out); return r;
-}
-
-/* `fold coll init [acc x][ body ]` — left fold. */
-static Value b_fold(Env*e,Value*a,int n){
-    Value coll=a[0], init=a[1], params=a[2], action=a[3];
-    int cnt=coll.k==V_RANGE?(int)(coll.u.range.hi-coll.u.range.lo+1):coll.u.block.n;
-    Value acc=init;
-    for(int i=0;i<cnt;i++){
-        Value el=coll.k==V_RANGE?v_int(coll.u.range.lo+i):*coll.u.block.items[i];
-        Env *child=env_new(e);
-        if(params.k==V_BLOCK && params.u.block.n>=1) env_set(child,(*params.u.block.items[0]).u.s,acc);
-        if(params.k==V_BLOCK && params.u.block.n>=2) env_set(child,(*params.u.block.items[1]).u.s,el);
-        acc=evalSeq(child,action.u.block.items,action.u.block.n);
-    }
-    return acc;
 }
 
 static Value b_lower(Env*e,Value*a,int n){
@@ -848,7 +942,7 @@ static Value b_index(Env*e,Value*a,int n){
         return v_int(p?(long)(p-s):-1);
     }
     if(a[0].k==V_BLOCK){
-        Value **it=a[0].u.block.items; int m=a[0].u.block.n;
+        Value **it=a[0].u.block.b->items; int m=a[0].u.block.b->n;
         for(int i=0;i<m;i++){ /* compare by value-str for simplicity */
             char *sv=val_str(*it[i]), *nv=val_str(a[1]);
             int eq=!strcmp(sv,nv); free(sv); free(nv);
@@ -862,11 +956,11 @@ static Value b_index(Env*e,Value*a,int n){
 static Value b_slice(Env*e,Value*a,int n){
     long from=as_int(a[1]), to=as_int(a[2]);
     if(a[0].k==V_BLOCK){
-        int m=a[0].u.block.n;
+        int m=a[0].u.block.b->n;
         if(from<0) from=0; if(to>=m) to=m-1;
         int cnt=(int)(to-from+1); if(cnt<0) cnt=0;
         Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
-        for(int i=0;i<cnt;i++) items[i]=a[0].u.block.items[from+i];
+        for(int i=0;i<cnt;i++) items[i]=a[0].u.block.b->items[from+i];
         return v_block(items,cnt);
     }
     if(a[0].k==V_STR){
@@ -901,9 +995,9 @@ static Value b_split(Env*e,Value*a,int n){
 static Value b_take(Env*e,Value*a,int n){
     long c=as_int(a[1]);
     if(a[0].k==V_BLOCK){
-        int m=a[0].u.block.n; if(c>m)c=m; if(c<0)c=0;
+        int m=a[0].u.block.b->n; if(c>m)c=m; if(c<0)c=0;
         Value **items=(Value**)xmalloc((c+1)*sizeof(Value*));
-        for(int i=0;i<c;i++) items[i]=a[0].u.block.items[i];
+        for(int i=0;i<c;i++) items[i]=a[0].u.block.b->items[i];
         return v_block(items,c);
     }
     if(a[0].k==V_STR){
@@ -916,9 +1010,9 @@ static Value b_take(Env*e,Value*a,int n){
 static Value b_drop(Env*e,Value*a,int n){
     long c=as_int(a[1]);
     if(a[0].k==V_BLOCK){
-        int m=a[0].u.block.n; if(c>m)c=m; if(c<0)c=0;
+        int m=a[0].u.block.b->n; if(c>m)c=m; if(c<0)c=0;
         int cnt=m-(int)c; Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
-        for(int i=0;i<cnt;i++) items[i]=a[0].u.block.items[c+i];
+        for(int i=0;i<cnt;i++) items[i]=a[0].u.block.b->items[c+i];
         return v_block(items,cnt);
     }
     if(a[0].k==V_STR){
@@ -935,8 +1029,8 @@ static Value b_reverse(Env*e,Value*a,int n){
         Value r=v_str(out); free(out); return r;
     }
     if(a[0].k==V_BLOCK){
-        int m=a[0].u.block.n; Value **items=(Value**)xmalloc((m+1)*sizeof(Value*));
-        for(int i=0;i<m;i++) items[i]=a[0].u.block.items[m-1-i];
+        int m=a[0].u.block.b->n; Value **items=(Value**)xmalloc((m+1)*sizeof(Value*));
+        for(int i=0;i<m;i++) items[i]=a[0].u.block.b->items[m-1-i];
         return v_block(items,m);
     }
     die("reverse"); return v_null();
@@ -960,18 +1054,24 @@ static Value b_array(Env*e,Value*a,int n){
 static Value b_case(Env*e,Value*a,int n){
     Value key=a[0]; Value pairs=a[1];
     if(pairs.k!=V_BLOCK) die("case: expected arms block");
-    Value **it=pairs.u.block.items; int pn=pairs.u.block.n;
+    Value **it=pairs.u.block.b->items; int pn=pairs.u.block.b->n;
+    /* An arm's result runs until the next MATCH token. A match is a string
+     * immediately followed by `->` (`:integer -> ...` in cValue, but cNode's
+     * `case op [ "load" -> ... ]` uses PLAIN words as matches — the old scan
+     * only stopped at ":"-prefixed/else tokens, so a plain-word arm's result
+     * swallowed every later arm and `case` fell off the end returning null,
+     * which made cNode emit "null" for every corpus statement). */
     int i=0;
     while(i<pn){
-        /* match token */
+        if(!(i+1<pn && it[i]->k==V_STR && it[i+1]->k==V_STR && !strcmp(it[i+1]->u.s,"->"))){ i++; continue; }
         Value mv=*it[i];
-        int arrow=i+1;
-        if(arrow>=pn || it[arrow]->k!=V_STR || strcmp(it[arrow]->u.s,"->")) i++;
-        int rs=arrow+1;               /* result start */
-        int re=rs;                    /* result end (exclusive) */
+        int rs=i+2;               /* result start */
+        int re=rs;                /* result end (exclusive) */
         while(re<pn){
             Value t=*it[re];
-            if(t.k==V_STR && (t.u.s[0]==':' || !strcmp(t.u.s,"else"))) break;
+            int armStart = (t.k==V_STR && (t.u.s[0]==':' || !strcmp(t.u.s,"else")))
+                        || (re+1<pn && t.k==V_STR && it[re+1]->k==V_STR && !strcmp(it[re+1]->u.s,"->"));
+            if(armStart) break;
             re++;
         }
         int hit;
@@ -1045,13 +1145,13 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"get",b_get},{"empty?",b_empty},{"call",b_call},{"type",b_type},
     {"concat",b_concat},{"range",b_range},{"key?",b_key},
     {"map",b_map},{"select",b_select},{"loop",b_loop},
-    {"to",b_to},{"replace",b_replace},{"joinWith",b_joinWith},{"fold",b_fold},
+    {"to",b_to},{"replace",b_replace},{"joinWith",b_joinWith},
     {"lower",b_lower},{"upper",b_upper},{"index",b_index},{"slice",b_slice},
     {"split",b_split},{"take",b_take},{"drop",b_drop},{"reverse",b_reverse},
     {"ensure",b_ensure},{"array",b_array},{"case",b_case},
     {"read",b_read},{"write",b_write},{"execute",b_execute},{"args",b_args},
     {"insert",b_insert},{"break",b_break},{"null?",b_isNull},{"contains?",b_contains},
-    {"greaterOrEqual?",b_ge},{"join",b_join},{"try",b_try},
+    {"greaterOrEqual?",b_ge},{"lessOrEqual?",b_le},{"join",b_join},{"try",b_try},
     {NULL,NULL}
 };
 
@@ -1086,7 +1186,19 @@ static const char *binop_name(const char *s) {
     if (!strcmp(s,"^")) return "pow";
     if (!strcmp(s,">")) return "greater?";
     if (!strcmp(s,"<")) return "less?";
+    if (!strcmp(s,"="))  return "equal?";
     if (!strcmp(s,"==")) return "equal?";
+    if (!strcmp(s,"<>")) return "notEqual?";
+    if (!strcmp(s,">=")) return "greaterOrEqual?";
+    if (!strcmp(s,"=<")) return "lessOrEqual?";
+    if (!strcmp(s,"--")) return "remove";
+    if (!strcmp(s,"//")) return "fdiv";
+    if (!strcmp(s,"/%")) return "divmod";
+    if (!strcmp(s,"<=>")) return "between?";
+    if (!strcmp(s,"??")) return "coalesce";
+    if (!strcmp(s,"..")) return "range";
+    if (!strcmp(s,"∧")) return "and?";
+    if (!strcmp(s,">>")) return "write";
     if (!strcmp(s,"++")) return "concat";
     if (!strcmp(s,"&&")) return "and?";
     if (!strcmp(s,"||")) return "or?";
@@ -1106,13 +1218,14 @@ static Value apply_binop(Value a, const char *sym, Value b) {
  * so a conditionally-skipped `if cond -> body` body doesn't trigger builtin
  * side effects (print). Mirrors evalExpr/parsePrimary traversal only. */
 static int  starts_stmt(Value v);
+static int  arg_boundary(Value **it, int n, int ip);
 static void skipExpr(Env *e, Value **it, int n, int *ip);
 static void skipPrimary(Env *e, Value **it, int n, int *ip) {
     Value v = *it[*ip];
     if (v.k == V_BLOCK) { (*ip)++; return; }            /* block value: one token */
     if (v.k == V_STR && rt_builtin_known(v.u.s) && !env_bound(e, v.u.s)) {
         (*ip)++;                                        /* function head */
-        while (*ip<n && !is_binop(*it[*ip]) && !starts_stmt(*it[*ip]))
+        while (*ip<n && !is_binop(*it[*ip]) && !arg_boundary(it,n,*ip))
             skipExpr(e, it, n, ip);
         return;
     }
@@ -1135,19 +1248,92 @@ static Value runBlockValue(Env *e, Value block);
 static int  path_is_dyn(Value v);
 static Value path_read(Env *e, Value p);
 
+/* fixed arities for the heads that appear in stored action blocks. The greedy
+ * boundary scan can't delimit these by itself: `not? key? NOT_MUTATING nm [b]`
+ * must give `not?` one arg (key? eats NOT_MUTATING nm) and leave [b] as the
+ * `if` branch, while `loop spec\muts [m][body]` must feed `loop` its two block
+ * args. -1 means "scan to the boundary" (the old behaviour). */
+static int fn_arity(const char *name){
+    if (!strcmp(name,"loop")||!strcmp(name,"map")||!strcmp(name,"select")) return 3;
+    if (!strcmp(name,"not?")||!strcmp(name,"first")||!strcmp(name,"last")
+        ||!strcmp(name,"size")||!strcmp(name,"type")||!strcmp(name,"pop")) return 1;
+    if (!strcmp(name,"key?")||!strcmp(name,"get")||!strcmp(name,"set")
+        ||!strcmp(name,"equal?")||!strcmp(name,"add")||!strcmp(name,"sub")
+        ||!strcmp(name,"mul")||!strcmp(name,"div")||!strcmp(name,"mod")
+        ||!strcmp(name,"to")||!strcmp(name,"append")) return 2;
+    return -1;
+}
+/* is the idx-th (0-based) arg of this head a BLOCK handed to the function as-is
+ * (loop/map/select params+action), never evaluated here? */
+static int block_arg(const char *name, int idx){
+    if ((!strcmp(name,"loop")||!strcmp(name,"map")||!strcmp(name,"select")) && idx>=1) return 1;
+    return 0;
+}
+
 static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
     Value v = *it[*ip];
     if (v.k == V_BLOCK) { (*ip)++; return runBlockValue(e, v); }  /* inline (sub)expr */
+    if (v.k == V_STR && !strcmp(v.u.s,"@")) {
+        /* `@[a b]` — an EVALUATED block value. In action-body block VALUES the
+         * `@` and its block are raw tokens (`parts: parts ++ @[pa]`); parsePrimary
+         * must combine them into a block whose elements are evaluated, or the `@`
+         * comes back as data and `pa` is lost. */
+        if (*ip+1 < n && it[*ip+1]->k == V_BLOCK) {
+            Value blk = *it[*ip+1];
+            int cnt = blk.u.block.b->n;
+            Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
+            for (int i=0;i<cnt;i++){
+                Value *cp=(Value*)xmalloc(sizeof(Value));
+                Value *single=(Value*)xmalloc(sizeof(Value)); single[0]=*blk.u.block.b->items[i];
+                Block *sb=(Block*)xmalloc(sizeof *sb); sb->items=(Value**)xmalloc(sizeof(Value*)); sb->items[0]=single; sb->n=1; sb->cap=1;
+                Value one=(Value){V_BLOCK, .u.block.b=sb};
+                cp[0]=runBlockValue(e, one);
+                free(sb); free(single);
+                items[i]=cp;
+            }
+            (*ip)+=2;
+            return v_block(items, cnt);
+        }
+    }
     if (v.k == V_STR) {
+        /* the literal words true/false/null (the frontend emits them as plain
+         * strings inside action-body block VALUES) resolve to the literals,
+         * matching runNode0's word/load handling and the host. Without this,
+         * `isFirst: false` bound isFirst to the TRUTHY string "false" and the
+         * joinWith separator branch never ran. */
+        if (!strcmp(v.u.s,"true")) { (*ip)++; return v_bool(1); }
+        if (!strcmp(v.u.s,"false")) { (*ip)++; return v_bool(0); }
+        if (!strcmp(v.u.s,"null")) { (*ip)++; return v_null(); }
         if (rt_builtin_known(v.u.s) && !env_bound(e, v.u.s)) {
-            /* function head: apply to the following expression(s), stopping at a
-             * statement boundary (a define head, `if`, or a dynamic path write)
-             * so a call in statement position doesn't swallow later statements */
+            /* function head: apply to the following expression(s). Arity-aware
+             * when the head has a known fixed arity (loop/map/fold/select take
+             * trailing block args verbatim); otherwise scan to a statement
+             * boundary so a call in statement position doesn't swallow later
+             * statements (a define head, `if`, or a dynamic path write). */
+            /* A string LITERAL that names a builtin (`"call" = op`, `intrinsicNode
+             * "get"`) is data being compared / an ARG, not a call — same lost
+             * word/string distinction as the bound-function branch below. If the
+             * NEXT token is a binop, return the string as an operand; likewise if
+             * there are fewer remaining tokens than the head's fixed arity, there
+             * is no call to make (`"get"` at the end of an inline block). */
+            if (*ip+1 < n && is_binop(*it[*ip+1])) { (*ip)++; return v; }
+            {
+                int A = fn_arity(v.u.s);
+                if (A >= 0 && *ip + A >= n) { (*ip)++; return v; }
+            }
             (*ip)++;
+            int A = fn_arity(v.u.s);
             Value *args = (Value*)xmalloc((n+1)*sizeof(Value));
             int m = 0;
-            while (*ip < n && !is_binop(*it[*ip]) && !starts_stmt(*it[*ip]))
-                args[m++] = evalExpr(e, it, n, ip);
+            if (A >= 0) {
+                for (int k=0; k<A && *ip<n; k++) {
+                    if (block_arg(v.u.s,k)) { args[m++] = *it[*ip]; (*ip)++; }   /* block arg, verbatim */
+                    else args[m++] = evalExpr(e, it, n, ip);
+                }
+            } else {
+                while (*ip < n && !is_binop(*it[*ip]) && !arg_boundary(it,n,*ip))
+                    args[m++] = evalExpr(e, it, n, ip);
+            }
             Value out;
             if (rt_builtin(v.u.s, e, args, m, &out)) { free(args); return out; }
             free(args); die("unknown function in action"); return v_null();
@@ -1156,10 +1342,16 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
         if (env_bound(e, v.u.s)) {
             Value bv = env_get(e, v.u.s);
             if (bv.k==V_FUNC || bv.k==V_BUILTIN) {      /* callable: apply to args */
+                /* A string LITERAL that names a bound function (`"define" = node\nodek`)
+                 * is data being compared, not a call — the bare-word/string distinction
+                 * is lost in the emitted block (both are v_str). A function call's first
+                 * argument can never be a binop, so if the NEXT token is a binop this
+                 * value is a comparison operand: return it, don't apply it. */
+                if (*ip+1 < n && is_binop(*it[*ip+1])) { (*ip)++; return v; }
                 (*ip)++;
                 Value *args=(Value*)xmalloc((n+1)*sizeof(Value));
                 int m=0;
-                while (*ip<n && !is_binop(*it[*ip]) && !starts_stmt(*it[*ip]))
+                while (*ip<n && !is_binop(*it[*ip]) && !arg_boundary(it,n,*ip))
                     args[m++]=evalExpr(e,it,n,ip);
                 Value out=applyFunc(e,bv,args,m);
                 free(args); return out;
@@ -1198,6 +1390,23 @@ static int starts_stmt(Value v){
     }
     return 0;
 }
+/* During argument collection a dynamic path is an ARG (a read: `cBlock n\items`,
+ * `cPathKeyNode @DYN blk j`), NOT a statement boundary — but a path that would
+ * begin a WRITE statement (`acc\[k]: v`, i.e. followed by a non-operator value)
+ * does end the call so the write is its own statement. The old starts_stmt made
+ * every dyn path a boundary, so `cBlock n\items` called cBlock with ZERO args
+ * and the stray `n\items` read became the case result — every `[1 2 3]` block
+ * arg came back raw. */
+static int arg_boundary(Value **it, int n, int ip){
+    Value v=*it[ip];
+    if (v.k==V_STR){
+        if (!strncmp(v.u.s,"@LBL:",5)) return 1;
+        if (!strcmp(v.u.s,"if")) return 1;
+    }
+    if (v.k==V_PATH) return path_is_dyn(v)
+        && (ip+1<n && !is_binop(*it[ip+1]) && !starts_stmt(*it[ip+1]));
+    return 0;
+}
 static const char *seg_key(Env *e, const char *s){
     if (s[0]==':') return s+1;
     Value v = env_get(e, s);
@@ -1208,7 +1417,7 @@ static const char *seg_key(Env *e, const char *s){
 }
 static Value index_at(Value cur, const char *key, Env *e){
     if (cur.k==V_DICT){ int i=dict_find(cur,key); return i>=0?cur.u.dict->vals[i]:v_null(); }
-    if (cur.k==V_BLOCK){ long idx=atol(key); if(idx<0||idx>=cur.u.block.n)return v_null(); return *cur.u.block.items[idx]; }
+    if (cur.k==V_BLOCK){ long idx=atol(key); if(idx<0||idx>=cur.u.block.b->n)return v_null(); return *cur.u.block.b->items[idx]; }
     if (cur.k==V_RANGE){ long idx=atol(key); return (idx>=cur.u.range.lo&&idx<=cur.u.range.hi)?v_int(idx):v_null(); }
     return v_null();
 }
@@ -1229,35 +1438,80 @@ static void path_write(Env *e, Value p, Value val){
         dd->keys[dd->n]=(char*)xmalloc(strlen(last)+1); strcpy(dd->keys[dd->n],last);
         dd->vals[dd->n]=val; dd->n++; return;
     }
-    if (cur.k==V_BLOCK){ long idx=atol(last); if(idx>=0&&idx<cur.u.block.n) *cur.u.block.items[idx]=val; }
+    if (cur.k==V_BLOCK){ long idx=atol(last); if(idx>=0&&idx<cur.u.block.b->n) *cur.u.block.b->items[idx]=val; }
 }
 
+/* evaluate ONE statement. A complex path write `[set, base, keyblock] value`
+ * spans a head block plus a following value token; it must be consumed at
+ * statement level (a bare evalExpr would see the head block as a 2-arg `set`
+ * call and store a null value). Everything else is one expression. */
+static Value evalStmt(Env *e, Value **it, int n, int *ip) {
+    Value h = *it[*ip];
+    if (h.k == V_STR && !strncmp(h.u.s,"@LBL:",5)) { /* `x: val` as an if-body */
+        const char *nm = h.u.s+5; (*ip)++;
+        Value val = evalExpr(e, it, n, ip);
+        env_set(e, nm, val);
+        return val;
+    }
+    if (h.k == V_BLOCK && h.u.block.b->n>=3 && (*h.u.block.b->items[0]).k==V_STR
+        && !strcmp((*h.u.block.b->items[0]).u.s,"set")) {
+        Value **sit=h.u.block.b->items; int sn=h.u.block.b->n;
+        int si=1;
+        Value base = evalExpr(e, sit, sn, &si);   /* the dict (by ref) */
+        Value key  = evalExpr(e, sit, sn, &si);   /* computed key */
+        (*ip)++;
+        Value val = evalExpr(e, it, n, ip);
+        b_set(e, (Value[]){base,key,val}, 3);
+        return val;
+    }
+    if (h.k == V_PATH && path_is_dyn(h)) {          /* `path\[k]: val` as an if-body */
+        /* a dyn path followed by a BINOP is a READ expression (`c\i + 1`),
+         * not an assignment: only write when the next token is a value. */
+        if (*ip+1 < n && !is_binop(*it[*ip+1])) {   /* WRITE: `c\i: value` */
+            int i2 = *ip+1;
+            Value val = evalExpr(e, it, n, &i2);
+            path_write(e, h, val);
+            *ip = i2; return val;
+        }
+        return evalExpr(e, it, n, ip);              /* READ expression or bare path */
+    }
+    return evalExpr(e, it, n, ip);
+}
+/* structural skip of one statement (mirrors evalStmt) */
+static void skipStmt(Env *e, Value **it, int n, int *ip) {
+    Value h = *it[*ip];
+    if (h.k == V_STR && !strncmp(h.u.s,"@LBL:",5)) { /* `x: val` as an if-body */
+        (*ip)++;                                    /* skip the define head */
+        skipExpr(e, it, n, ip);                     /* skip the value */
+        return;
+    }
+    if (h.k == V_BLOCK && h.u.block.b->n>=3 && (*h.u.block.b->items[0]).k==V_STR
+        && !strcmp((*h.u.block.b->items[0]).u.s,"set")) {
+        (*ip)++;                                    /* skip the head block */
+        skipExpr(e, it, n, ip);                     /* skip the value */
+        return;
+    }
+    if (h.k == V_PATH && path_is_dyn(h) && *ip+1 < n) {
+        (*ip)++;                                    /* skip path */
+        skipExpr(e, it, n, ip);                     /* skip value */
+        return;
+    }
+    skipExpr(e, it, n, ip);
+}
 static Value evalSeq(Env *e, Value **it, int n) {
     Value r = v_null();
     int i = 0;
     while (i < n) {
         Value h = *it[i];
-        if (h.k == V_BLOCK && h.u.block.n>=3 && (*h.u.block.items[0]).k==V_STR
-            && !strcmp((*h.u.block.items[0]).u.s,"set")) {
-            /* complex path write `[set, base, keyblock] value` */
-            Value **sit=h.u.block.items; int sn=h.u.block.n;
-            int si=1;
-            Value base = evalExpr(e, sit, sn, &si);   /* the dict (by ref) */
-            Value key  = evalExpr(e, sit, sn, &si);   /* computed key */
-            i++;                                       /* past the head block */
-            Value val = evalExpr(e, it, n, &i);
-            b_set(e, (Value[]){base,key,val}, 3);
-            continue;
-        }
         if (h.k == V_PATH && path_is_dyn(h)) {          /* `path\[k]: val` */
-            if (i+1 < n) {                              /* path followed by value: WRITE */
+            if (i+1 < n && !is_binop(*it[i+1])) {       /* path followed by value: WRITE */
                 int i2 = i+1;
                 Value val = evalExpr(e, it, n, &i2);
                 path_write(e, h, val);
                 i = i2; continue;
             }
-            r = path_read(e, h);                        /* bare path: READ expr */
-            i++; continue;
+            r = evalExpr(e, it, n, &i);                 /* READ expr (`c\i + 1`) or bare path */
+            continue;
         }
         if (h.k == V_STR && !strncmp(h.u.s,"@LBL:",5)) { /* define `x: val` */
             const char *nm = h.u.s+5; i++;
@@ -1270,8 +1524,8 @@ static Value evalSeq(Env *e, Value **it, int n) {
             Value cond = evalExpr(e, it, n, &ci);
             if (ci<n && it[ci]->k==V_STR && !strcmp(it[ci]->u.s,"->")) {
                 ci++;
-                if (v_truthy(cond)) { r = evalExpr(e, it, n, &ci); }   /* run */
-                else               { skipExpr(e, it, n, &ci); }        /* skip w/o side effects */
+                if (v_truthy(cond)) { r = evalStmt(e, it, n, &ci); }   /* run */
+                else               { skipStmt(e, it, n, &ci); }        /* skip w/o side effects */
                 i = ci; continue;
             }
             if (ci<n && it[ci]->k==V_BLOCK) {
@@ -1281,24 +1535,30 @@ static Value evalSeq(Env *e, Value **it, int n) {
             }
             r = cond; i = ci; continue;
         }
-        r = evalExpr(e, it, n, &i);
+        r = evalStmt(e, it, n, &i);
     }
     return r;
 }
 static Value runBlockValue(Env *e, Value block) {
-    return evalSeq(e, block.u.block.items, block.u.block.n);
+    return evalSeq(e, block.u.block.b->items, block.u.block.b->n);
 }
 
 /* bind a single parameter to an element and run an action block in a child env */
 static Value applyAction(Env *parent, Value params, Value action, Value el) {
     Env *child = env_new(parent);
-    /* params is a block of word-names, or a single quoted word (passthrough) */
-    if (params.k == V_STR) env_set(child, params.u.s, el);
-    else if (params.k == V_BLOCK && params.u.block.n > 0) {
-        Value p = *params.u.block.items[0];
-        if (p.k == V_STR) env_set(child, p.u.s, el);
+    /* params is a block of word-names, a single quoted word `'x` (a pathliteral
+     * reference whose name is its only segment), or a bare passthrough word */
+    if (params.k == V_STR) env_define_local(child, params.u.s, el);
+    else if ((params.k==V_PATHLITERAL || params.k==V_PATH)
+             && params.u.path.nsegs==1) env_define_local(child, params.u.path.segs[0], el);
+    else if (params.k == V_BLOCK && params.u.block.b->n > 0) {
+        Value p = *params.u.block.b->items[0];
+        if (p.k == V_STR) env_define_local(child, p.u.s, el);
+        else if ((p.k==V_PATHLITERAL || p.k==V_PATH) && p.u.path.nsegs==1)
+            env_define_local(child, p.u.path.segs[0], el);
     }
-    return evalSeq(child, action.u.block.items, action.u.block.n);
+    Value r = evalSeq(child, action.u.block.b->items, action.u.block.b->n);
+    return r;
 }
 
 Value runSeq(Env *e, IR **seq, int n) {
@@ -1313,20 +1573,61 @@ Value runSeq(Env *e, IR **seq, int n) {
 /* a call whose callee is intrinsic: dispatch to a builtin */
 static Value callIntrinsic(Env *e, IR *node) {
     const char *name = node->fn->name;
+    /* The frontend emits `ir_intrinsic` ONLY for a real builtin CALL HEAD
+     * (user functions go through `ir_load`); the host's rule is that builtins
+     * WIN over same-named user functions (`add: function [...]` then `add 3 4`
+     * still calls the builtin — corpus/17_shadowing). The old bound-first check
+     * made the compiler's OWN `fold` (a 1-arg user function in ir.art that the
+     * intrinsic table wrongly lists as a builtin) dispatch to itself; that name
+     * is now absent from the intrinsic table so the emitted code loads it, and
+     * an intrinsic here is always the primitive. */
     Value *argv = (Value*)xmalloc((node->nargs+1)*sizeof(Value));
     for (int i=0;i<node->nargs;i++) argv[i] = runNode0(e, node->args[i]);
     Value out;
-    if (rt_builtin(name, e, argv, node->nargs, &out)) return out;
+    if (rt_builtin(name, e, argv, node->nargs, &out)) { free(argv); return out; }
+    free(argv);
     fprintf(stderr,"[unknown intrinsic: %s]\n", name);
     die("unknown intrinsic"); return v_null();
+}
+
+/* a `do` block body (`(__seq` in the emitted IR) is a statement sequence the
+ * host runs as an EXPRESSION: `do ( = A B )` emits do(seq[=, A, B]) and the host
+ * evaluates the leading infix symbol as a PREFIX call (`= A B` == `equal? A B`).
+ * The kernel's runSeq treats each node as a bare statement and would return the
+ * LAST operand (B) instead — so `or? (= :path t) (= :pathlabel t)` was always
+ * truthy and cNode sent every dict through the path emitter. Dispatch a leading
+ * passthrough whose text is an infix symbol to the mapped builtin over the
+ * following statements (arity-limited, like the block-as-code evaluator). */
+static Value runDoSeq(Env *e, IR **seq, int n){
+    if (n >= 3 && seq[0] && seq[0]->op && !strcmp(seq[0]->op,"passthrough")) {
+        const char *nm = binop_name(seq[0]->v.u.s);
+        if (nm) {
+            int A = fn_arity(nm);
+            int avail = n - 1;
+            if (A >= 0 && A < avail) avail = A;
+            Value *argv = (Value*)xmalloc((avail+1)*sizeof(Value));
+            for (int k=0;k<avail;k++) argv[k] = runNode0(e, seq[1+k]);
+            Value out;
+            if (rt_builtin(nm, e, argv, avail, &out)) { free(argv); return out; }
+            free(argv);
+        }
+    }
+    Value r = v_null();
+    for (int i=0;i<n;i++) r = runNode0(e, seq[i]);
+    return r;
 }
 
 static Value runNode0(Env *e, IR *node) {
     if (!node) return v_null();
     if (!node->op) return node->v;   /* a raw constant */
 
-    if (!strcmp(node->op,"const")) return node->v;
-    if (!strcmp(node->op,"load")) {
+    if (!strcmp(node->op,"const")) return node->v;    if (!strcmp(node->op,"load")) {
+        /* the emitted IR loads the literal words `true`/`false`/`null` as
+         * `ir_load("true")` (e.g. a dict field `infix?: true`). The host treats
+         * those as literals; bind them here so they don't come back null. */
+        if (!strcmp(node->name,"true"))  return v_bool(1);
+        if (!strcmp(node->name,"false")) return v_bool(0);
+        if (!strcmp(node->name,"null"))  return v_null();
         Value v = env_get(e, node->name);
         if (v.k==V_NULL && rt_builtin_known(node->name)) {
             Value b; memset(&b,0,sizeof b); b.k=V_BUILTIN; b.u.s=(char*)node->name; return b;
@@ -1337,6 +1638,9 @@ static Value runNode0(Env *e, IR *node) {
     if (!strcmp(node->op,"word")) {
         /* bare word in value position: load the binding if one exists, else call
          * a zero-arity builtin, else a builtin function value, else null. */
+        if (!strcmp(node->name,"true"))  return v_bool(1);
+        if (!strcmp(node->name,"false")) return v_bool(0);
+        if (!strcmp(node->name,"null"))  return v_null();
         Value v = env_get(e, node->name);
         if (v.k != V_NULL) return v;
         if (rt_builtin_known(node->name)) {
@@ -1353,7 +1657,7 @@ static Value runNode0(Env *e, IR *node) {
 
     if (!strcmp(node->op,"define")) {
         Value v = runNode0(e, node->args[0]);
-        env_set(e, node->name, v);
+        env_define_local(e, node->name, v);
         return v;
     }
     if (!strcmp(node->op,"block")) {
@@ -1372,22 +1676,34 @@ static Value runNode0(Env *e, IR *node) {
     }
     if (!strcmp(node->op,"if")) {
         Value cond = runNode0(e, node->args[0]);
-        if (v_truthy(cond)) return node->nargs>1 ? runNode0(e, node->args[1]) : v_null();
+        if (v_truthy(cond)) {
+            Value rv = node->nargs>1 ? runNode0(e, node->args[1]) : v_null();
+            return rv;
+        }
         if (node->nargs>2 && node->args[2]) return runNode0(e, node->args[2]);
         return v_null();
     }
     if (!strcmp(node->op,"do")) {
         IR *body = node->args[0];
         /* a __seq body is already the block's statements; running it yields
-         * the last value (a block result there is data, e.g. `do [[1 2][3 4]]`) */
-        if (body && body->op && !strcmp(body->op,"__seq")) return runNode0(e, body);
+         * the last value (a block result there is data, e.g. `do [[1 2][3 4]]`).
+         * Use the expression runner so a leading infix symbol is a prefix call. */
+        if (body && body->op && !strcmp(body->op,"__seq")) return runDoSeq(e, body->args, body->nargs);
         /* a stored block value (e.g. `do b` where b = [10 * 3]) runs as code */
         Value v = runNode0(e, body);
         if (v.k == V_BLOCK) return runBlockValue(e, v);
         return v;
     }
     if (!strcmp(node->op,"return")) {
-        rt_ret_set=1; rt_ret_val = runNode0(e, node->args[0]); return rt_ret_val;
+        /* Evaluate the argument FIRST: `return <call f>` must run f (whose
+         * applyFunc resets rt_ret_set at entry) without clobbering the return
+         * flag this op is about to raise. Setting the flag before evaluating
+         * the argument loses the return whenever the argument is a function
+         * call — f's applyFunc clears it back to 0 and the return vanishes,
+         * so the caller's `if not? isIR node -> return ...` falls through. */
+        rt_ret_val = runNode0(e, node->args[0]);
+        rt_ret_set = 1;
+        return rt_ret_val;
     }
     if (!strcmp(node->op,"while")) {
         rt_brk_set=0;
@@ -1410,8 +1726,10 @@ static Value runNode0(Env *e, IR *node) {
         return v_null();
     }
     if (!strcmp(node->op,"call")) {
-        if (node->fn && node->fn->op && !strcmp(node->fn->op,"intrinsic"))
-            return callIntrinsic(e, node);
+        if (node->fn && node->fn->op && !strcmp(node->fn->op,"intrinsic")){
+            Value r = callIntrinsic(e, node);
+            return r;
+        }
         /* user callee: evaluate to a function value and apply */
         Value fn = runNode0(e, node->fn);
         Value *argv=(Value*)xmalloc((node->nargs+1)*sizeof(Value));

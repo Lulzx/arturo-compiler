@@ -1,0 +1,6 @@
+; emit an already-built self-contained source (tmp/nc_self.art) to C and link nc_plain.
+import ./"../src/cbackend.art"
+doit: function [src outName][ compileToNativeC src outName ]
+src: read "tmp/nc_self.art"
+doit src "tmp/nc_plain"
+print "emitted"

@@ -1,0 +1,22 @@
+; build the self-contained compiler, emit it to C via the C backend, link nc_plain.
+import ./"../src/cbackend.art"
+
+buildSelfCompiler: function [][
+    out: @[]
+    files: ["intrinsics.art" "semantics.art" "front.art" "kernel.art" "ir.art" "backend.art"]
+    loop files [f][
+        src: read ("src/" ++ f)
+        loop files [g][ src: replace src ("import ./\"" ++ g ++ "\"\n") "" ]
+        addItem out src
+    ]
+    joinWith out "\n"
+]
+CMAIN: "\nif 1 < size args\\values [\n    inPath: args\\values\\0\n    outPath: args\\values\\1\n    b: read inPath\n    print \"in: \" ++ inPath ++ \" readBytes: \" ++ (to :string (size b))\n    src: to :string b\n    print \"srcChars: \" ++ (to :string (size src))\n    art: renderProgram src\n    print \"artChars: \" ++ (to :string (size art))\n    write art outPath\n    print outPath\n]\n"
+
+doit: function [src outName][ compileToNativeC src outName ]
+src: buildSelfCompiler ++ CMAIN
+write src "tmp/nc_self.art"
+print "source bytes: " ++ (to :string (size src))
+print "leftover imports: " ++ (to :string (size (match src "import ./\"")))
+doit src "tmp/nc_plain"
+print "built"
