@@ -840,6 +840,25 @@ defRule "makeDict" #[
     ]
 ]
 
+; Function values created by the kernel are closures, which deliberately
+; cannot be donated to the host. Own this predicate so introspection works
+; for both kernel closures and ordinary host functions.
+defRule "function?" #[
+    eval: function [env argv][
+        v: evalNode env argv\0 :interpret
+        if and? (isNode v) ["closure" = v\nodek] -> return true
+        false
+    ]
+    emit: function [env argv][
+        #[op: "call" fn: #[op: "intrinsic" name: "function?"] args: emitSeq env argv]
+    ]
+    run: function [env argv][
+        v: runNode env argv\0
+        if and? (isNode v) ["closure" = v\nodek] -> return true
+        false
+    ]
+]
+
 ; `call` is the builtin that takes a function VALUE and a
 ; block of arguments and applies them. It cannot stay
 ; delegated: the function value is usually a kernel

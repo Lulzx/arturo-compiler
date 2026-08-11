@@ -338,6 +338,28 @@ static Value b_or(Env*e,Value*a,int n){
     return v_bool(v_truthy(s));
 }
 static Value b_not(Env*e,Value*a,int n){ return v_bool(!v_truthy(a[0])); }
+static Value b_abs(Env*e,Value*a,int n){
+    if (a[0].k==V_INT) return v_int(a[0].u.i < 0 ? -a[0].u.i : a[0].u.i);
+    double x=as_float(a[0]); return v_float(fabs(x));
+}
+static Value b_ceil(Env*e,Value*a,int n){ return v_int((long)ceil(as_float(a[0]))); }
+static Value b_floor(Env*e,Value*a,int n){ return v_int((long)floor(as_float(a[0]))); }
+static Value b_even(Env*e,Value*a,int n){ return v_bool(as_int(a[0]) % 2 == 0); }
+static Value b_odd(Env*e,Value*a,int n){ return v_bool(as_int(a[0]) % 2 != 0); }
+static Value b_positive(Env*e,Value*a,int n){ return v_bool(as_float(a[0]) > 0); }
+static Value b_negative(Env*e,Value*a,int n){ return v_bool(as_float(a[0]) < 0); }
+static Value b_zero(Env*e,Value*a,int n){ return v_bool(as_float(a[0]) == 0); }
+
+static Value b_type_is(Env*e,Value*a,int n,VKind k){ return v_bool(a[0].k==k); }
+static Value b_blockp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_BLOCK); }
+static Value b_dictp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_DICT); }
+static Value b_intp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_INT); }
+static Value b_floatp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_FLOAT); }
+static Value b_stringp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_STR); }
+static Value b_logicalp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_BOOL); }
+static Value b_charp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_CHAR); }
+static Value b_functionp(Env*e,Value*a,int n){ return v_bool(a[0].k==V_FUNC || a[0].k==V_BUILTIN); }
+static Value b_rangep(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_RANGE); }
 static Value b_size(Env*e,Value*a,int n){
     Value v=a[0];
     if (v.k==V_BLOCK) return num2(v.u.block.b->n);
@@ -422,7 +444,7 @@ static Value b_append(Env*e,Value*a,int n){
         /* string append: concatenate the second arg (as text) onto the string */
         const char *s = v.u.s;
         char buf[64];
-        const char *app;
+        const char *app = NULL;
         Value x = a[1];
         if (x.k==V_STR) app=x.u.s;
         else if (x.k==V_INT){ sprintf(buf,"%ld",x.u.i); app=buf; }
@@ -689,6 +711,40 @@ static Value b_empty(Env*e,Value*a,int n){
     if (v.k==V_STR) return v_bool(strlen(v.u.s)==0);
     if (v.k==V_DICT) return v_bool(v.u.dict->n==0);
     return v_bool(0);
+}
+static Value numeric_fold(Value v, int which){
+    if(v.k!=V_BLOCK || v.u.block.b->n==0) return v_null();
+    Value r=*v.u.block.b->items[0];
+    for(int i=1;i<v.u.block.b->n;i++){
+        Value x=*v.u.block.b->items[i];
+        if(which==0 && as_float(x)<as_float(r)) r=x;
+        if(which==1 && as_float(x)>as_float(r)) r=x;
+        if(which==2) r=(r.k==V_FLOAT||x.k==V_FLOAT) ? v_float(as_float(r)+as_float(x)) : v_int(r.u.i+x.u.i);
+        if(which==3) r=(r.k==V_FLOAT||x.k==V_FLOAT) ? v_float(as_float(r)*as_float(x)) : v_int(r.u.i*x.u.i);
+    }
+    return r;
+}
+static Value b_min(Env*e,Value*a,int n){ return numeric_fold(a[0],0); }
+static Value b_max(Env*e,Value*a,int n){ return numeric_fold(a[0],1); }
+static Value b_sum(Env*e,Value*a,int n){
+    if(a[0].k==V_BLOCK && a[0].u.block.b->n==0) return v_int(0);
+    return numeric_fold(a[0],2);
+}
+static Value b_product(Env*e,Value*a,int n){
+    if(a[0].k==V_BLOCK && a[0].u.block.b->n==0) return v_int(1);
+    return numeric_fold(a[0],3);
+}
+static Value b_keys(Env*e,Value*a,int n){
+    if(a[0].k!=V_DICT) die("keys: expected dictionary");
+    int m=a[0].u.dict->n; Value **items=xmalloc((m+1)*sizeof(Value*));
+    for(int i=0;i<m;i++){ items[i]=xmalloc(sizeof(Value)); items[i][0]=v_str(a[0].u.dict->keys[i]); }
+    return v_block(items,m);
+}
+static Value b_values(Env*e,Value*a,int n){
+    if(a[0].k!=V_DICT) die("values: expected dictionary");
+    int m=a[0].u.dict->n; Value **items=xmalloc((m+1)*sizeof(Value*));
+    for(int i=0;i<m;i++){ items[i]=xmalloc(sizeof(Value)); items[i][0]=a[0].u.dict->vals[i]; }
+    return v_block(items,m);
 }
 /* call: apply a function value to a block of evaluated args */
 static Value b_call(Env*e,Value*a,int n){
@@ -1165,6 +1221,12 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"read",b_read},{"write",b_write},{"execute",b_execute},{"args",b_args},
     {"insert",b_insert},{"break",b_break},{"do",b_do},{"null?",b_isNull},{"contains?",b_contains},
     {"greaterOrEqual?",b_ge},{"lessOrEqual?",b_le},{"join",b_join},{"try",b_try},
+    {"abs",b_abs},{"ceil",b_ceil},{"floor",b_floor},{"even?",b_even},{"odd?",b_odd},
+    {"positive?",b_positive},{"negative?",b_negative},{"zero?",b_zero},
+    {"min",b_min},{"max",b_max},{"sum",b_sum},{"product",b_product},
+    {"keys",b_keys},{"values",b_values},{"block?",b_blockp},{"dictionary?",b_dictp},
+    {"integer?",b_intp},{"floating?",b_floatp},{"string?",b_stringp},{"logical?",b_logicalp},
+    {"char?",b_charp},{"function?",b_functionp},{"range?",b_rangep},
     {NULL,NULL}
 };
 
@@ -1827,8 +1889,6 @@ typedef struct { char *b; int len, cap; } SB;
 
 static int lx_peek(LX*x,int off){ int p=x->pos+off; return p<x->len ? (unsigned char)x->s[p] : 0; }
 static int lx_at(LX*x){ return lx_peek(x,0); }
-static void lx_adv(LX*x){ if(x->pos<x->len) x->pos++; }
-static int lx_eof(LX*x){ return x->pos>=x->len; }
 static int is_id_start(int c){ return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_'; }
 static int is_id_in(int c){ return is_id_start(c)||(c>='0'&&c<='9'); }
 static int is_digit(int c){ return c>='0'&&c<='9'; }
@@ -1837,7 +1897,6 @@ static int in_syms(int c){ return c=='~'||c=='!'||c=='@'||c=='#'||c=='$'||c=='%'
 static void sb_init(SB*s){ s->cap=32; s->len=0; s->b=xmalloc(32); s->b[0]=0; }
 static void sb_add(SB*s,int c){ if(s->len+2>s->cap){s->cap*=2;s->b=xrealloc(s->b,s->cap);} s->b[s->len++]=(char)c; s->b[s->len]=0; }
 static void sb_adds(SB*s,const char*st){ for(;*st;st++) sb_add(s,*st); }
-static char *sb_take(SB*s){ char *r=s->b; s->b=NULL; return r; }
 
 typedef struct { Value **items; int n, cap; } BLD;
 static void bld_init(BLD*b){ b->cap=8; b->n=0; b->items=xmalloc(b->cap*sizeof(Value*)); }
@@ -2015,13 +2074,13 @@ static int lx_known_type(const char *s){
  * `:` makes the whole thing a label. */
 static Value parse_curly(LX*x){
     x->pos++; /* consume '{' */
-    int verbatim=0, regex=0;
+    int regex=0;
     char flags[8]={0}; int nflags=0;
     if(lx_at(x)=='!'){
         x->pos++;
         while(lx_at(x) && is_id_in((unsigned char)lx_at(x))) x->pos++;
     }
-    if(lx_at(x)==':'){ x->pos++; verbatim=1; }
+    if(lx_at(x)==':'){ x->pos++; }
     else if(lx_at(x)=='/'){ x->pos++; regex=1; }
     SB sb; sb_init(&sb);
     int depth=1;
@@ -2121,7 +2180,7 @@ static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline){
             SB sb; sb_init(&sb); int hasDot; parse_number(x,&sb,&hasDot);
             /* exponent */
             if((lx_at(x)=='e'||lx_at(x)=='E') && (is_digit((unsigned char)lx_peek(x,1))||lx_peek(x,1)=='+'||lx_peek(x,1)=='-')){
-                int pp=x->pos; sb_add(&sb,x->s[x->pos]); x->pos++;
+                sb_add(&sb,x->s[x->pos]); x->pos++;
                 if(lx_at(x)=='+'||lx_at(x)=='-'){ sb_add(&sb,lx_at(x)); x->pos++; }
                 while(x->pos<x->len && is_digit((unsigned char)x->s[x->pos])){ sb_add(&sb,x->s[x->pos]); x->pos++; }
                 bld_add(&b, v_float(atof(sb.b)));
