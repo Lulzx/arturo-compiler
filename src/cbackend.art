@@ -9,6 +9,14 @@
 
 import ./"ir.art"
 
+; Native compilation is part of the compiler's normal edit/bootstrap loop.
+; Size optimization plus LTO made the 670KB generated self-compiler take over
+; six minutes to link, while `-O1` produces equivalent output in seconds and
+; has comparable corpus compile throughput. Release packaging can optimize the
+; resulting artifact separately when size is more important than turnaround.
+NATIVE_CFLAGS: "-O1 -fvisibility=hidden"
+NATIVE_LDFLAGS: "-O1 -Wl,-dead_strip -Wl,-x"
+
 ; escape a string for a C double-quoted literal: backslash first,
 ; then the double-quote. `replace` scans left to right, so escaping
 ; the backslash first keeps the freshly-added \" pairs from doubling.
@@ -1746,7 +1754,7 @@ compileToNativeC: function [src outName][
     c: compileToC src
     cPath: outName ++ ".c"
     write c cPath
-    execute ("cc -Oz -flto -fvisibility=hidden -c -Iruntime " ++ cPath ++ " -o " ++ outName ++ ".o 2>&1")
-    execute ("cc -Oz -flto -Wl,-dead_strip -Wl,-x " ++ outName ++ ".o runtime/runtime.a -lm -o " ++ outName ++ " 2>&1")
+    execute ("cc " ++ NATIVE_CFLAGS ++ " -c -Iruntime " ++ cPath ++ " -o " ++ outName ++ ".o 2>&1")
+    execute ("cc " ++ NATIVE_LDFLAGS ++ " " ++ outName ++ ".o runtime/runtime.a -lm -o " ++ outName ++ " 2>&1")
     outName
 ]

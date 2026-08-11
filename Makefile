@@ -4,7 +4,10 @@
 ARTURO  ?= arturo
 CC      ?= cc
 AR      ?= ar
-CFLAGS  ?= -Oz -flto -fvisibility=hidden
+# Optimize for compiler turnaround. `-Oz -flto` spent over six minutes in the
+# bootstrap link on macOS, while `-O1` builds the same compiler in seconds and
+# keeps its corpus compile throughput effectively unchanged.
+CFLAGS  ?= -O1 -fvisibility=hidden
 NCCOMP   = tmp/ncomp
 RUNTIME_O = runtime/runtime.o
 RUNTIME_A = runtime/runtime.a
@@ -19,7 +22,7 @@ ncomp: $(NCCOMP)
 $(NCCOMP): tools/cbnative.art $(SOURCES) $(RUNTIME_A)
 	$(ARTURO) tools/cbnative.art
 
-$(RUNTIME_O): runtime/runtime.c runtime/runtime.h
+$(RUNTIME_O): runtime/runtime.c runtime/runtime.h Makefile
 	$(CC) $(CFLAGS) -c -Iruntime runtime/runtime.c -o $(RUNTIME_O)
 
 $(RUNTIME_A): $(RUNTIME_O)
