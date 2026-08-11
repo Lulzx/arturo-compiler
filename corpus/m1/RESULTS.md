@@ -1,4 +1,4 @@
-# M1 — The application model (pinned)
+# M1: The application model (pinned)
 
 Pinned empirically (this corpus, run under `arturo 0.10.0`, one probe per
 process) and by reading the authoritative front-end `src/vm/ast.nim`
@@ -20,7 +20,7 @@ A block is compiled left→right into a tree:
 3. **Infix symbols bind an operand.** When the element after a value is an
    infix *symbol*, the value becomes its first operand and the build descends.
    Since completion pops at exactly `arity`, **infix chains are
-   right-associative and the rightmost infix operator binds tightest** — there
+   right-associative and the rightmost infix operator binds tightest**: there
    is a single `InfixPrecedence`; there is no numeric precedence table.
 
    Verified on the host:
@@ -64,7 +64,7 @@ A block is compiled left→right into a tree:
 | `map` `select` `loop` | 3 | (collection, params, action); params ∈ {Literal, Block, Null}. |
 | `and?` `or?` | 2 | prefix words, **eager**. Lazy infix forms are `∧` `∨`. |
 | `and` `or` | 2 | bitwise, integer operands. |
-| `print` | 1 | returns Nothing — cannot chain (`print print 5` errors). |
+| `print` | 1 | returns Nothing; cannot chain (`print print 5` errors). |
 | `size` | 1 | — |
 | `+ - * / % ^ //`, comparisons, `++` | 2 | infix symbols. |
 
@@ -74,7 +74,7 @@ Canonical higher-order forms (all verified):
 - `map [1 2 3] => [& * 2]` → 2 4 6
 - `select [1 2 3 4] [x][x > 2]` → 3 4
 - `loop 1..3 [x][print x]` → 1 2 3
-- **`map [1 2 3] function [x][x*2]` is an error** — that's 2 args, map needs 3.
+- **`map [1 2 3] function [x][x*2]` is an error**: that's 2 args, map needs 3.
 
 `=>` expansion: `=> [& * 2]` becomes the two elements `_0` and `[_0 * 2]`
 (replacing `&` with `_0`, `_1`, …). It feeds the (collection, params, action)
@@ -93,7 +93,7 @@ nothing usable; values that are never claimed are dropped at block end.
 ## 0.10.0 bugs to design around
 
 1. **Value-stack contamination.** An unused value left inside a callee is
-   later popped as an argument by the enclosing call — corrupted results in
+   later popped as an argument by the enclosing call. Corrupted results in
    probes whose function bodies leave trailing values (e.g. `function [x][
    print "p:" x  x]` returns garbage; the trailing `x` leaks). Workaround:
    `return`, or no trailing values. This contaminated several multi-statement
@@ -104,14 +104,14 @@ nothing usable; values that are never claimed are dropped at block end.
    `print x`).
 3. **`to :dictionary` hands out copies.** `get d k` on a dictionary built
    by `to :dictionary <block>` returns a *copy* of the value; on a `#[...]`
-   literal it returns the reference. So `d\a\b: v` — which lowers to
-   `set (get d 'a) 'b v` — writes into a copy and the update is lost. The
+   literal it returns the reference. So `d\a\b: v`, which lowers to
+   `set (get d 'a) 'b v`, writes into a copy and the update is lost. The
    kernel builds dictionaries as `#[]` seeded with `set` instead.
 4. **`-c` drops mutation through a path reference.** `append 'c\stack 4`
    and `pop 'c\stack` work when the source is interpreted but write
    nothing once compiled to bytecode; `append 'b 4` through a plain
    literal reference is fine either way. Binding the path to a local
-   first is enough — the local aliases the same container — so the
+   first is enough, because the local aliases the same container, so the
    printer emits `do [_ref1: c\stack append '_ref1 4]`.
 5. **Binding an in-place `append`'s result kills the process.**
    `v: append 'b 4` exits silently, source or bytecode, even wrapped in
@@ -134,7 +134,7 @@ nothing usable; values that are never claimed are dropped at block end.
 9. **The host `call` builtin applied to a kernel closure corrupts the
    value stack when the closure's body recurses.** `call r\run @[env args]`
    works when the run column is shallow (the `makeDict` and `call` rows),
-   but when the construct's body runs — `runSeq` → `runCall` → `applyVal` —
+   but when the construct's body runs, via `runSeq` → `runCall` → `applyVal`,
    `applyVal`'s `argVals` binding is lost and the host raises a name error.
    Constant folding also poisoned the stack: a fold's `runIR` left it dirty
    and the *next* nested call under a construct dropped its arguments. The
@@ -161,4 +161,4 @@ nothing usable; values that are never claimed are dropped at block end.
   builtin word to a plain value would capture the compiler's own calls.
   The binding is renamed instead (`_shadow_mul`), which leaves the word
   meaning the builtin exactly as it did in the source. A `function`
-  binding is left alone — it does not shadow on the host either.
+  binding is left alone, because it does not shadow on the host either.

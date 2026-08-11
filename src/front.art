@@ -420,18 +420,15 @@ lowerWalk: function [blok start stopAtRoot][
             if not? done [
                 if "define" = top\nodek [
                     expr: top\args\0
-                    print "RW-DEF name: [" ++ top\name ++ "] isCall: [" ++ (to :string (isCallNode expr)) ++ "]"
                     if isCallNode expr [
                         if "function" = calleeName expr\fn [
                             params: expr\args\0
-                            print "RW-DEF params: [" ++ (to :string params) ++ "] ptype: [" ++ (to :string (type params)) ++ "]"
                             if :block = type params [
                                 cnt: 0
                                 loop params [p][
                                     if :type <> type p -> cnt: cnt + 1
                                 ]
                                 ARITY\[top\name]: cnt
-                                print "RW-DEF set arity: [" ++ (to :string cnt) ++ "]"
                             ]
                             if :block <> type params -> ARITY\[top\name]: 1
                         ]
@@ -578,7 +575,6 @@ lowerWalk: function [blok start stopAtRoot][
                 if name <> "false" [
                     if name <> "null" [
                         ar: arityOf name
-                        print "AR name: [" ++ name ++ "] ar: [" ++ (to :string ar) ++ "]"
                         ; A word of arity 0 consumes no operands, so
                         ; it is a leaf: opening a call frame for it
                         ; parks a frame that nothing will ever

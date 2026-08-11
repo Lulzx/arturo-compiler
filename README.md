@@ -1,10 +1,9 @@
 # arturo-compiler
 
-A compiler for Arturo, written in Arturo, that compiles itself — to a
-native binary that reproduces the interpreter's output byte-for-byte.
-Proven, not promised.
+A compiler for Arturo, written in Arturo, that compiles itself to a native
+binary that reproduces the interpreter's output byte for byte.
 
-## The whole trick is one table
+## One table
 
 One row per construct, three columns.
 
@@ -16,17 +15,16 @@ defRule "while" #[
 ]
 ```
 
-`eval` is what the construct means interpreted from source, `emit` is
-the IR it produces, `run` is what that IR does when executed. The
-dispatchers know no construct by name — they look up the row and pick
-a column. Adding a language feature is adding a row. That's it.
+`eval` is what the construct means interpreted from source, `emit` is the IR
+it produces, `run` is what that IR does when executed. The dispatchers know
+no construct by name; they look up the row and pick a column. Adding a
+language feature is adding a row.
 
-Arity isn't in the row. It's generated into `INTRINSICS` from
-Arturo's own source, one copy, nothing to drift.
+Arity is not in the row. It is generated into `INTRINSICS` from Arturo's own
+source, one copy, nothing to drift.
 
-`call` is a row too. A kernel closure won't hand its internals to the
-host, so the kernel applies it itself — which is exactly how the table
-is executed.
+`call` is a row too. A kernel closure will not hand its internals to the
+host, so the kernel applies it itself, which is how the table is executed.
 
 ## The invariant
 
@@ -34,38 +32,33 @@ is executed.
 eval(env, emit(n)) == eval(env, n)      ; for every node n
 ```
 
-Every construct is held to it across four engines — host, kernel,
-compiled, and in-kernel IR. `corpus/` is one program per rule, and
-each runs through all four and must agree.
+Every construct is held to it across four engines: host, kernel, compiled,
+and in-kernel IR. `corpus/` is one program per rule, and each runs through
+all four and must agree.
 
 ## Self-hosting
 
-The compiler emits itself to C, links it, and the result —
-`tmp/ncomp`, a standalone native CLI — compiles every corpus program
-to a native binary. Its output is byte-identical to the host
-interpreter. 27/27.
-
-```
-bash tools/selfhost_test.sh     # pass=27 fail=0
-```
+The compiler emits itself to C, links it, and the result, `tmp/ncomp`, is a
+standalone native CLI. It compiles corpus programs to native binaries whose
+output is byte-identical to the host interpreter. `make verify` proves it
+every time it runs.
 
 ## Build, run, test
 
-```
-arturo tools/cbnative.art                 # build the native compiler -> tmp/ncomp
-./tmp/ncomp  in.art  out                  # compile a program to a native binary
-./out                                     # run it
-arturo src/compiler.art in.art out.art    # emit -> fold -> render
-```
+    make ncomp              # build the native compiler -> tmp/ncomp
+    ./tmp/ncomp in.art out  # compile a program to a native binary
+    ./out                   # run it
+    make test               # 4-way differential, every corpus program
+    make verify             # native == host, byte for byte
 
-```
-arturo src/tests.art            # host vs kernel vs compiled vs runIR
-bash tools/selfhost_test.sh     # native == host, 27/27
-```
+Or by hand:
+
+    arturo tools/cbnative.art            # build the native compiler
+    arturo src/compiler.art in.art out   # emit -> fold -> render
 
 ## Files
 
-    src/intrinsics.art   GENERATED — every builtin's signature, read off Arturo's source
+    src/intrinsics.art   GENERATED: builtin arities, read off Arturo's source
     src/front.art        lex + lower
     src/kernel.art       the rule table, its dispatchers, runIR
     src/ir.art           IR + constant folding
@@ -74,10 +67,11 @@ bash tools/selfhost_test.sh     # native == host, 27/27
     src/compiler.art     entry point
     tools/extract_intrinsics.art  the generator
     tools/cbnative.art            build the native compiler
-    tools/selfhost_test.sh        the proof
-    corpus/                      one program per rule
-    SPEC.md                      the full design
+    tools/selfhost_test.sh        the self-hosting proof
+    corpus/                       one program per rule
+    SPEC.md                       the full design
+    CONTRIBUTING.md               how to add a construct
 
-Built against Arturo 0.10.0, pinned to the revision in
-`corpus/m1/RESULTS.md`. Read `SPEC.md` for the design; the compiler
-reproduces itself, and that's the whole claim.
+Built against Arturo 0.10.0, pinned to the revision in `corpus/m1/RESULTS.md`.
+Read `SPEC.md` for the design; the compiler reproduces itself, and that is
+the whole claim.
