@@ -38,11 +38,22 @@ truthy: function [v][
 ; Environment: frames with a parent chain
 ;-----------------------------------------------
 newEnv: function [parent][
-    #[bindings: #[] parent: parent]
+    #[bindings: #[] parent: parent rebind: false]
 ]
 
 define: function [env name value][
+    if env\rebind [
+        target: env
+        while [not? null? target][
+            if key? target\bindings name [
+                target\bindings\[name]: value
+                return value
+            ]
+            target: target\parent
+        ]
+    ]
     env\bindings\[name]: value
+    value
 ]
 
 bound?: function [env name][
@@ -331,6 +342,84 @@ evalUntil: function [env actionBlock condBlock][
     null
 ]
 
+; A loop iteration has a child frame: its parameters are local,
+; while labels in the body update the nearest existing binding.
+; This is the host's action-block scope, and keeps a loop body
+; capable of resolving kernel closures through the parent chain.
+loopFrame: function [env params boundVals][
+    child: newEnv env
+    j: 0
+    loop params [p][
+        if j < size boundVals -> define child (to :string p) boundVals\[j]
+        j: j + 1
+    ]
+    child\rebind: true
+    child
+]
+
+evalLoop: function [env collectionNode params actionBlock][
+    coll: evalNode env collectionNode :interpret
+    if :dictionary = type coll [
+        loop coll [k v][
+            iterVals: @[]
+            addItem iterVals k
+            addItem iterVals v
+            child: loopFrame env params iterVals
+            evalSeq child (lowerBlock actionBlock)
+            if RET\set -> break
+        ]
+        if RET\set -> return RET\value
+        return null
+    ]
+    loop coll [v][
+        iterVals: @[]
+        addItem iterVals v
+        child: loopFrame env params iterVals
+        evalSeq child (lowerBlock actionBlock)
+        if RET\set -> break
+    ]
+    if RET\set -> return RET\value
+    null
+]
+
+runLoop: function [env argv][
+    coll: runNode env argv\0
+    params: argv\1
+    if :dictionary = type coll [
+        loop coll [k v][
+            iterVals: @[]
+            addItem iterVals k
+            addItem iterVals v
+            child: loopFrame env params iterVals
+            runSeq child argv\2
+            if RET\set -> break
+        ]
+        if RET\set -> return RET\value
+        return null
+    ]
+    loop coll [v][
+        iterVals: @[]
+        addItem iterVals v
+        child: loopFrame env params iterVals
+        runSeq child argv\2
+        if RET\set -> break
+    ]
+    if RET\set -> return RET\value
+    null
+]
+
+evalRange: function [env fromNode toNode][
+    fromVal: evalNode env fromNode :interpret
+    toVal: evalNode env toNode :interpret
+    fromVal .. toVal
+]
+
+runRange: function [env argv][
+    fromVal: runNode env argv\0
+    toVal: runNode env argv\1
+    fromVal .. toVal
+]
+
 applyClosure: function [cl argVals][
     child: newEnv cl\env
     params: cl\params
@@ -398,7 +487,12 @@ evalCall: function [env node][
     ; one row per construct, one lookup, one of its three
     ; behaviours picked by which dispatcher is asking
     r: ruleFor (calleeName fnNode)
-    if not? null? r -> return call r\eval @[env node\args]
+    if not? null? r [
+        rowArgs: @[]
+        addItem rowArgs env
+        addItem rowArgs node\args
+        return call r\eval rowArgs
+    ]
 
     fnVal: evalNode env fnNode :interpret
     argVals: @[]
@@ -448,7 +542,12 @@ emitNode: function [env node][
 emitCall: function [env node][
     fnNode: node\fn
     r: ruleFor (calleeName fnNode)
-    if not? null? r -> return call r\emit @[env node\args]
+    if not? null? r [
+        rowArgs: @[]
+        addItem rowArgs env
+        addItem rowArgs node\args
+        return call r\emit rowArgs
+    ]
     fnIR: emitNode env fnNode
     argsIR: @[]
     loop node\args [a][ addItem argsIR (emitNode env a) ]
@@ -536,13 +635,20 @@ runNode: function [env node][
     if "return" = op -> return runReturn env node\args
     if "while" = op -> return runWhile env node\args
     if "until" = op -> return runUntil env node\args
+    if "loop" = op -> return runLoop env node\args
+    if "range" = op -> return runRange env node\args
     node
 ]
 
 runCall: function [env node][
     fnNode: node\fn
     r: ruleFor (irCalleeName fnNode)
-    if not? null? r -> return call r\run @[env node\args]
+    if not? null? r [
+        rowArgs: @[]
+        addItem rowArgs env
+        addItem rowArgs node\args
+        return call r\run rowArgs
+    ]
 
     fnVal: runNode env fnNode
     argVals: @[]
@@ -685,6 +791,33 @@ defRule "until" #[
         #[op: "until" args: @[actionIR condIR]]
     ]
     run:  function [env argv][ runUntil env argv ]
+]
+
+defRule "loop" #[
+    eval: function [env argv][ evalLoop env argv\0 argv\1 argv\2 ]
+    emit: function [env argv][
+        collectionIR: emitNode env argv\0
+        bodyIR: emitSeq env (lowerBlock argv\2)
+        loopArgs: @[]
+        addItem loopArgs collectionIR
+        addItem loopArgs argv\1
+        addItem loopArgs bodyIR
+        #[op: "loop" args: loopArgs]
+    ]
+    run: function [env argv][ runLoop env argv ]
+]
+
+defRule "range" #[
+    eval: function [env argv][ evalRange env argv\0 argv\1 ]
+    emit: function [env argv][
+        fromIR: emitNode env argv\0
+        toIR: emitNode env argv\1
+        rangeArgs: @[]
+        addItem rangeArgs fromIR
+        addItem rangeArgs toIR
+        #[op: "range" args: rangeArgs]
+    ]
+    run: function [env argv][ runRange env argv ]
 ]
 
 ; `makeDict` is the one row that is not an Arturo word. The

@@ -1,0 +1,29 @@
+; loop — kernel rule. The body resolves kernel-bound names (closures) and its
+; labels update the nearest binding (accumulating an outer counter), exactly
+; as the host's loop does.
+;
+; block collection
+acc: 0
+loop [1 2 3] [v][ acc: acc + v ]
+print acc
+; range collection
+r: 0
+loop 1..4 [i][ r: r + i ]
+print r
+down: 0
+loop 3..1 [i][ down: down + i ]
+print down
+; string collection iterates characters
+s: ""
+loop "abc" [ch][ s: s ++ ch ]
+print s
+; dict with [k v] binds key and value
+d: #[a: 1 b: 2]
+total: 0
+loop d [k v][ total: total + v ]
+print total
+; loop body referencing a kernel closure
+f: function [x][ x * 10 ]
+out: 0
+loop [1 2 3] [i][ out: out + f i ]
+print out

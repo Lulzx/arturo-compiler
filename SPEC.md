@@ -359,7 +359,7 @@ constructs is a v1 concern.
 | paths `a/b`, symbols `'x` | delegated/passthrough | kernel rules (note `=` bug) |
 | parens `( .. )` | passthrough | lowering |
 | string interpolation | passthrough | lowering |
-| loops (`loop`, `while`, `until`, ranges) | passthrough | kernel rules (lazy) |
+| loops (`loop`, `while`, `until`, ranges) | kernel rules | owned (lazy bodies; explicit range IR) |
 | `import` / modules | passthrough | later, after the driver |
 | objects / classes | passthrough | later |
 | `try` / `except` | passthrough | after §12 error model |

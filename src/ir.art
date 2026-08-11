@@ -235,6 +235,17 @@ ir2art: function [node][
         cd: ir2artSeq node\args\1
         return "until [" ++ ac ++ "] [" ++ cd ++ "]"
     ]
+    if "loop" = op [
+        coll: ir2art node\args\0
+        params: renderValue node\args\1
+        body: ir2artSeq node\args\2
+        return "loop " ++ coll ++ " " ++ params ++ " [" ++ body ++ "]"
+    ]
+    if "range" = op [
+        fromText: ir2art node\args\0
+        toText: ir2art node\args\1
+        return fromText ++ ".." ++ toText
+    ]
     if "passthrough" = op -> return renderValue node\src
     if "call" = op -> return ir2artCall node
     renderValue node

@@ -429,6 +429,8 @@ cNode: function [n][
         "if"           -> cIf n
         "while"        -> cWhile n
         "until"        -> cUntil n
+        "loop"         -> cLoop n
+        "range"        -> cRange n
         "return"       -> cReturn n
     ]
 ]
@@ -453,6 +455,17 @@ cUntil: function [n][
     a: cNode n\args\0
     b: cNode n\args\1
     "ir_op(\"until\", (IR*[]){" ++ a ++ ", " ++ b ++ "}, 2)"
+]
+cLoop: function [n][
+    coll: cNode n\args\0
+    params: cBlock n\args\1
+    body: cNode n\args\2
+    "ir_op(\"loop\", (IR*[]){" ++ coll ++ ", " ++ params ++ ", " ++ body ++ "}, 3)"
+]
+cRange: function [n][
+    fromc: cNode n\args\0
+    toc: cNode n\args\1
+    "ir_op(\"range\", (IR*[]){" ++ fromc ++ ", " ++ toc ++ "}, 2)"
 ]
 cReturn: function [n][
     a: cNullConst

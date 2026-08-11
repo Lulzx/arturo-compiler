@@ -157,7 +157,7 @@ void v_print(Value v) {
 /* ---- environments -------------------------------------------------------- */
 Env *env_new(Env *parent) {
     Env *e = (Env*)xmalloc(sizeof *e);
-    e->names=NULL; e->vals=NULL; e->n=0; e->parent=parent; return e;
+    e->names=NULL; e->vals=NULL; e->n=0; e->parent=parent; e->rebind_parent=0; return e;
 }
 static int env_find(Env *e, const char *name) {
     for (int i=0;i<e->n;i++) if (!strcmp(e->names[i], name)) return i;
@@ -198,6 +198,13 @@ static void env_define_local(Env *e, const char *name, Value v) {
     e->vals  = (Value*)xrealloc(e->vals, (e->n+1)*sizeof(Value));
     e->names[e->n] = (char*)xmalloc(strlen(name)+1); strcpy(e->names[e->n], name);
     e->vals[e->n] = v; e->n++;
+}
+
+/* A kernel-owned loop body uses action-block scope: parameters are local, but
+ * a label assignment updates the nearest existing outer binding. */
+static void env_define_body(Env *e, const char *name, Value v) {
+    if (e->rebind_parent) env_set(e, name, v);
+    else env_define_local(e, name, v);
 }
 
 /* ---- IR builders --------------------------------------------------------- */
@@ -606,6 +613,12 @@ static Value b_try(Env*e,Value*a,int n){
     }
     g_try_jmp = prev;
     return v_null();
+}
+/* `do block` inside a stored action block. Delegate uses this under `try` to
+ * invoke a dynamically assembled builtin call during constant folding. */
+static Value b_do(Env*e,Value*a,int n){
+    if (n<1 || a[0].k!=V_BLOCK) return n ? a[0] : v_null();
+    return runBlockValue(e, a[0]);
 }
 
 /* dict helpers */
@@ -1150,7 +1163,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"split",b_split},{"take",b_take},{"drop",b_drop},{"reverse",b_reverse},
     {"ensure",b_ensure},{"array",b_array},{"case",b_case},
     {"read",b_read},{"write",b_write},{"execute",b_execute},{"args",b_args},
-    {"insert",b_insert},{"break",b_break},{"null?",b_isNull},{"contains?",b_contains},
+    {"insert",b_insert},{"break",b_break},{"do",b_do},{"null?",b_isNull},{"contains?",b_contains},
     {"greaterOrEqual?",b_ge},{"lessOrEqual?",b_le},{"join",b_join},{"try",b_try},
     {NULL,NULL}
 };
@@ -1256,6 +1269,7 @@ static Value path_read(Env *e, Value p);
 static int fn_arity(const char *name){
     if (!strcmp(name,"loop")||!strcmp(name,"map")||!strcmp(name,"select")) return 3;
     if (!strcmp(name,"not?")||!strcmp(name,"first")||!strcmp(name,"last")
+        ||!strcmp(name,"do")
         ||!strcmp(name,"size")||!strcmp(name,"type")||!strcmp(name,"pop")) return 1;
     if (!strcmp(name,"key?")||!strcmp(name,"get")||!strcmp(name,"set")
         ||!strcmp(name,"equal?")||!strcmp(name,"add")||!strcmp(name,"sub")
@@ -1266,6 +1280,7 @@ static int fn_arity(const char *name){
 /* is the idx-th (0-based) arg of this head a BLOCK handed to the function as-is
  * (loop/map/select params+action), never evaluated here? */
 static int block_arg(const char *name, int idx){
+    if (!strcmp(name,"do") && idx==0) return 1;
     if ((!strcmp(name,"loop")||!strcmp(name,"map")||!strcmp(name,"select")) && idx>=1) return 1;
     return 0;
 }
@@ -1295,7 +1310,7 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
             return v_block(items, cnt);
         }
     }
-    if (v.k == V_STR) {
+    if (v.k == V_STR || v.k == V_WORD) {
         /* the literal words true/false/null (the frontend emits them as plain
          * strings inside action-body block VALUES) resolve to the literals,
          * matching runNode0's word/load handling and the host. Without this,
@@ -1327,8 +1342,9 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
             int m = 0;
             if (A >= 0) {
                 for (int k=0; k<A && *ip<n; k++) {
-                    if (block_arg(v.u.s,k)) { args[m++] = *it[*ip]; (*ip)++; }   /* block arg, verbatim */
-                    else args[m++] = evalExpr(e, it, n, ip);
+                    if (block_arg(v.u.s,k) && it[*ip]->k==V_BLOCK) {
+                        args[m++] = *it[*ip]; (*ip)++;   /* literal block arg, verbatim */
+                    } else args[m++] = evalExpr(e, it, n, ip);
                 }
             } else {
                 while (*ip < n && !is_binop(*it[*ip]) && !arg_boundary(it,n,*ip))
@@ -1400,6 +1416,7 @@ static int starts_stmt(Value v){
 static int arg_boundary(Value **it, int n, int ip){
     Value v=*it[ip];
     if (v.k==V_STR){
+        if (!strcmp(v.u.s,"->")) return 1;
         if (!strncmp(v.u.s,"@LBL:",5)) return 1;
         if (!strcmp(v.u.s,"if")) return 1;
     }
@@ -1657,7 +1674,7 @@ static Value runNode0(Env *e, IR *node) {
 
     if (!strcmp(node->op,"define")) {
         Value v = runNode0(e, node->args[0]);
-        env_define_local(e, node->name, v);
+        env_define_body(e, node->name, v);
         return v;
     }
     if (!strcmp(node->op,"block")) {
@@ -1724,6 +1741,61 @@ static Value runNode0(Env *e, IR *node) {
         }
         if (rt_ret_set) return rt_ret_val;
         return v_null();
+    }
+    if (!strcmp(node->op,"loop")) {
+        Value coll = runNode0(e, node->args[0]);
+        Value params = runNode0(e, node->args[1]);
+        IR *body = node->args[2];
+        IR **body_items = body && body->op && !strcmp(body->op,"__seq") ? body->args : &body;
+        int body_n = body && body->op && !strcmp(body->op,"__seq") ? body->nargs : 1;
+        rt_brk_set=0;
+        if (coll.k==V_DICT) {
+            Dict *dd=coll.u.dict;
+            for (int i=0;i<dd->n;i++) {
+                Env *child=env_new(e);
+                if (params.k==V_BLOCK && params.u.block.b->n==1)
+                    env_define_local(child, (*params.u.block.b->items[0]).u.s, dd->vals[i]);
+                else if (params.k==V_BLOCK && params.u.block.b->n>=2) {
+                    env_define_local(child, (*params.u.block.b->items[0]).u.s, v_str(dd->keys[i]));
+                    env_define_local(child, (*params.u.block.b->items[1]).u.s, dd->vals[i]);
+                }
+                child->rebind_parent=1;
+                runSeq(child, body_items, body_n);
+                if (rt_ret_set || rt_brk_set) break;
+            }
+        } else if (coll.k==V_STR) {
+            int count=(int)strlen(coll.u.s);
+            for (int i=0;i<count;i++) {
+                Env *child=env_new(e);
+                if (params.k==V_BLOCK && params.u.block.b->n>0)
+                    env_define_local(child, (*params.u.block.b->items[0]).u.s, v_char(coll.u.s[i]));
+                child->rebind_parent=1;
+                runSeq(child, body_items, body_n);
+                if (rt_ret_set || rt_brk_set) break;
+            }
+        } else if (coll.k==V_BLOCK || coll.k==V_RANGE) {
+            int count = coll.k==V_BLOCK ? coll.u.block.b->n
+                : (int)(labs(coll.u.range.hi-coll.u.range.lo)+1);
+            long step = coll.k==V_RANGE && coll.u.range.hi<coll.u.range.lo ? -1 : 1;
+            for (int i=0;i<count;i++) {
+                Value el = coll.k==V_BLOCK ? *coll.u.block.b->items[i]
+                    : v_int(coll.u.range.lo + step*i);
+                Env *child=env_new(e);
+                if (params.k==V_BLOCK && params.u.block.b->n>0)
+                    env_define_local(child, (*params.u.block.b->items[0]).u.s, el);
+                child->rebind_parent=1;
+                runSeq(child, body_items, body_n);
+                if (rt_ret_set || rt_brk_set) break;
+            }
+        } else die("loop: unsupported collection");
+        rt_brk_set=0;
+        if (rt_ret_set) return rt_ret_val;
+        return v_null();
+    }
+    if (!strcmp(node->op,"range")) {
+        Value from = runNode0(e, node->args[0]);
+        Value to = runNode0(e, node->args[1]);
+        return v_range(as_int(from), as_int(to));
     }
     if (!strcmp(node->op,"call")) {
         if (node->fn && node->fn->op && !strcmp(node->fn->op,"intrinsic")){

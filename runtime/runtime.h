@@ -81,7 +81,7 @@ int  v_truthy(Value v);
 void v_print(Value v);               /* Arturo's `print`: value + newline */
 
 /* ---- environments (frames with a parent chain) ----------------------- */
-struct Env { char **names; Value *vals; int n; Env *parent; };
+struct Env { char **names; Value *vals; int n; Env *parent; int rebind_parent; };
 Env *env_new(Env *parent);
 Value env_get(Env *e, const char *name);   /* returns V_NULL if unbound */
 int   env_bound(Env *e, const char *name);
@@ -93,7 +93,7 @@ void  env_set(Env *e, const char *name, Value v);
  * the builders; runNode reads only what its op needs. */
 struct IR {
     const char *op;      /* "const","load","define","function","if","do",
-                            "block","call","return","while","until",
+                            "block","call","return","while","until","loop","range",
                             "passthrough","intrinsic" */
     const char *name;    /* load/define/intrinsic */
     Value       v;       /* const / passthrough */
