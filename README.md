@@ -43,6 +43,13 @@ standalone native CLI. It compiles corpus programs to native binaries whose
 output is byte-identical to the host interpreter. `make verify` proves it
 every time it runs.
 
+Two things "byte-identical" does not claim. It means the printed output
+(stdout and stderr) of the native binary matches the host interpreter's
+character for character. It does not compare state that never prints. And it
+is proven on the corpus subset and on the compiler's own source, not on the
+whole language; constructs the compiler does not yet own (see the backlog in
+`SPEC.md`) are outside the proof until a corpus program pins them.
+
 ## Build, run, test
 
     make ncomp              # build the native compiler -> tmp/ncomp
