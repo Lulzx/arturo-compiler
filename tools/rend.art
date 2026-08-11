@@ -1,5 +1,0 @@
-import ./"../src/backend.art"
-go: function [p][
-    print (renderProgram (read p))
-]
-go (args\values\0)

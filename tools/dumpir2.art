@@ -1,7 +1,0 @@
-import ./"../src/ir.art"
-import ./"../src/front.art"
-zzprobe: function [path][
-    ir: fold (compileToIR (read path))
-    loop ir [n][ print (to :string n) ]
-]
-zzprobe (args\values\0)

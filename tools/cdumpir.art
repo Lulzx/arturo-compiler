@@ -1,4 +1,0 @@
-import ./"../src/kernel.art"
-import ./"../src/ir.art"
-doit: function [src][ compileToIR src ]
-print (doit "b: read.binary \"x\"")

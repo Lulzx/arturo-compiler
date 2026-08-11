@@ -1,3 +1,0 @@
-import ./"../src/backend.art"
-ir: compileToIR (read args\values\0)
-loop ir [n][ print (to :string n) ]

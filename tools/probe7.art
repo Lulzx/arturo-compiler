@@ -1,7 +1,0 @@
-import ./"../src/cbackend.art"
-doit: function [p][
-    src: read p
-    c: compileToC src
-    print "ok size:" ++ (to :string (size c))
-]
-doit (args\values\0)

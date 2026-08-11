@@ -1,7 +1,0 @@
-import ./"../src/backend.art"
-src: "lst: @[1]\ninsert 'lst 0 9\n"
-myir: fold (compileToIR src)
-node: myir\1
-ps: node\args\0
-print "src type: " ++ (to :string (type ps\src))
-print "src: " ++ (to :string ps\src)

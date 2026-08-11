@@ -1,7 +1,0 @@
-import ./"../src/cbackend.art"
-doit: function [inPath][
-    src: read inPath
-    c: compileToC src
-    print "inside-size:" ++ (to :string (size c))
-]
-doit "/tmp/nullprog.art"

@@ -1,2 +1,0 @@
-import ./"../src/cbackend.art"
-doit: function [inPath outName][ compileToNativeC (read inPath) outName ]

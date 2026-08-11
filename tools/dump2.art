@@ -1,8 +1,0 @@
-import ./"../src/backend.art"
-dump: function [path][
-    print ["=====" path "====="]
-    ir: compileToIR (read path)
-    loop ir [n][ print (to :string n) ]
-]
-dump "corpus/06_if.art"
-dump "corpus/13_while.art"
