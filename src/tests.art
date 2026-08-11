@@ -40,5 +40,8 @@ go: function [][
     print passed
     print "failed:"
     print failed
+    ; A red test run must also be a failing process. Without this assertion,
+    ; `make test` returned success even when the report contained FAIL lines.
+    ensure [0 = failed]
 ]
 go

@@ -11,7 +11,7 @@ RUNTIME_A = runtime/runtime.a
 SOURCES  = src/intrinsics.art src/semantics.art src/front.art src/kernel.art \
            src/ir.art src/backend.art src/cbackend.art runtime/runtime.c
 
-.PHONY: ncomp test verify compat check clean
+.PHONY: ncomp test verify compat coverage check clean
 
 # The native compiler: emitted by its own C backend, linked against runtime.c.
 ncomp: $(NCCOMP)
@@ -37,6 +37,11 @@ verify: ncomp
 # outputs; they do not belong in the host-parity corpus above.
 compat: ncomp
 	bash tools/compat_test.sh
+
+# Report the native runtime's declared-intrinsic coverage. This is a scope
+# metric, not a correctness metric; `test`/`verify` prove implemented behavior.
+coverage:
+	bash tools/language_coverage.sh
 
 check: test verify compat
 
