@@ -474,8 +474,547 @@ cReturn: function [n][
 ]
 
 ; ---- full C program ---------------------------------------------------------
+; A direct-C leaf does not need the dynamic Value model, IR builders, or runSeq.
+; The folder has already evaluated pure constant calls, so constant prints emit
+; as libc I/O. Safe dynamic statements may be interleaved as individual runNode
+; calls; structural control flow falls back to one runSeq so return/break keeps
+; its sequence-wide behavior.
+directStmt: function [n][
+    if :dictionary <> type n [ return "" ]
+    if "call" <> n\op [ return "" ]
+    if :dictionary <> type n\fn [ return "" ]
+    if "intrinsic" <> n\fn\op [ return "" ]
+    if "print" <> n\fn\name [ return "" ]
+    if 1 <> size n\args [ return "" ]
+    a: n\args\0
+    if :dictionary <> type a [ return "" ]
+    if "const" <> a\op [ return "" ]
+    if :null = type a\value [ return "puts(\"null\");" ]
+    t: type a\value
+    if :string = t [ return "puts(" ++ (quoteC a\value) ++ ");" ]
+    if :integer = t [ return "puts(" ++ (quoteC (to :string a\value)) ++ ");" ]
+    if :floating = t [ return "printf(\"%g\\n\", (double)" ++ (to :string a\value) ++ ");" ]
+    if :char = t [ return "fputs(" ++ (quoteC (to :string a\value)) ++ ", stdout); putchar('\\n');" ]
+    if :logical = t [
+        if a\value [ return "puts(\"true\");" ]
+        return "puts(\"false\");"
+    ]
+    ""
+]
+
+; ---- typed native lowering -------------------------------------------------
+; This is the real AOT path for the statically typed scalar subset. Values are
+; C scalars, definitions are C locals, pure intrinsic calls are C expressions,
+; and if/while become C control flow. A single unsupported value rejects this
+; whole path; directProgram below can still pick direct/hybrid IR statement
+; emission, and the final fallback remains the complete dynamic runtime.
+nativeResult: function [ok kind code][
+    r: #[]
+    r\ok: ok
+    r\kind: kind
+    r\code: code
+    r
+]
+nativeFail: function [][ nativeResult false "" "" ]
+
+nativeNumeric?: function [kind][
+    if "int" = kind [ return true ]
+    if "float" = kind [ return true ]
+    false
+]
+
+nativeExpr: function [n state][
+    if :dictionary <> type n [
+        if :null = type n [ return nativeResult true "null" "0" ]
+        rawType: type n
+        if :integer = rawType [ return nativeResult true "int" (to :string n) ]
+        if :floating = rawType [ return nativeResult true "float" (to :string n) ]
+        if :string = rawType [ return nativeResult true "string" (quoteC n) ]
+        if :logical = rawType [
+            if n [ return nativeResult true "bool" "1" ]
+            return nativeResult true "bool" "0"
+        ]
+        return nativeFail
+    ]
+    if not? key? n "op" [ return nativeFail ]
+    op: n\op
+    if "const" = op [
+        if :null = type n\value [ return nativeResult true "null" "0" ]
+        t: type n\value
+        if :integer = t [ return nativeResult true "int" (to :string n\value) ]
+        if :floating = t [ return nativeResult true "float" (to :string n\value) ]
+        if :string = t [ return nativeResult true "string" (quoteC n\value) ]
+        if :type = t [ return nativeResult true "string" (quoteC (":" ++ (to :string n\value))) ]
+        if :logical = t [
+            if n\value [ return nativeResult true "bool" "1" ]
+            return nativeResult true "bool" "0"
+        ]
+        return nativeFail
+    ]
+    if "load" = op [
+        if key? state\vars n\name [
+            found: get state\vars n\name
+            return found
+        ]
+        return nativeFail
+    ]
+    if "range" = op [
+        fromv: nativeExpr n\args\0 state
+        tov: nativeExpr n\args\1 state
+        if not? fromv\ok [ return nativeFail ]
+        if not? tov\ok [ return nativeFail ]
+        if "int" <> fromv\kind [ return nativeFail ]
+        if "int" <> tov\kind [ return nativeFail ]
+        return nativeResult true "range" ("(DRange){" ++ fromv\code ++ ", " ++ tov\code ++ "}")
+    ]
+    if "call" <> op [ return nativeFail ]
+    if :dictionary <> type n\fn [ return nativeFail ]
+    ; A single-expression user function can be inlined with its arguments bound
+    ; to native expressions. This preserves call-by-value for this pure subset
+    ; and avoids shipping the closure/IR machinery for ordinary helpers.
+    if "load" = n\fn\op [
+        if not? key? state\funcs n\fn\name [ return nativeFail ]
+        fnDef: get state\funcs n\fn\name
+        params: fnDef\args\0
+        fnBody: fnDef\args\1
+        if 1 <> size fnBody [ return nativeFail ]
+        if (size params) <> size n\args [ return nativeFail ]
+        saved: @[]
+        had: @[]
+        good: true
+        j: 0
+        loop params [p][
+            pname: to :string p
+            existed: key? state\vars pname
+            addItem had existed
+            old: nativeFail
+            if existed [ old: get state\vars pname ]
+            addItem saved old
+            av: nativeExpr n\args\[j] state
+            if not? av\ok [ good: false ]
+            if av\ok [ set state\vars pname av ]
+            j: j + 1
+        ]
+        result: nativeFail
+        if good [ result: nativeExpr fnBody\0 state ]
+        j: 0
+        loop params [p][
+            pname: to :string p
+            if had\[j] [ set state\vars pname saved\[j] ]
+            if not? had\[j] [
+                unavailable: nativeFail
+                set state\vars pname unavailable
+            ]
+            j: j + 1
+        ]
+        return result
+    ]
+    if "intrinsic" <> n\fn\op [ return nativeFail ]
+    name: n\fn\name
+
+    ; size of a literal block needs no block runtime representation.
+    if "size" = name [
+        if 1 <> size n\args [ return nativeFail ]
+        raw: n\args\0
+        if :dictionary = type raw [
+            if "block" = raw\op [ return nativeResult true "int" (to :string (size raw\items)) ]
+        ]
+        one: nativeExpr raw state
+        if not? one\ok [ return nativeFail ]
+        if "string" = one\kind [ return nativeResult true "int" ("(long)strlen(" ++ one\code ++ ")") ]
+        if "range" = one\kind [ return nativeResult true "int" ("(long)(labs((" ++ one\code ++ ").hi - (" ++ one\code ++ ").lo) + 1)") ]
+        return nativeFail
+    ]
+    if "type" = name [
+        if 1 <> size n\args [ return nativeFail ]
+        one: nativeExpr n\args\0 state
+        if not? one\ok [ return nativeFail ]
+        tn: ""
+        if "int" = one\kind [ tn: ":integer" ]
+        if "float" = one\kind [ tn: ":floating" ]
+        if "string" = one\kind [ tn: ":string" ]
+        if "bool" = one\kind [ tn: ":logical" ]
+        if "null" = one\kind [ tn: ":null" ]
+        if empty? tn [ return nativeFail ]
+        return nativeResult true "string" (quoteC tn)
+    ]
+    if "first" = name [
+        if 1 <> size n\args [ return nativeFail ]
+        raw: n\args\0
+        if :dictionary <> type raw [ return nativeFail ]
+        if "block" <> raw\op [ return nativeFail ]
+        if empty? raw\items [ return nativeResult true "null" "0" ]
+        return nativeExpr raw\items\0 state
+    ]
+    if "last" = name [
+        if 1 <> size n\args [ return nativeFail ]
+        raw: n\args\0
+        if :dictionary <> type raw [ return nativeFail ]
+        if "block" <> raw\op [ return nativeFail ]
+        if empty? raw\items [ return nativeResult true "null" "0" ]
+        return nativeExpr (last raw\items) state
+    ]
+    if "inc" = name [
+        one: nativeExpr n\args\0 state
+        if not? one\ok [ return nativeFail ]
+        if "int" <> one\kind [ return nativeFail ]
+        return nativeResult true "int" ("(" ++ one\code ++ " + 1)")
+    ]
+    if "dec" = name [
+        one: nativeExpr n\args\0 state
+        if not? one\ok [ return nativeFail ]
+        if "int" <> one\kind [ return nativeFail ]
+        return nativeResult true "int" ("(" ++ one\code ++ " - 1)")
+    ]
+    if 2 <> size n\args [ return nativeFail ]
+    left: nativeExpr n\args\0 state
+    right: nativeExpr n\args\1 state
+    if not? left\ok [ return nativeFail ]
+    if not? right\ok [ return nativeFail ]
+
+    if "append" = name [
+        if "string" <> left\kind [ return nativeFail ]
+        if "string" <> right\kind [ return nativeFail ]
+        state\concat: true
+        return nativeResult true "string" ("dc_concat(" ++ left\code ++ ", " ++ right\code ++ ")")
+    ]
+    if "add" = name [
+        if not? nativeNumeric? left\kind [ return nativeFail ]
+        if not? nativeNumeric? right\kind [ return nativeFail ]
+        kind: "int"
+        if "float" = left\kind [ kind: "float" ]
+        if "float" = right\kind [ kind: "float" ]
+        return nativeResult true kind ("(" ++ left\code ++ " + " ++ right\code ++ ")")
+    ]
+    if "sub" = name [
+        if not? nativeNumeric? left\kind [ return nativeFail ]
+        if not? nativeNumeric? right\kind [ return nativeFail ]
+        kind: "int"
+        if "float" = left\kind [ kind: "float" ]
+        if "float" = right\kind [ kind: "float" ]
+        return nativeResult true kind ("(" ++ left\code ++ " - " ++ right\code ++ ")")
+    ]
+    if "mul" = name [
+        if not? nativeNumeric? left\kind [ return nativeFail ]
+        if not? nativeNumeric? right\kind [ return nativeFail ]
+        kind: "int"
+        if "float" = left\kind [ kind: "float" ]
+        if "float" = right\kind [ kind: "float" ]
+        return nativeResult true kind ("(" ++ left\code ++ " * " ++ right\code ++ ")")
+    ]
+    if "div" = name [
+        if "int" <> left\kind [ return nativeFail ]
+        if "int" <> right\kind [ return nativeFail ]
+        return nativeResult true "int" ("(" ++ left\code ++ " / " ++ right\code ++ ")")
+    ]
+    if "fdiv" = name [
+        if not? nativeNumeric? left\kind [ return nativeFail ]
+        if not? nativeNumeric? right\kind [ return nativeFail ]
+        return nativeResult true "float" ("((double)(" ++ left\code ++ ") / (double)(" ++ right\code ++ "))")
+    ]
+    if "mod" = name [
+        if "int" <> left\kind [ return nativeFail ]
+        if "int" <> right\kind [ return nativeFail ]
+        return nativeResult true "int" ("(" ++ left\code ++ " % " ++ right\code ++ ")")
+    ]
+    if "pow" = name [
+        if not? nativeNumeric? left\kind [ return nativeFail ]
+        if not? nativeNumeric? right\kind [ return nativeFail ]
+        return nativeResult true "float" ("pow((double)(" ++ left\code ++ "), (double)(" ++ right\code ++ "))")
+    ]
+
+    cmp: ""
+    if "equal?" = name [ cmp: "==" ]
+    if "notEqual?" = name [ cmp: "!=" ]
+    if "less?" = name [ cmp: "<" ]
+    if "greater?" = name [ cmp: ">" ]
+    if "lessOrEqual?" = name [ cmp: "<=" ]
+    if "greaterOrEqual?" = name [ cmp: ">=" ]
+    if not? empty? cmp [
+        if and? ("string" = left\kind) ("string" = right\kind) [
+            return nativeResult true "bool" ("(strcmp(" ++ left\code ++ ", " ++ right\code ++ ") " ++ cmp ++ " 0)")
+        ]
+        if and? (nativeNumeric? left\kind) (nativeNumeric? right\kind) [
+            return nativeResult true "bool" ("(" ++ left\code ++ " " ++ cmp ++ " " ++ right\code ++ ")")
+        ]
+        if and? ("bool" = left\kind) ("bool" = right\kind) [
+            return nativeResult true "bool" ("(" ++ left\code ++ " " ++ cmp ++ " " ++ right\code ++ ")")
+        ]
+    ]
+    nativeFail
+]
+
+nativeTruth: function [r][
+    if "null" = r\kind [ return "0" ]
+    if "bool" = r\kind [ return r\code ]
+    "1"
+]
+
+nativePrint: function [r][
+    if "null" = r\kind [ return "puts(\"null\");" ]
+    if "string" = r\kind [ return "puts(" ++ r\code ++ ");" ]
+    if "int" = r\kind [ return "printf(\"%ld\\n\", (long)(" ++ r\code ++ "));" ]
+    if "float" = r\kind [ return "printf(\"%g\\n\", (double)(" ++ r\code ++ "));" ]
+    if "bool" = r\kind [ return "puts((" ++ r\code ++ ") ? \"true\" : \"false\");" ]
+    if "range" = r\kind [ return "printf(\"%ld..%ld\\n\", (long)(" ++ r\code ++ ").lo, (long)(" ++ r\code ++ ").hi);" ]
+    ""
+]
+
+nativeCType: function [kind][
+    if "int" = kind [ return "long" ]
+    if "float" = kind [ return "double" ]
+    if "string" = kind [ return "const char *" ]
+    if "bool" = kind [ return "int" ]
+    if "range" = kind [ return "DRange" ]
+    ""
+]
+
+nativeSeq: function [ir state][
+    lines: @[]
+    good: true
+    loop ir [n][
+        if good [
+            handled: false
+            if :dictionary = type n [
+                if "define" = n\op [
+                    if :dictionary = type n\expr [
+                        if "function" = n\expr\op [
+                            set state\funcs n\name n\expr
+                            handled: true
+                        ]
+                    ]
+                    if not? handled [
+                        rv: nativeExpr n\expr state
+                        if not? rv\ok [ good: false ]
+                        if rv\ok [
+                        if key? state\vars n\name [
+                            old: get state\vars n\name
+                            if old\kind <> rv\kind [ good: false ]
+                            if old\kind = rv\kind [ addItem lines (old\code ++ " = " ++ rv\code ++ ";") ]
+                        ]
+                        if not? key? state\vars n\name [
+                            ctype: nativeCType rv\kind
+                            if empty? ctype [ good: false ]
+                            if not? empty? ctype [
+                                cname: "dv_" ++ (to :string state\next)
+                                state\next: state\next + 1
+                                stored: nativeResult true rv\kind cname
+                                set state\vars n\name stored
+                                addItem lines (ctype ++ " " ++ cname ++ " = " ++ rv\code ++ ";")
+                            ]
+                        ]
+                    ]
+                    ]
+                    handled: true
+                ]
+                if "call" = n\op [
+                    isPrint: false
+                    if :dictionary = type n\fn [
+                        if "intrinsic" = n\fn\op [
+                            if "print" = n\fn\name [ isPrint: true ]
+                        ]
+                    ]
+                    if isPrint [
+                        rv: nativeExpr n\args\0 state
+                        if not? rv\ok [ good: false ]
+                        if rv\ok [
+                            pc: nativePrint rv
+                            if empty? pc [ good: false ]
+                            if not? empty? pc [ addItem lines pc ]
+                        ]
+                        handled: true
+                    ]
+                    if not? isPrint [
+                        rv: nativeExpr n state
+                        if not? rv\ok [ good: false ]
+                        if rv\ok [ addItem lines ("(void)(" ++ rv\code ++ ");") ]
+                        handled: true
+                    ]
+                ]
+                if "const" = n\op [
+                    rv: nativeExpr n state
+                    if not? rv\ok [ good: false ]
+                    if rv\ok [ addItem lines ("(void)(" ++ rv\code ++ ");") ]
+                    handled: true
+                ]
+                if "load" = n\op [
+                    rv: nativeExpr n state
+                    if not? rv\ok [ good: false ]
+                    if rv\ok [ addItem lines ("(void)(" ++ rv\code ++ ");") ]
+                    handled: true
+                ]
+                if "if" = n\op [
+                    cond: nativeExpr n\args\0 state
+                    if not? cond\ok [ good: false ]
+                    if cond\ok [
+                        state\depth: state\depth + 1
+                        yes: nativeSeq n\args\1 state
+                        state\depth: state\depth - 1
+                        if not? yes\ok [ good: false ]
+                        if yes\ok [ addItem lines ("if (" ++ (nativeTruth cond) ++ ") {\n" ++ yes\code ++ "\n}") ]
+                    ]
+                    handled: true
+                ]
+                if "while" = n\op [
+                    if 1 <> size n\args\0 [ good: false ]
+                    if good [
+                        cond: nativeExpr n\args\0\0 state
+                        if not? cond\ok [ good: false ]
+                        if cond\ok [
+                            state\depth: state\depth + 1
+                            action: nativeSeq n\args\1 state
+                            state\depth: state\depth - 1
+                            if not? action\ok [ good: false ]
+                            if action\ok [ addItem lines ("while (" ++ (nativeTruth cond) ++ ") {\n" ++ action\code ++ "\n}") ]
+                        ]
+                    ]
+                    handled: true
+                ]
+                if "loop" = n\op [
+                    coll: n\args\0
+                    params: n\args\1
+                    if 0 = size params [ good: false ]
+                    if good [
+                        pname: to :string params\0
+                        hadOld: key? state\vars pname
+                        old: nativeFail
+                        if hadOld [ old: get state\vars pname ]
+                        cname: "dv_" ++ (to :string state\next)
+                        state\next: state\next + 1
+                        prefix: ""
+                        suffix: "}"
+                        elemKind: ""
+                        if :dictionary = type coll [
+                            if "range" = coll\op [
+                                lo: nativeExpr coll\args\0 state
+                                hi: nativeExpr coll\args\1 state
+                                if not? lo\ok [ good: false ]
+                                if not? hi\ok [ good: false ]
+                                if good [
+                                    if "int" <> lo\kind [ good: false ]
+                                    if "int" <> hi\kind [ good: false ]
+                                ]
+                                if good [
+                                    elemKind: "int"
+                                    prefix: "for (long " ++ cname ++ " = " ++ lo\code ++ ", dc_end = " ++ hi\code ++ ", dc_step = (" ++ lo\code ++ " <= " ++ hi\code ++ " ? 1 : -1);; " ++ cname ++ " += dc_step) {\n"
+                                    suffix: "if (" ++ cname ++ " == dc_end) break;\n}"
+                                ]
+                            ]
+                            if "block" = coll\op [
+                                items: @[]
+                                loopKind: ""
+                                loopGood: true
+                                loop coll\items [item][
+                                    ri: nativeExpr item state
+                                    if not? ri\ok [ loopGood: false ]
+                                    if ri\ok [
+                                        if empty? loopKind [ loopKind: ri\kind ]
+                                        if loopKind <> ri\kind [ loopGood: false ]
+                                        addItem items ri\code
+                                    ]
+                                ]
+                                if not? loopGood [ good: false ]
+                                if loopGood [
+                                    ctype: nativeCType loopKind
+                                    if empty? ctype [ good: false ]
+                                    if not? empty? ctype [
+                                        arr: "da_" ++ (to :string state\next)
+                                        state\next: state\next + 1
+                                        elemKind: loopKind
+                                        prefix: ctype ++ " " ++ arr ++ "[] = {" ++ (joinWith items ", ") ++ "};\nfor (size_t di=0; di<" ++ (to :string (size items)) ++ "; di++) {\n" ++ ctype ++ " " ++ cname ++ " = " ++ arr ++ "[di];\n"
+                                    ]
+                                ]
+                            ]
+                        ]
+                        if empty? elemKind [ good: false ]
+                        if good [
+                            bound: nativeResult true elemKind cname
+                            set state\vars pname bound
+                            action: nativeSeq n\args\2 state
+                            if not? action\ok [ good: false ]
+                            if action\ok [ addItem lines (prefix ++ action\code ++ "\n" ++ suffix) ]
+                        ]
+                        if hadOld [ set state\vars pname old ]
+                        if not? hadOld [
+                            unavailable: nativeFail
+                            set state\vars pname unavailable
+                        ]
+                    ]
+                    handled: true
+                ]
+            ]
+            if not? handled [ good: false ]
+        ]
+    ]
+    nativeResult good "seq" (joinWith lines "\n")
+]
+
+nativeProgram: function [ir][
+    state: #[]
+    state\vars: #[]
+    state\funcs: #[]
+    state\next: 0
+    state\depth: 0
+    state\concat: false
+    body: nativeSeq ir state
+    if not? body\ok [ return "" ]
+    helpers: ""
+    if state\concat [
+        helpers: "static char *dc_concat(const char *a, const char *b){ size_t na=strlen(a), nb=strlen(b); char *r=(char*)malloc(na+nb+1); memcpy(r,a,na); memcpy(r+na,b,nb+1); return r; }\n\n"
+    ]
+    content: body\code
+    if not? empty? content [ content: "\t" ++ (replace content "\n" "\n\t") ++ "\n" ]
+    "/* typed native C: no IR interpreter */\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\ntypedef struct { long lo, hi; } DRange;\n\n" ++ helpers ++ "int main(void){\n" ++ content ++ "\treturn 0;\n}\n"
+]
+
+directProgram: function [ir][
+    lines: @[]
+    hasDirect: false
+    hasGeneric: false
+    safe: true
+    loop ir [n][
+        line: directStmt n
+        if not? empty? line [
+            hasDirect: true
+            addItem lines line
+        ]
+        if empty? line [
+            allowed: false
+            if :dictionary = type n [
+                if "define" = n\op [ allowed: true ]
+                if "call" = n\op [ allowed: true ]
+                if "const" = n\op [ allowed: true ]
+                if "load" = n\op [ allowed: true ]
+                if "block" = n\op [ allowed: true ]
+                if "passthrough" = n\op [ allowed: true ]
+            ]
+            if allowed [
+                generic: cNode n
+                addItem lines ("(void)runNode(e, " ++ generic ++ ");")
+                hasGeneric: true
+            ]
+            if not? allowed [ safe: false ]
+        ]
+    ]
+    ; With no direct statements the ordinary runSeq emitter is smaller and has
+    ; already been proved by the differential harness. Structural ops fall back
+    ; too: a nested return/break must be allowed to stop the enclosing sequence.
+    if not? hasDirect [ return "" ]
+    if not? safe [ return "" ]
+    body: ""
+    if not? empty? lines [ body: "\t" ++ (joinWith lines "\n\t") ++ "\n" ]
+    if hasGeneric [
+        return "/* hybrid C: direct statements plus the dynamic fallback */\n#include \"runtime.h\"\n#include <stdio.h>\n\nint main(int argc, char **argv){\n\truntime_set_args(argc, argv);\n\tEnv *e = env_new(NULL);\n" ++ body ++ "\treturn 0;\n}\n"
+    ]
+    "/* direct C: this program needs no Arturo runtime */\n#include <stdio.h>\n\nint main(void){\n" ++ body ++ "\treturn 0;\n}\n"
+]
+
 compileToC: function [src][
     ir: fold (compileToIR src)
+    native: nativeProgram ir
+    if not? empty? native [ return native ]
+    direct: directProgram ir
+    if not? empty? direct [ return direct ]
     ; each statement string must be returned BARE from the map (as cSeq/cCall
     ; do) — the deep cNode result is bound to r, and formatting moves into the
     ; joinWith separator. Inlining `"\t\t" ++ r` corrupts the host value stack
@@ -496,7 +1035,7 @@ compileToNativeC: function [src outName][
     c: compileToC src
     cPath: outName ++ ".c"
     write c cPath
-    execute ("cc -c -Iruntime " ++ cPath ++ " -o " ++ outName ++ ".o 2>&1")
-    execute ("cc " ++ outName ++ ".o runtime/runtime.a -lm -o " ++ outName ++ " 2>&1")
+    execute ("cc -Oz -flto -fvisibility=hidden -c -Iruntime " ++ cPath ++ " -o " ++ outName ++ ".o 2>&1")
+    execute ("cc -Oz -flto -Wl,-dead_strip -Wl,-x " ++ outName ++ ".o runtime/runtime.a -lm -o " ++ outName ++ " 2>&1")
     outName
 ]
