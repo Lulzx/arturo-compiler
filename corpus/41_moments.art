@@ -1,0 +1,9 @@
+; population central moments and statistical edge cases
+print skewness @[1 2 3]
+print skewness @[1 1 2 4]
+print kurtosis @[1 2 3]
+print kurtosis @[1 1 2 4]
+print variance @[]
+print deviation @[]
+print skewness @[5 5 5]
+print kurtosis @[5 5 5]

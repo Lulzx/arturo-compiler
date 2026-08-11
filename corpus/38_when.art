@@ -1,0 +1,17 @@
+; multi-arm lazy conditional: first matching condition wins
+x: 0
+when [false [x: missingName] true [x: 2] true [x: 3]]
+print x
+print when [false [7] true [8]]
+print when [true [9] true [missingName]]
+
+classify: function [n][
+    when [
+        n < 0 ["negative"]
+        n = 0 ["zero"]
+        true ["positive"]
+    ]
+]
+print classify neg 1
+print classify 0
+print classify 2

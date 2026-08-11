@@ -1,0 +1,34 @@
+; reciprocal trigonometry and scalar bit/logical operations
+print sec 0
+print sech 0
+print csec 1.5707963267948966
+print csech 1
+print ctan 0.7853981633974483
+print ctanh 1
+print asec 1
+print asech 1
+print acsec 1
+print acsech 1
+print actan 1
+print atan2 1 1
+print gamma 5
+
+print and 6 3
+print or 4 1
+print not 5
+print nand 6 3
+print nor 4 1
+print xor 6 3
+print xnor 6 3
+print shl 3 2
+print shr 12 2
+print nand? true true
+print nor? false false
+print xor? true false
+print xnor? true true
+
+x: 6
+and 'x 3
+print x
+shl 'x 2
+print x

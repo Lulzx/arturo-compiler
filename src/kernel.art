@@ -24,6 +24,7 @@ import ./"front.art"
 ; return-signal holder (single-threaded; reset per call)
 ;-----------------------------------------------
 RET: #[set: false value: null]
+LOOP_SIGNAL: #[break: false continue: false]
 
 ;-----------------------------------------------
 ; Truthiness: false and null are falsy
@@ -51,6 +52,19 @@ define: function [env name value][
             ]
             target: target\parent
         ]
+    ]
+    env\bindings\[name]: value
+    value
+]
+
+letBind: function [env name value][
+    target: env
+    while [not? null? target][
+        if key? target\bindings name [
+            target\bindings\[name]: value
+            return value
+        ]
+        target: target\parent
     ]
     env\bindings\[name]: value
     value
@@ -100,12 +114,13 @@ delegate: function [name argVals][
         if isNode v -> return #[nodek: "error" msg: ["cannot delegate internal value" v\nodek]]
         if isIR v -> return #[nodek: "error" msg: ["cannot delegate IR value"]]
     ]
-    blk: @[]
-    el0: to :block name
-    if not? empty? el0 -> addItem blk el0\0
-    loop argVals [v][ addItem blk v ]
     r: null
-    err: try [r: do blk]
+    ; `do [callee arg...]` is not a safe donation boundary once an evaluated
+    ; argument is itself a language token: a :word/:label/:path in that block
+    ; is interpreted again as source. `call` accepts an evaluated argument
+    ; block and therefore preserves every value kind. A literal names the host
+    ; function without invoking it while the call is being assembled.
+    err: try [r: call (to :literal name) argVals]
     if :error = type err -> return #[nodek: "error" msg: err]
     r
 ]
@@ -131,7 +146,13 @@ delegate: function [name argVals][
 ; a `:literal` and is ambiguous — `get d 'tag` passes one as a
 ; key — so those still go through as values.
 ;-----------------------------------------------
-isPathRef: function [v][ :pathliteral = type v ]
+isPathRef: function [v][
+    if :pathliteral = type v -> return true
+    ; For an intrinsic known to mutate, a bare literal (`'x`) is the
+    ; one-segment reference to x. Non-mutating calls never enter the reference
+    ; route, so ordinary literal keys remain ordinary values.
+    :literal = type v
+]
 
 hasPathRef: function [argVals][
     found: false
@@ -160,7 +181,10 @@ delegateThroughRef: function [env name argVals][
         ]
         j: j + 1
     ]
-    parts: to :block argVals\[refAt]
+    refValue: argVals\[refAt]
+    parts: @[]
+    if :literal = type refValue -> addItem parts refValue
+    if :literal <> type refValue -> parts: to :block refValue
     baseName: to :string parts\0
     if not? bound? env baseName -> return #[nodek: "error" msg: ["unbound path reference" baseName]]
 
@@ -219,6 +243,8 @@ evalSeq: function [env seq][
     loop seq [el][
         result: evalNode env el :interpret
         if RET\set -> break
+        if LOOP_SIGNAL\break -> break
+        if LOOP_SIGNAL\continue -> break
     ]
     result
 ]
@@ -231,6 +257,9 @@ evalBody: function [env node][
 ]
 
 loadRule: function [env name][
+    if "true" = name -> return true
+    if "false" = name -> return false
+    if "null" = name -> return null
     ; The host resolves builtin words to the builtin, never
     ; to a user function of the same name (verified: a user
     ; `add` does not shadow the builtin `add`). So builtins
@@ -244,6 +273,11 @@ evalDefine: function [env node][
     value: evalNode env node\args\0 :interpret
     define env node\name value
     value
+]
+
+evalLet: function [env argv][
+    value: evalNode env argv\1 :interpret
+    letBind env (to :string argv\0) value
 ]
 
 evalReturn: function [env valNode][
@@ -261,6 +295,29 @@ evalIf: function [env condNode yesNode][
     null
 ]
 
+evalUnless: function [env condNode actionNode][
+    cond: evalNode env condNode :interpret
+    if not? truthy cond -> return evalBody env actionNode
+    null
+]
+
+evalSwitch: function [env condNode yesNode noNode][
+    cond: evalNode env condNode :interpret
+    if truthy cond -> return evalBody env yesNode
+    evalBody env noNode
+]
+
+evalWhen: function [env casesNode][
+    cases: lowerBlock casesNode
+    j: 0
+    while [(j + 1) < size cases][
+        cond: evalNode env cases\[j] :interpret
+        if truthy cond -> return evalBody env cases\[j + 1]
+        j: j + 2
+    ]
+    null
+]
+
 ; The run behaviour of each construct, as a named helper. Each
 ; row's `run` column points at one (`function [env argv][ runIf
 ; env argv ]`) and runNode's construct dispatch calls the same
@@ -270,11 +327,272 @@ runFunction: function [env argv][
     #[nodek: "closure" params: argv\0 body: argv\1 ir: true env: env]
 ]
 
+runLet: function [env node][
+    value: runNode env node\expr
+    letBind env node\name value
+]
+
 runIf: function [env argv][
     cond: runNode env argv\0
     if truthy cond -> return runSeq env argv\1
     if not? null? argv\2 -> return runSeq env argv\2
     null
+]
+
+runUnless: function [env argv][
+    cond: runNode env argv\0
+    if not? truthy cond -> return runSeq env argv\1
+    null
+]
+
+runSwitch: function [env argv][
+    cond: runNode env argv\0
+    if truthy cond -> return runSeq env argv\1
+    runSeq env argv\2
+]
+
+runWhen: function [env argv][
+    j: 0
+    while [(j + 1) < size argv][
+        cond: runNode env argv\[j]
+        if truthy cond -> return runSeq env argv\[j + 1]
+        j: j + 2
+    ]
+    null
+]
+
+evalUsing: function [env valueNode bodyBlock][
+    value: evalNode env valueNode :interpret
+    child: newEnv env
+    define child "this" value
+    child\rebind: true
+    evalSeq child (lowerBlock bodyBlock)
+]
+
+runUsing: function [env argv][
+    value: runNode env argv\0
+    child: newEnv env
+    define child "this" value
+    child\rebind: true
+    runSeq child argv\1
+]
+
+evalTryBlock: function [env bodyBlock predicate][
+    result: null
+    caught: try [ result: evalSeq env (lowerBlock bodyBlock) ]
+    failed: :error = type caught
+    if isErrorNode result -> failed: true
+    if predicate -> return failed
+    if :error = type caught -> return caught
+    if isErrorNode result -> return result\msg
+    null
+]
+
+runTryBlock: function [env bodyIR predicate][
+    result: null
+    caught: try [ result: runSeq env bodyIR ]
+    failed: :error = type caught
+    if isErrorNode result -> failed: true
+    if predicate -> return failed
+    if :error = type caught -> return caught
+    if isErrorNode result -> return result\msg
+    null
+]
+
+evalThrow: function [env valueNode][
+    value: evalNode env valueNode :interpret
+    caught: try [ throw value ]
+    #[nodek: "error" msg: caught]
+]
+
+runThrow: function [env valueNode][
+    value: runNode env valueNode
+    caught: try [ throw value ]
+    #[nodek: "error" msg: caught]
+]
+
+evalErrorPredicate: function [env valueNode][
+    value: evalNode env valueNode :interpret
+    if isErrorNode value -> return true
+    :error = type value
+]
+
+runErrorPredicate: function [env valueNode][
+    value: runNode env valueNode
+    if isErrorNode value -> return true
+    :error = type value
+]
+
+evalEnsure: function [env conditionBlock][
+    condition: evalSeq env (lowerBlock conditionBlock)
+    if truthy condition -> return null
+    caught: try [ throw "assertion failed" ]
+    #[nodek: "error" msg: caught]
+]
+
+runEnsure: function [env conditionIR][
+    condition: runSeq env conditionIR
+    if truthy condition -> return null
+    caught: try [ throw "assertion failed" ]
+    #[nodek: "error" msg: caught]
+]
+
+collectionItems: function [coll][
+    out: @[]
+    if :dictionary = type coll [
+        loop coll [k v][ addItem out @[k v] ]
+        return out
+    ]
+    loop coll [v][ addItem out v ]
+    out
+]
+
+higherGroup: function [env coll params action mode][
+    vals: collectionItems coll
+    keys: @[]
+    groups: @[]
+    gathered: #[]
+    j: 0
+    loop vals [item][
+        iterVals: @[item]
+        if :dictionary = type coll -> iterVals: item
+        child: loopFrame env params iterVals
+        groupKey: evalSeq child (lowerBlock action)
+        found: neg 1
+        if "chunk" = mode [
+            if 0 < size keys [
+                lastAt: dec size keys
+                if same? keys\[lastAt] groupKey -> found: lastAt
+            ]
+        ]
+        if "chunk" <> mode [
+            k: 0
+            loop keys [known][
+                if and? (0 > found) [same? known groupKey] -> found: k
+                k: k + 1
+            ]
+        ]
+        if 0 > found [
+            addItem keys groupKey
+            addItem groups @[]
+            found: dec size groups
+        ]
+        group: groups\[found]
+        addItem group item
+        set groups found group
+        if "gather" = mode -> set gathered groupKey group
+        j: j + 1
+    ]
+    if "gather" = mode -> return gathered
+    groups
+]
+
+higherApply: function [env coll params action mode][
+    vals: collectionItems coll
+    out: @[]
+    keys: @[]
+    count: 0
+    bestSet: false
+    bestItem: null
+    bestKey: null
+    j: 0
+    while [j < size vals][
+        item: vals\[j]
+        iterVals: @[item]
+        if :dictionary = type coll -> iterVals: item
+        child: loopFrame env params iterVals
+        result: evalSeq child (lowerBlock action)
+        if "map" = mode -> addItem out result
+        if "select" = mode -> if truthy result -> addItem out item
+        if "filter" = mode -> if not? truthy result -> addItem out item
+        if "every?" = mode -> if not? truthy result -> return false
+        if "some?" = mode -> if truthy result -> return true
+        if "enumerate" = mode -> if truthy result -> count: count + 1
+        if or? ("maximum" = mode) ["minimum" = mode] [
+            replaceBest: not? bestSet
+            if bestSet [
+                order: compare result bestKey
+                if "maximum" = mode -> replaceBest: 0 < order
+                if "minimum" = mode -> replaceBest: 0 > order
+            ]
+            if replaceBest [
+                bestSet: true
+                bestItem: item
+                bestKey: result
+            ]
+        ]
+        if "arrange" = mode [
+            at: size keys
+            k: 0
+            while [k < size keys][
+                if 0 > compare result keys\[k] [
+                    at: k
+                    k: size keys
+                ]
+                k: k + 1
+            ]
+            insert 'keys at result
+            insert 'out at item
+        ]
+        j: j + 1
+    ]
+    if "every?" = mode -> return true
+    if "some?" = mode -> return false
+    if "enumerate" = mode -> return count
+    if or? ("maximum" = mode) ["minimum" = mode] -> return bestItem
+    out
+]
+
+evalHigher: function [env argv mode][
+    coll: evalNode env argv\0 :interpret
+    if or? ("chunk" = mode) [or? ("cluster" = mode) ["gather" = mode]] [
+        return higherGroup env coll argv\1 argv\2 mode
+    ]
+    higherApply env coll argv\1 argv\2 mode
+]
+
+runHigher: function [env argv mode][
+    coll: runNode env argv\0
+    params: runNode env argv\1
+    action: runNode env argv\2
+    if or? ("chunk" = mode) [or? ("cluster" = mode) ["gather" = mode]] [
+        return higherGroup env coll params action mode
+    ]
+    higherApply env coll params action mode
+]
+
+emitHigher: function [env argv name][
+    collIR: emitNode env argv\0
+    paramsIR: emitNode env argv\1
+    actionIR: emitNode env argv\2
+    #[op: "call" fn: #[op: "intrinsic" name: name] args: @[collIR paramsIR actionIR]]
+]
+
+logicalAggregate: function [values mode][
+    stats: tally values
+    if "all?" = mode [
+        answer: empty? values
+        if key? stats true [ answer: (get stats true) = size values ]
+        return answer
+    ]
+    key? stats true
+]
+
+evalLogicalAggregate: function [env argv mode][
+    values: evalNode env argv\0 :interpret
+    logicalAggregate values mode
+]
+
+runLogicalAggregate: function [env argv mode][
+    values: runNode env argv\0
+    logicalAggregate values mode
+]
+
+emitLogicalAggregate: function [env argv name][
+    valuesIR: emitNode env argv\0
+    ; Keep native emission as an ordinary builtin call. runCall still finds
+    ; this rule by its intrinsic callee and uses the explicit run behavior.
+    #[op: "call" fn: #[op: "intrinsic" name: name] args: @[valuesIR]]
 ]
 
 runDo: function [env argv][
@@ -301,7 +619,10 @@ runWhile: function [env argv][
         if not? truthy cond -> break
         runSeq env argv\1
         if RET\set -> break
+        if LOOP_SIGNAL\break -> break
+        if LOOP_SIGNAL\continue -> LOOP_SIGNAL\continue: false
     ]
+    LOOP_SIGNAL\break: false
     if RET\set -> return RET\value
     null
 ]
@@ -310,10 +631,13 @@ runUntil: function [env argv][
     while [true][
         runSeq env argv\0
         if RET\set -> break
+        if LOOP_SIGNAL\break -> break
+        if LOOP_SIGNAL\continue -> LOOP_SIGNAL\continue: false
         cond: runSeq env argv\1
         if RET\set -> break
         if truthy cond -> break
     ]
+    LOOP_SIGNAL\break: false
     if RET\set -> return RET\value
     null
 ]
@@ -325,7 +649,10 @@ evalWhile: function [env condBlock actionBlock][
         if not? truthy cond -> break
         evalSeq env (lowerBlock actionBlock)
         if RET\set -> break
+        if LOOP_SIGNAL\break -> break
+        if LOOP_SIGNAL\continue -> LOOP_SIGNAL\continue: false
     ]
+    LOOP_SIGNAL\break: false
     if RET\set -> return RET\value
     null
 ]
@@ -334,10 +661,13 @@ evalUntil: function [env actionBlock condBlock][
     while [true][
         evalSeq env (lowerBlock actionBlock)
         if RET\set -> break
+        if LOOP_SIGNAL\break -> break
+        if LOOP_SIGNAL\continue -> LOOP_SIGNAL\continue: false
         cond: evalSeq env (lowerBlock condBlock)
         if RET\set -> break
         if truthy cond -> break
     ]
+    LOOP_SIGNAL\break: false
     if RET\set -> return RET\value
     null
 ]
@@ -348,10 +678,15 @@ evalUntil: function [env actionBlock condBlock][
 ; capable of resolving kernel closures through the parent chain.
 loopFrame: function [env params boundVals][
     child: newEnv env
-    j: 0
-    loop params [p][
-        if j < size boundVals -> define child (to :string p) boundVals\[j]
-        j: j + 1
+    if :block = type params [
+        j: 0
+        loop params [p][
+            if j < size boundVals -> define child (to :string p) boundVals\[j]
+            j: j + 1
+        ]
+    ]
+    if :block <> type params [
+        if 0 < size boundVals -> define child (to :string params) boundVals\0
     ]
     child\rebind: true
     child
@@ -367,7 +702,10 @@ evalLoop: function [env collectionNode params actionBlock][
             child: loopFrame env params iterVals
             evalSeq child (lowerBlock actionBlock)
             if RET\set -> break
+            if LOOP_SIGNAL\break -> break
+            if LOOP_SIGNAL\continue -> LOOP_SIGNAL\continue: false
         ]
+        LOOP_SIGNAL\break: false
         if RET\set -> return RET\value
         return null
     ]
@@ -377,7 +715,10 @@ evalLoop: function [env collectionNode params actionBlock][
         child: loopFrame env params iterVals
         evalSeq child (lowerBlock actionBlock)
         if RET\set -> break
+        if LOOP_SIGNAL\break -> break
+        if LOOP_SIGNAL\continue -> LOOP_SIGNAL\continue: false
     ]
+    LOOP_SIGNAL\break: false
     if RET\set -> return RET\value
     null
 ]
@@ -393,7 +734,10 @@ runLoop: function [env argv][
             child: loopFrame env params iterVals
             runSeq child argv\2
             if RET\set -> break
+            if LOOP_SIGNAL\break -> break
+            if LOOP_SIGNAL\continue -> LOOP_SIGNAL\continue: false
         ]
+        LOOP_SIGNAL\break: false
         if RET\set -> return RET\value
         return null
     ]
@@ -403,7 +747,10 @@ runLoop: function [env argv][
         child: loopFrame env params iterVals
         runSeq child argv\2
         if RET\set -> break
+        if LOOP_SIGNAL\break -> break
+        if LOOP_SIGNAL\continue -> LOOP_SIGNAL\continue: false
     ]
+    LOOP_SIGNAL\break: false
     if RET\set -> return RET\value
     null
 ]
@@ -474,7 +821,13 @@ applyVal: function [env fnVal argVals][
     if and? (isNode fnVal) [not? null? fnVal\nodek] [
         if "closure" = fnVal\nodek -> return applyClosure fnVal argVals
         if "hostword" = fnVal\nodek [
-            if hasPathRef argVals -> return delegateThroughRef env fnVal\name argVals
+            ; A pathliteral is a reference only for an intrinsic declared to
+            ; mutate through that argument. Predicates/conversions must receive
+            ; it as an ordinary value (`pathLiteral? 'a\b`), not trigger the
+            ; write-back shim.
+            if and? (mutatesThroughRef? fnVal\name) [hasPathRef argVals] [
+                return delegateThroughRef env fnVal\name argVals
+            ]
             return delegate fnVal\name argVals
         ]
     ]
@@ -564,7 +917,14 @@ evalNode: function [env node mode][
 
 evalInterpret: function [env node][
     if and? (isNode node) ["load" = node\nodek] -> return evalLoad env node
-    if and? (isNode node) ["intrinsic" = node\nodek] -> return #[nodek: "hostword" name: node\name]
+    if and? (isNode node) ["intrinsic" = node\nodek] [
+        if "break" = node\name [ LOOP_SIGNAL\break: true  return null ]
+        if "continue" = node\name [ LOOP_SIGNAL\continue: true  return null ]
+        if "true" = node\name -> return true
+        if "false" = node\name -> return false
+        if "null" = node\name -> return null
+        return #[nodek: "hostword" name: node\name]
+    ]
     if and? (isNode node) ["define" = node\nodek] -> return evalDefine env node
     if and? (isNode node) ["call" = node\nodek] -> return evalCall env node
     if and? (isNode node) ["blockval" = node\nodek] [
@@ -584,7 +944,10 @@ evalLoad: function [env node][
 ]
 
 evalWord: function [env node][
-    loadRule env (to :string node)
+    name: to :string node
+    if "break" = name [ LOOP_SIGNAL\break: true  return null ]
+    if "continue" = name [ LOOP_SIGNAL\continue: true  return null ]
+    loadRule env name
 ]
 
 evalInline: function [env node][
@@ -599,6 +962,8 @@ runSeq: function [env seq][
     loop seq [el][
         result: runNode env el
         if RET\set -> break
+        if LOOP_SIGNAL\break -> break
+        if LOOP_SIGNAL\continue -> break
     ]
     result
 ]
@@ -608,12 +973,20 @@ runNode: function [env node][
     op: node\op
     if "const" = op -> return node\value
     if "load" = op -> return loadRule env node\name
-    if "intrinsic" = op -> return #[nodek: "hostword" name: node\name]
+    if "intrinsic" = op [
+        if "true" = node\name -> return true
+        if "false" = node\name -> return false
+        if "null" = node\name -> return null
+        return #[nodek: "hostword" name: node\name]
+    ]
+    if "break" = op [ LOOP_SIGNAL\break: true  return null ]
+    if "continue" = op [ LOOP_SIGNAL\continue: true  return null ]
     if "define" = op [
         value: runNode env node\expr
         define env node\name value
         return value
     ]
+    if "let" = op -> return runLet env node
     if "block" = op [
         out: @[]
         loop node\items [it][
@@ -631,6 +1004,13 @@ runNode: function [env node][
     ; the value stack and a deeper runCall loses its `argVals`.
     if "function" = op -> return runFunction env node\args
     if "if" = op -> return runIf env node\args
+    if "unless" = op -> return runUnless env node\args
+    if "switch" = op -> return runSwitch env node\args
+    if "when" = op -> return runWhen env node\args
+    if "using" = op -> return runUsing env node\args
+    if "try" = op -> return runTryBlock env node\args\0 false
+    if "throws?" = op -> return runTryBlock env node\args\0 true
+    if "ensure" = op -> return runEnsure env node\args\0
     if "do" = op -> return runDo env node\args
     if "return" = op -> return runReturn env node\args
     if "while" = op -> return runWhile env node\args
@@ -662,6 +1042,8 @@ runCall: function [env node][
 resetRET: function [][
     RET\set: false
     RET\value: null
+    LOOP_SIGNAL\break: false
+    LOOP_SIGNAL\continue: false
 ]
 
 ; interpret a source string with the kernel (interpret mode)
@@ -739,6 +1121,31 @@ defRule "function" #[
     run:  function [env argv][ runFunction env argv ]
 ]
 
+defRule "let" #[
+    eval: function [env argv][ evalLet env argv ]
+    emit: function [env argv][
+        valueIR: emitNode env argv\1
+        #[op: "let" name: to :string argv\0 expr: valueIR]
+    ]
+    run: function [env argv][
+        ; Calls dispatch here with a flat argument list only for call-shaped
+        ; rules. `let` emits its own op and runNode handles its named field.
+        null
+    ]
+]
+
+defRule "break" #[
+    eval: function [env argv][ LOOP_SIGNAL\break: true  null ]
+    emit: function [env argv][ #[op: "break" args: @[]] ]
+    run: function [env argv][ LOOP_SIGNAL\break: true  null ]
+]
+
+defRule "continue" #[
+    eval: function [env argv][ LOOP_SIGNAL\continue: true  null ]
+    emit: function [env argv][ #[op: "continue" args: @[]] ]
+    run: function [env argv][ LOOP_SIGNAL\continue: true  null ]
+]
+
 defRule "if" #[
     eval: function [env argv][ evalIf env argv\0 argv\1 ]
     emit: function [env argv][
@@ -748,6 +1155,182 @@ defRule "if" #[
         #[op: "if" args: @[condIR yesIR noIR]]
     ]
     run:  function [env argv][ runIf env argv ]
+]
+
+defRule "unless" #[
+    eval: function [env argv][ evalUnless env argv\0 argv\1 ]
+    emit: function [env argv][
+        condIR: emitNode env argv\0
+        actionIR: emitSeq env (lowerBlock argv\1)
+        #[op: "unless" args: @[condIR actionIR]]
+    ]
+    run: function [env argv][ runUnless env argv ]
+]
+
+defRule "switch" #[
+    eval: function [env argv][ evalSwitch env argv\0 argv\1 argv\2 ]
+    emit: function [env argv][
+        condIR: emitNode env argv\0
+        yesIR: emitSeq env (lowerBlock argv\1)
+        noIR: emitSeq env (lowerBlock argv\2)
+        #[op: "switch" args: @[condIR yesIR noIR]]
+    ]
+    run: function [env argv][ runSwitch env argv ]
+]
+
+defRule "when" #[
+    eval: function [env argv][ evalWhen env argv\0 ]
+    emit: function [env argv][
+        cases: lowerBlock argv\0
+        out: @[]
+        j: 0
+        while [(j + 1) < size cases][
+            addItem out (emitNode env cases\[j])
+            addItem out (emitSeq env (lowerBlock cases\[j + 1]))
+            j: j + 2
+        ]
+        #[op: "when" args: out]
+    ]
+    run: function [env argv][ runWhen env argv ]
+]
+
+defRule "using" #[
+    eval: function [env argv][ evalUsing env argv\0 argv\1 ]
+    emit: function [env argv][
+        valueIR: emitNode env argv\0
+        bodyIR: emitSeq env (lowerBlock argv\1)
+        #[op: "using" args: @[valueIR bodyIR]]
+    ]
+    run: function [env argv][ runUsing env argv ]
+]
+
+defRule "try" #[
+    eval: function [env argv][ evalTryBlock env argv\0 false ]
+    emit: function [env argv][
+        bodyIR: emitSeq env (lowerBlock argv\0)
+        #[op: "try" args: @[bodyIR]]
+    ]
+    run: function [env argv][ runTryBlock env argv\0 false ]
+]
+
+defRule "throws?" #[
+    eval: function [env argv][ evalTryBlock env argv\0 true ]
+    emit: function [env argv][
+        bodyIR: emitSeq env (lowerBlock argv\0)
+        #[op: "throws?" args: @[bodyIR]]
+    ]
+    run: function [env argv][ runTryBlock env argv\0 true ]
+]
+
+defRule "throw" #[
+    eval: function [env argv][ evalThrow env argv\0 ]
+    emit: function [env argv][
+        valueIR: emitNode env argv\0
+        #[op: "call" fn: #[op: "intrinsic" name: "throw"] args: @[valueIR]]
+    ]
+    run: function [env argv][ runThrow env argv\0 ]
+]
+
+defRule "error?" #[
+    eval: function [env argv][ evalErrorPredicate env argv\0 ]
+    emit: function [env argv][
+        valueIR: emitNode env argv\0
+        #[op: "call" fn: #[op: "intrinsic" name: "error?"] args: @[valueIR]]
+    ]
+    run: function [env argv][ runErrorPredicate env argv\0 ]
+]
+
+defRule "ensure" #[
+    eval: function [env argv][ evalEnsure env argv\0 ]
+    emit: function [env argv][
+        conditionIR: emitSeq env (lowerBlock argv\0)
+        #[op: "ensure" args: @[conditionIR]]
+    ]
+    run: function [env argv][ runEnsure env argv\0 ]
+]
+
+defRule "map" #[
+    eval: function [env argv][ evalHigher env argv "map" ]
+    emit: function [env argv][ emitHigher env argv "map" ]
+    run: function [env argv][ runHigher env argv "map" ]
+]
+
+defRule "select" #[
+    eval: function [env argv][ evalHigher env argv "select" ]
+    emit: function [env argv][ emitHigher env argv "select" ]
+    run: function [env argv][ runHigher env argv "select" ]
+]
+
+defRule "filter" #[
+    eval: function [env argv][ evalHigher env argv "filter" ]
+    emit: function [env argv][ emitHigher env argv "filter" ]
+    run: function [env argv][ runHigher env argv "filter" ]
+]
+
+defRule "every?" #[
+    eval: function [env argv][ evalHigher env argv "every?" ]
+    emit: function [env argv][ emitHigher env argv "every?" ]
+    run: function [env argv][ runHigher env argv "every?" ]
+]
+
+defRule "some?" #[
+    eval: function [env argv][ evalHigher env argv "some?" ]
+    emit: function [env argv][ emitHigher env argv "some?" ]
+    run: function [env argv][ runHigher env argv "some?" ]
+]
+
+defRule "chunk" #[
+    eval: function [env argv][ evalHigher env argv "chunk" ]
+    emit: function [env argv][ emitHigher env argv "chunk" ]
+    run: function [env argv][ runHigher env argv "chunk" ]
+]
+
+defRule "cluster" #[
+    eval: function [env argv][ evalHigher env argv "cluster" ]
+    emit: function [env argv][ emitHigher env argv "cluster" ]
+    run: function [env argv][ runHigher env argv "cluster" ]
+]
+
+defRule "gather" #[
+    eval: function [env argv][ evalHigher env argv "gather" ]
+    emit: function [env argv][ emitHigher env argv "gather" ]
+    run: function [env argv][ runHigher env argv "gather" ]
+]
+
+defRule "arrange" #[
+    eval: function [env argv][ evalHigher env argv "arrange" ]
+    emit: function [env argv][ emitHigher env argv "arrange" ]
+    run: function [env argv][ runHigher env argv "arrange" ]
+]
+
+defRule "enumerate" #[
+    eval: function [env argv][ evalHigher env argv "enumerate" ]
+    emit: function [env argv][ emitHigher env argv "enumerate" ]
+    run: function [env argv][ runHigher env argv "enumerate" ]
+]
+
+defRule "maximum" #[
+    eval: function [env argv][ evalHigher env argv "maximum" ]
+    emit: function [env argv][ emitHigher env argv "maximum" ]
+    run: function [env argv][ runHigher env argv "maximum" ]
+]
+
+defRule "minimum" #[
+    eval: function [env argv][ evalHigher env argv "minimum" ]
+    emit: function [env argv][ emitHigher env argv "minimum" ]
+    run: function [env argv][ runHigher env argv "minimum" ]
+]
+
+defRule "all?" #[
+    eval: function [env argv][ evalLogicalAggregate env argv "all?" ]
+    emit: function [env argv][ emitLogicalAggregate env argv "all?" ]
+    run: function [env argv][ runLogicalAggregate env argv "all?" ]
+]
+
+defRule "any?" #[
+    eval: function [env argv][ evalLogicalAggregate env argv "any?" ]
+    emit: function [env argv][ emitLogicalAggregate env argv "any?" ]
+    run: function [env argv][ runLogicalAggregate env argv "any?" ]
 ]
 
 defRule "do" #[

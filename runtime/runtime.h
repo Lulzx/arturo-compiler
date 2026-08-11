@@ -17,7 +17,8 @@ typedef enum {
     V_NULL, V_INT, V_FLOAT, V_STR, V_CHAR, V_BOOL,
     V_BLOCK, V_DICT, V_FUNC, V_BUILTIN, V_RANGE, V_PATH,
     V_WORD, V_LABEL, V_LITERAL, V_SYMBOL, V_TYPE, V_INLINE,
-    V_PATHLABEL, V_PATHLITERAL, V_REGEX, V_ATTRIBUTE, V_ATTRIBUTELABEL
+    V_PATHLABEL, V_PATHLITERAL, V_REGEX, V_ATTRIBUTE, V_ATTRIBUTELABEL,
+    V_ERROR
 } VKind;
 
 typedef struct Value Value;
@@ -66,6 +67,7 @@ Value v_float(double f);
 Value v_str(const char *s);          /* copies */
 Value v_char(char c);
 Value v_bool(int b);
+Value v_error(const char *message);
 Value v_block(Value **items, int n);
 Value v_dict(char **keys, Value *vals, int n);
 Value v_range(long lo, long hi);
@@ -79,6 +81,8 @@ Value v_func(IR *params, IR **body, int nbody, Env *closure);
 /* value access / printing */
 int  v_truthy(Value v);
 void v_print(Value v);               /* Arturo's `print`: value + newline */
+void rt_write_float(double f);        /* Arturo-compatible float text, no newline */
+void rt_print_float(double f);        /* Arturo-compatible float text + newline */
 
 /* ---- environments (frames with a parent chain) ----------------------- */
 struct Env { char **names; Value *vals; int n; Env *parent; int rebind_parent; };
@@ -107,6 +111,7 @@ IR *ir_load(const char *name);
 IR *ir_intrinsic(const char *name);
 IR *ir_word(const char *name);   /* bare word in value position: load-if-bound, else call zero-arity builtin */
 IR *ir_define(const char *name, IR *expr);
+IR *ir_let(const char *name, IR *expr);
 IR *ir_call(IR *fn, IR **args, int n);
 IR *ir_passthrough(Value src);
 IR *ir_block(IR **items, int n);

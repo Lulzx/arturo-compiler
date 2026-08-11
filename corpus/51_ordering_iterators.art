@@ -1,0 +1,9 @@
+; closure-aware ordering and aggregate iterators
+offset: 10
+print arrange [3 1 2] 'x [x + offset]
+print enumerate [1 2 3 4] 'x [even? x]
+print maximum [7 2 9 4] 'x [x]
+print minimum [7 2 9 4] 'x [x]
+print maximum [7 2 9 4] 'x [neg x]
+print arrange "cab" 'x [x]
+print enumerate 1..5 'x [x > 2]

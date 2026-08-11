@@ -1,0 +1,15 @@
+; lazy conditionals are compiler-owned so action blocks close over local frames
+x: 0
+unless false [x: x + 1]
+print x
+unless true [x: missingName]
+print x
+print switch true [7] [missingName]
+print switch false [missingName] [8]
+
+choose: function [flag base][
+    unless flag [base: base + 10]
+    switch flag [base + 1] [base + 2]
+]
+print choose true 5
+print choose false 5

@@ -1,0 +1,21 @@
+; scalar math and aggregate integer gcd
+; Use exact/easy points so the parity test checks semantics and float value
+; rendering without depending on platform-specific transcendental rounding.
+print round 2.6
+print round neg 2.6
+print sqrt 81
+print ln 1
+print log 8 2
+print sin 0
+print cos 0
+print tan 0
+print asin 0
+print acos 1
+print atan 0
+print sinh 0
+print cosh 0
+print tanh 0
+print asinh 0
+print acosh 1
+print atanh 0
+print gcd [18 24 30]

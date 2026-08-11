@@ -1,0 +1,14 @@
+; ensure evaluates its condition lazily in the current scope
+x: 1
+ok: try [ensure [x = 1]]
+print type ok
+print ok
+
+bad: try [ensure [x = 2]]
+print type bad
+print error? bad
+print throws? [ensure [false]]
+
+panicked: try [panic "stop"]
+print type panicked
+print error? panicked

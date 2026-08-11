@@ -14,7 +14,7 @@ check` proves behavior only for the checked-in corpus and compatibility cases.
 | Common arithmetic, collections, strings, predicates | Partial | Every declared runtime builtin needs positive, edge, and error parity tests |
 | Modules/imports | Unsupported by standalone target | Resolve/import dependencies at compile time and test multi-file packages |
 | Objects/classes/methods | Unsupported | Add value/runtime representation, dispatch, mutation, and inheritance tests |
-| Exceptions | Partial (`try` only) | Structured error values, stack traces, `try`/`except` parity, nonzero exits |
+| Exceptions | Partial (`try`, `throw`, `throws?`, `error?`, `ensure`, `panic`) | Stack traces, handler forms beyond `try`, uncaught-error parity, and stable nonzero exits |
 | Remaining Arturo value kinds | Partial | Represent and test quantities, dates, colors, regexes, binaries, stores, etc. |
 | I/O, networking, databases, GUI | Mostly unsupported | Either link the authoritative Arturo runtime or implement capability modules |
 | Diagnostics/tooling | Not production-grade | Source spans, filenames, actionable errors, stable exit codes, debug metadata |

@@ -1,0 +1,9 @@
+; strict logical aggregation (non-logical values do not count as true)
+print all? @[true true]
+print all? @[true false]
+print all? @[]
+print all? @[1 true]
+print any? @[false true]
+print any? @[false false]
+print any? @[]
+print any? @[1 true]

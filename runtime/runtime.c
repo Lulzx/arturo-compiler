@@ -18,9 +18,11 @@
  * instead of exiting when one is set. A linked stack of jmp_bufs lets nested
  * trys nest correctly. */
 static jmp_buf *g_try_jmp = NULL;
+static char g_last_error[512];
 static void die(const char *msg) {
-    fprintf(stderr, "runtime error: %s\n", msg);
+    snprintf(g_last_error,sizeof g_last_error,"%s",msg?msg:"runtime error");
     if (g_try_jmp) longjmp(*g_try_jmp, 1);
+    fprintf(stderr, "runtime error: %s\n", g_last_error);
     exit(1);
 }
 void rt_error(const char *msg) { die(msg); }
@@ -32,6 +34,7 @@ static void *xmalloc(size_t n) {
 }
 static char *seg_text(Value v);
 static Value v_block_cpy(Value **items, int n);
+static char *fstr(double f, char *out, size_t cap);
 static void *xrealloc(void *p, size_t n) {
     void *q = realloc(p, n);
     if (!q) { die("out of memory"); }
@@ -57,6 +60,7 @@ Value v_str(const char *s) {
     v.u.s = (char*)xmalloc(strlen(s)+1); strcpy(v.u.s, s);
     return v;
 }
+Value v_error(const char *s) { Value v=v_str(s?s:""); v.k=V_ERROR; return v; }
 Value v_block(Value **items, int n) {
     Value v; memset(&v,0,sizeof v); v.k=V_BLOCK;
     Block *b=(Block*)xmalloc(sizeof *b);
@@ -116,13 +120,23 @@ static void print_scalar(Value v) {
     switch (v.k) {
         case V_NULL:  printf("null"); break;
         case V_INT:   printf("%ld", v.u.i); break;
-        case V_FLOAT: printf("%g", v.u.f); break;
+        case V_FLOAT: {
+            char buf[128];
+            fputs(fstr(v.u.f, buf, sizeof buf), stdout);
+            break;
+        }
         case V_STR:   fwrite(v.u.s,1,strlen(v.u.s),stdout); break;
+        case V_ERROR: printf("Runtime Error: %s",v.u.s?v.u.s:""); break;
         case V_CHAR:  putchar(v.u.c); break;
         case V_BOOL:  printf(v.u.b ? "true" : "false"); break;
         case V_DICT:
-            printf("#[");
+            printf("[");
             for (int i=0;i<v.u.dict->n;i++){ if(i)printf(" "); printf("%s:",v.u.dict->keys[i]); print_scalar(v.u.dict->vals[i]); }
+            printf("]");
+            break;
+        case V_BLOCK:
+            printf("[");
+            for(int i=0;i<v.u.block.b->n;i++){if(i)printf(" ");print_scalar(*v.u.block.b->items[i]);}
             printf("]");
             break;
         case V_FUNC: printf("function"); break;
@@ -207,6 +221,17 @@ static void env_define_body(Env *e, const char *name, Value v) {
     else env_define_local(e, name, v);
 }
 
+/* `let 'x value` updates the nearest binding and creates a missing name in
+ * the current frame. This differs from a function-local label only when an
+ * outer binding already exists: `let` reaches it, while `x:` shadows it. */
+static void env_let(Env *e, const char *name, Value v) {
+    for (Env *f=e; f; f=f->parent) {
+        int i=env_find(f,name);
+        if(i>=0){ f->vals[i]=v; return; }
+    }
+    env_define_local(e,name,v);
+}
+
 /* ---- IR builders --------------------------------------------------------- */
 static IR *ir_new(const char *op) {
     IR *n=(IR*)xmalloc(sizeof *n); memset(n,0,sizeof *n); n->op=op; return n;
@@ -220,6 +245,7 @@ IR *ir_intrinsic(const char *name){ IR*n=ir_new("intrinsic"); n->name=name; retu
  * builtin (`args`, `break`) is called. */
 IR *ir_word(const char *name){ IR*n=ir_new("word"); n->name=name; return n; }
 IR *ir_define(const char *name, IR *expr){ IR*n=ir_new("define"); n->name=name; n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
+IR *ir_let(const char *name, IR *expr){ IR*n=ir_new("let"); n->name=name; n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
 IR *ir_call(IR *fn, IR **args, int n){ IR*x=ir_new("call"); x->fn=fn; x->args=args; x->nargs=n; return x; }
 IR *ir_passthrough(Value src){ IR*n=ir_new("passthrough"); n->v=src; return n; }
 IR *ir_block(IR **items, int n){ IR*x=ir_new("block"); x->args=items; x->nargs=n; return x; }
@@ -232,14 +258,19 @@ IR *ir_seq(IR **items, int n){ IR*x=ir_new("__seq"); x->args=items; x->nargs=n; 
 static int   rt_ret_set = 0;
 static Value rt_ret_val;
 static int   rt_brk_set = 0;   /* `break` inside a loop body */
+static int   rt_cont_set = 0;  /* `continue` inside a loop body */
 
 /* ---- apply a function value to evaluated args ----------------------------- */
 static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
-    if (fn.k==V_BUILTIN) {   /* a host builtin reached as a value */
+    if (fn.k==V_BUILTIN || fn.k==V_LITERAL || fn.k==V_WORD || fn.k==V_STR) {
+        /* Arturo's `call 'name args` resolves a literal function reference.
+         * The native `to :literal` compatibility path currently carries that
+         * name as a string-like value, so accept all equivalent name kinds. */
         Value out;
         if (rt_builtin(fn.u.s, caller, argv, n, &out)) return out;
         die("unknown builtin"); return v_null();
     }
+    if (fn.k!=V_FUNC) { die("cannot call non-function"); return v_null(); }
     Env *child = env_new(fn.u.fn.closure);
     IR *params = fn.u.fn.params;   /* a block of name words (IR) or NULL */
     if (params && params->op && !strcmp(params->op,"block")) {
@@ -277,10 +308,57 @@ static Value numf(double f){ return v_float(f); }
 static Value b_add(Env*e,Value*a,int n){ if(a[0].k==V_FLOAT||a[1].k==V_FLOAT)return numf(as_float(a[0])+as_float(a[1])); return num2(as_int(a[0])+as_int(a[1])); }
 static Value b_sub(Env*e,Value*a,int n){ if(a[0].k==V_FLOAT||a[1].k==V_FLOAT)return numf(as_float(a[0])-as_float(a[1])); return num2(as_int(a[0])-as_int(a[1])); }
 static Value b_mul(Env*e,Value*a,int n){ if(a[0].k==V_FLOAT||a[1].k==V_FLOAT)return numf(as_float(a[0])*as_float(a[1])); return num2(as_int(a[0])*as_int(a[1])); }
-static Value b_div(Env*e,Value*a,int n){ return num2(as_int(a[0])/as_int(a[1])); }
-static Value b_fdiv(Env*e,Value*a,int n){ return numf(as_float(a[0])/as_float(a[1])); }
-static Value b_mod(Env*e,Value*a,int n){ return num2(as_int(a[0])%as_int(a[1])); }
-static Value b_pow(Env*e,Value*a,int n){ return numf(pow(as_float(a[0]),as_float(a[1]))); }
+static Value b_div(Env*e,Value*a,int n){
+    long denominator=as_int(a[1]);
+    if(denominator==0)die("division by zero");
+    return num2(as_int(a[0])/denominator);
+}
+static Value b_fdiv(Env*e,Value*a,int n){
+    double denominator=as_float(a[1]);
+    if(denominator==0.0)die("division by zero");
+    return numf(as_float(a[0])/denominator);
+}
+static Value b_mod(Env*e,Value*a,int n){
+    long denominator=as_int(a[1]);
+    if(denominator==0)die("division by zero");
+    return num2(as_int(a[0])%denominator);
+}
+static long integer_gcd(long a,long b){
+    if(a<0)a=-a;if(b<0)b=-b;
+    while(b){long r=a%b;a=b;b=r;}return a?a:1;
+}
+static void floating_fraction(double value,long *numerator,long *denominator){
+    int negative=value<0.0;if(negative)value=-value;
+    long h0=0,h1=1,k0=1,k1=0;
+    double x=value;
+    for(int i=0;i<32;i++){
+        long whole=(long)floor(x);long h2=whole*h1+h0,k2=whole*k1+k0;
+        if(k2<=0||k2>1000000000L)break;
+        h0=h1;h1=h2;k0=k1;k1=k2;
+        double approximation=(double)h1/(double)k1;
+        if(fabs(approximation-value)<1e-12)break;
+        double remainder=x-(double)whole;if(remainder==0.0)break;x=1.0/remainder;
+    }
+    long divisor=integer_gcd(h1,k1);*numerator=(negative?-h1:h1)/divisor;*denominator=k1/divisor;
+}
+static Value b_numerator(Env*e,Value*a,int n){
+    if(a[0].k==V_INT)return a[0];
+    long numerator,denominator;floating_fraction(as_float(a[0]),&numerator,&denominator);
+    return v_int(numerator);
+}
+static Value b_denominator(Env*e,Value*a,int n){
+    if(a[0].k==V_INT)return v_int(1);
+    long numerator,denominator;floating_fraction(as_float(a[0]),&numerator,&denominator);
+    return v_int(denominator);
+}
+static Value b_pow(Env*e,Value*a,int n){
+    if(a[0].k==V_INT && a[1].k==V_INT && a[1].u.i>=0){
+        long base=a[0].u.i, exp=a[1].u.i, result=1;
+        while(exp){ if(exp&1) result*=base; exp>>=1; if(exp) base*=base; }
+        return v_int(result);
+    }
+    return numf(pow(as_float(a[0]),as_float(a[1])));
+}
 static Value b_neg(Env*e,Value*a,int n){ if(a[0].k==V_FLOAT)return numf(-a[0].u.f); return num2(-as_int(a[0])); }
 static Value b_inc(Env*e,Value*a,int n){ return num2(as_int(a[0])+1); }
 static Value b_dec(Env*e,Value*a,int n){ return num2(as_int(a[0])-1); }
@@ -313,6 +391,7 @@ static const char *type_name(Value v){
         case V_SYMBOL: return "symbol"; case V_TYPE: return "type"; case V_INLINE: return "inline";
         case V_PATHLABEL: return "pathlabel"; case V_PATHLITERAL: return "pathliteral"; case V_REGEX: return "regex";
         case V_ATTRIBUTE: return "attribute"; case V_ATTRIBUTELABEL: return "attributelabel";
+        case V_ERROR: return "error";
     }
     return "null";
 }
@@ -349,6 +428,36 @@ static Value b_odd(Env*e,Value*a,int n){ return v_bool(as_int(a[0]) % 2 != 0); }
 static Value b_positive(Env*e,Value*a,int n){ return v_bool(as_float(a[0]) > 0); }
 static Value b_negative(Env*e,Value*a,int n){ return v_bool(as_float(a[0]) < 0); }
 static Value b_zero(Env*e,Value*a,int n){ return v_bool(as_float(a[0]) == 0); }
+static Value b_round(Env*e,Value*a,int n){ return v_float(round(as_float(a[0]))); }
+static Value b_sqrt(Env*e,Value*a,int n){ return v_float(sqrt(as_float(a[0]))); }
+static Value b_ln(Env*e,Value*a,int n){ return v_float(log(as_float(a[0]))); }
+static Value b_log(Env*e,Value*a,int n){ return v_float(log(as_float(a[0])) / log(as_float(a[1]))); }
+static Value b_sin(Env*e,Value*a,int n){ return v_float(sin(as_float(a[0]))); }
+static Value b_cos(Env*e,Value*a,int n){ return v_float(cos(as_float(a[0]))); }
+static Value b_tan(Env*e,Value*a,int n){ return v_float(tan(as_float(a[0]))); }
+static Value b_asin(Env*e,Value*a,int n){ return v_float(asin(as_float(a[0]))); }
+static Value b_acos(Env*e,Value*a,int n){ return v_float(acos(as_float(a[0]))); }
+static Value b_atan(Env*e,Value*a,int n){ return v_float(atan(as_float(a[0]))); }
+static Value b_sinh(Env*e,Value*a,int n){ return v_float(sinh(as_float(a[0]))); }
+static Value b_cosh(Env*e,Value*a,int n){ return v_float(cosh(as_float(a[0]))); }
+static Value b_tanh(Env*e,Value*a,int n){ return v_float(tanh(as_float(a[0]))); }
+static Value b_asinh(Env*e,Value*a,int n){ return v_float(asinh(as_float(a[0]))); }
+static Value b_acosh(Env*e,Value*a,int n){ return v_float(acosh(as_float(a[0]))); }
+static Value b_atanh(Env*e,Value*a,int n){ return v_float(atanh(as_float(a[0]))); }
+
+static long gcd_pair(long a, long b){
+    a=labs(a); b=labs(b);
+    while(b){ long r=a%b; a=b; b=r; }
+    return a;
+}
+static Value b_gcd(Env*e,Value*a,int n){
+    if(a[0].k!=V_BLOCK) die("gcd: expected block");
+    Block *xs=a[0].u.block.b;
+    if(xs->n==0) return v_int(0);
+    long result=as_int(*xs->items[0]);
+    for(int i=1;i<xs->n;i++) result=gcd_pair(result,as_int(*xs->items[i]));
+    return v_int(labs(result));
+}
 
 static Value b_type_is(Env*e,Value*a,int n,VKind k){ return v_bool(a[0].k==k); }
 static Value b_blockp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_BLOCK); }
@@ -360,6 +469,18 @@ static Value b_logicalp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_BOOL); }
 static Value b_charp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_CHAR); }
 static Value b_functionp(Env*e,Value*a,int n){ return v_bool(a[0].k==V_FUNC || a[0].k==V_BUILTIN); }
 static Value b_rangep(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_RANGE); }
+static Value b_wordp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_WORD); }
+static Value b_labelp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_LABEL); }
+static Value b_literalp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_LITERAL); }
+static Value b_symbolp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_SYMBOL); }
+static Value b_typep(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_TYPE); }
+static Value b_inlinep(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_INLINE); }
+static Value b_pathp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_PATH); }
+static Value b_pathlabelp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_PATHLABEL); }
+static Value b_pathliteralp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_PATHLITERAL); }
+static Value b_regexp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_REGEX); }
+static Value b_attributep(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_ATTRIBUTE); }
+static Value b_attributelabelp(Env*e,Value*a,int n){ return b_type_is(e,a,n,V_ATTRIBUTELABEL); }
 static Value b_size(Env*e,Value*a,int n){
     Value v=a[0];
     if (v.k==V_BLOCK) return num2(v.u.block.b->n);
@@ -520,6 +641,25 @@ static Value b_range(Env*e,Value*a,int n){
 }
 static Value b_key(Env*e,Value*a,int n){
     return v_bool(dict_find(a[0], key_text(a[1]))>=0); }
+static int iterator_count(Value coll){
+    if(coll.k==V_BLOCK)return coll.u.block.b->n;
+    if(coll.k==V_STR)return (int)strlen(coll.u.s);
+    if(coll.k==V_RANGE)return (int)(labs(coll.u.range.hi-coll.u.range.lo)+1);
+    die("iterator: unsupported collection");return 0;
+}
+static Value iterator_item(Value coll,int i){
+    if(coll.k==V_BLOCK)return *coll.u.block.b->items[i];
+    if(coll.k==V_STR)return v_char(coll.u.s[i]);
+    long step=coll.u.range.hi<coll.u.range.lo?-1:1;
+    return v_int(coll.u.range.lo+step*i);
+}
+static int order_value(Value left,Value right){
+    if((left.k==V_INT||left.k==V_FLOAT)&&(right.k==V_INT||right.k==V_FLOAT)){
+        double x=as_float(left),y=as_float(right);return (x>y)-(x<y);
+    }
+    char*x=val_str(left),*y=val_str(right);int result=strcmp(x,y);
+    free(x);free(y);return (result>0)-(result<0);
+}
 static Value b_map(Env*e,Value*a,int n){
     Value coll=a[0], params=a[1], action=a[2];
     int cnt = coll.k==V_RANGE ? (int)(coll.u.range.hi-coll.u.range.lo+1) : coll.u.block.b->n;
@@ -540,6 +680,83 @@ static Value b_select(Env*e,Value*a,int n){
     }
     return v_block(items,m);
 }
+static Value b_filter(Env*e,Value*a,int n){
+    Value coll=a[0],params=a[1],pred=a[2];
+    int cnt=coll.k==V_RANGE?(int)(labs(coll.u.range.hi-coll.u.range.lo)+1):coll.u.block.b->n;
+    long step=coll.k==V_RANGE&&coll.u.range.hi<coll.u.range.lo?-1:1;
+    Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));int m=0;
+    for(int i=0;i<cnt;i++){Value el=coll.k==V_RANGE?v_int(coll.u.range.lo+step*i):*coll.u.block.b->items[i];if(!v_truthy(applyAction(e,params,pred,el))){items[m]=(Value*)xmalloc(sizeof(Value));*items[m++]=el;}}
+    return v_block(items,m);
+}
+static Value b_every(Env*e,Value*a,int n){
+    Value coll=a[0],params=a[1],pred=a[2];int cnt=coll.k==V_RANGE?(int)(labs(coll.u.range.hi-coll.u.range.lo)+1):coll.u.block.b->n;long step=coll.k==V_RANGE&&coll.u.range.hi<coll.u.range.lo?-1:1;
+    for(int i=0;i<cnt;i++){Value el=coll.k==V_RANGE?v_int(coll.u.range.lo+step*i):*coll.u.block.b->items[i];if(!v_truthy(applyAction(e,params,pred,el)))return v_bool(0);}return v_bool(1);
+}
+static Value b_some(Env*e,Value*a,int n){
+    Value coll=a[0],params=a[1],pred=a[2];int cnt=coll.k==V_RANGE?(int)(labs(coll.u.range.hi-coll.u.range.lo)+1):coll.u.block.b->n;long step=coll.k==V_RANGE&&coll.u.range.hi<coll.u.range.lo?-1:1;
+    for(int i=0;i<cnt;i++){Value el=coll.k==V_RANGE?v_int(coll.u.range.lo+step*i):*coll.u.block.b->items[i];if(v_truthy(applyAction(e,params,pred,el)))return v_bool(1);}return v_bool(0);
+}
+static Value b_grouped(Env*e,Value*a,int n,int mode){
+    Value coll=a[0],params=a[1],action=a[2];
+    if(coll.k!=V_BLOCK&&coll.k!=V_RANGE&&coll.k!=V_STR)die("grouping: unsupported collection");
+    int count=coll.k==V_BLOCK?coll.u.block.b->n:(coll.k==V_STR?(int)strlen(coll.u.s):(int)(labs(coll.u.range.hi-coll.u.range.lo)+1));
+    long step=coll.k==V_RANGE&&coll.u.range.hi<coll.u.range.lo?-1:1;
+    Value *keys=(Value*)xmalloc((size_t)(count?count:1)*sizeof(Value));
+    Value *groups=(Value*)xmalloc((size_t)(count?count:1)*sizeof(Value));
+    int used=0;
+    for(int i=0;i<count;i++){
+        Value el=coll.k==V_BLOCK?*coll.u.block.b->items[i]:(coll.k==V_STR?v_char(coll.u.s[i]):v_int(coll.u.range.lo+step*i));
+        Value key=applyAction(e,params,action,el); int found=-1;
+        if(mode==0){ if(used>0&&value_eq(keys[used-1],key))found=used-1; }
+        else for(int j=0;j<used;j++)if(value_eq(keys[j],key)){found=j;break;}
+        if(found<0){
+            found=used; keys[used]=key;
+            groups[used]=v_block((Value**)xmalloc(sizeof(Value*)),0); used++;
+        }
+        block_append(groups[found],el);
+    }
+    if(mode==2){
+        char **names=(char**)xmalloc((size_t)(used?used:1)*sizeof(char*));
+        Value *vals=(Value*)xmalloc((size_t)(used?used:1)*sizeof(Value));
+        for(int i=0;i<used;i++){names[i]=val_str(keys[i]);vals[i]=groups[i];}
+        free(keys);free(groups);return v_dict(names,vals,used);
+    }
+    Value **items=(Value**)xmalloc((size_t)(used?used:1)*sizeof(Value*));
+    for(int i=0;i<used;i++){items[i]=(Value*)xmalloc(sizeof(Value));*items[i]=groups[i];}
+    free(keys);free(groups);return v_block(items,used);
+}
+static Value b_chunk(Env*e,Value*a,int n){return b_grouped(e,a,n,0);}
+static Value b_cluster(Env*e,Value*a,int n){return b_grouped(e,a,n,1);}
+static Value b_gather(Env*e,Value*a,int n){return b_grouped(e,a,n,2);}
+static Value b_arrange(Env*e,Value*a,int n){
+    Value coll=a[0],params=a[1],action=a[2];int count=iterator_count(coll);
+    Value *keys=(Value*)xmalloc((size_t)(count?count:1)*sizeof(Value));
+    Value **items=(Value**)xmalloc((size_t)(count?count:1)*sizeof(Value*));int used=0;
+    for(int i=0;i<count;i++){
+        Value item=iterator_item(coll,i),key=applyAction(e,params,action,item);int at=used;
+        for(int j=0;j<used;j++)if(order_value(key,keys[j])<0){at=j;break;}
+        for(int j=used;j>at;j--){keys[j]=keys[j-1];items[j]=items[j-1];}
+        keys[at]=key;items[at]=(Value*)xmalloc(sizeof(Value));*items[at]=item;used++;
+    }
+    free(keys);return v_block(items,used);
+}
+static Value b_enumerate(Env*e,Value*a,int n){
+    Value coll=a[0];int count=iterator_count(coll),matched=0;
+    for(int i=0;i<count;i++)if(v_truthy(applyAction(e,a[1],a[2],iterator_item(coll,i))))matched++;
+    return v_int(matched);
+}
+static Value b_extreme(Env*e,Value*a,int n,int maximum){
+    Value coll=a[0],best=v_null(),best_key=v_null();int count=iterator_count(coll),set=0;
+    for(int i=0;i<count;i++){
+        Value item=iterator_item(coll,i),key=applyAction(e,a[1],a[2],item);
+        if(!set||(maximum?order_value(key,best_key)>0:order_value(key,best_key)<0)){
+            best=item;best_key=key;set=1;
+        }
+    }
+    return best;
+}
+static Value b_maximum(Env*e,Value*a,int n){return b_extreme(e,a,n,1);}
+static Value b_minimum(Env*e,Value*a,int n){return b_extreme(e,a,n,0);}
 static Value b_loop(Env*e,Value*a,int n){
     Value coll=a[0], params=a[1], body=a[2];
     rt_brk_set=0;
@@ -586,6 +803,7 @@ static Value b_loop(Env*e,Value*a,int n){
 /* `break` — exit the innermost loop. Sets a signal the enclosing while/until/
  * loop checks after each body evaluation. */
 static Value b_break(Env*e,Value*a,int n){ rt_brk_set=1; return v_null(); }
+static Value b_continue(Env*e,Value*a,int n){ rt_cont_set=1; return v_null(); }
 /* `null? x` — true iff x is null */
 static Value b_isNull(Env*e,Value*a,int n){ return v_bool(a[0].k==V_NULL); }
 /* `contains? coll x` — membership for a block, substring for a string */
@@ -623,18 +841,40 @@ static Value b_join(Env*e,Value*a,int n){
     }
     buf[len]=0; Value r=v_str(buf); free(buf); return r;
 }
-/* `try [blk]` — evaluate blk; on a runtime error return null instead of dying */
+/* `try [blk]` — success is null; failure is a first-class error value. */
 static Value b_try(Env*e,Value*a,int n){
     if (a[0].k!=V_BLOCK) return v_null();
     jmp_buf jb; jmp_buf *prev = g_try_jmp;
     g_try_jmp = &jb;
     if (setjmp(jb)==0){
-        Value r = evalSeq(e, a[0].u.block.b->items, a[0].u.block.b->n);
+        (void)evalSeq(e, a[0].u.block.b->items, a[0].u.block.b->n);
         g_try_jmp = prev;
-        return r;
+        return v_null();
     }
     g_try_jmp = prev;
-    return v_null();
+    return v_error(g_last_error);
+}
+static Value b_throw(Env*e,Value*a,int n){char *msg=val_str(a[0]);die(msg);free(msg);return v_null();}
+static Value b_throwsp(Env*e,Value*a,int n){
+    if(a[0].k!=V_BLOCK)return v_bool(0);
+    jmp_buf jb;jmp_buf *prev=g_try_jmp;g_try_jmp=&jb;
+    if(setjmp(jb)==0){(void)evalSeq(e,a[0].u.block.b->items,a[0].u.block.b->n);g_try_jmp=prev;return v_bool(0);}
+    g_try_jmp=prev;return v_bool(1);
+}
+static Value b_errorp(Env*e,Value*a,int n){return v_bool(a[0].k==V_ERROR);}
+static Value b_panic(Env*e,Value*a,int n){return b_throw(e,a,n);}
+static Value b_definedp(Env*e,Value*a,int n){
+    const char *name=IS_STRLIKE(a[0].k)?a[0].u.s:"";
+    if(name[0]==':')name++;
+    static const char *types[]={
+        "null","integer","floating","complex","rational","quantity",
+        "string","char","logical","block","inline","dictionary","object",
+        "function","method","type","error","errorkind","date","binary",
+        "bytecode","regex","color","database","socket","future","store",
+        "module","range","word","literal","label","symbol","symbolliteral",
+        "path","pathliteral","pathlabel","attribute","attributelabel",NULL};
+    for(int i=0;types[i];i++)if(!strcmp(name,types[i]))return v_bool(1);
+    return v_bool(0);
 }
 /* `do block` inside a stored action block. Delegate uses this under `try` to
  * invoke a dynamically assembled builtin call during constant folding. */
@@ -763,6 +1003,8 @@ static Value b_call(Env*e,Value*a,int n){
  * round-trip digits and always at least one fractional digit (`0.0`,`3.5`,
  * `15000000000.0`,`0.00001`). */
 static char *fstr(double f, char *out, size_t cap){
+    if(isnan(f)){ snprintf(out,cap,"nan"); return out; }
+    if(isinf(f)){ snprintf(out,cap,"%s",signbit(f)?"-∞":"∞"); return out; }
     if (f == (double)(long)f) {
         snprintf(out, cap, "%.0f", f);
         size_t l=strlen(out); if(l+2<cap){ out[l]='.'; out[l+1]='0'; out[l+2]=0; }
@@ -807,6 +1049,14 @@ static char *fstr(double f, char *out, size_t cap){
     if(!strchr(out,'.')){ size_t l=strlen(out); out[l]='.'; out[l+1]='0'; out[l+2]=0; }
     return out;
 }
+void rt_write_float(double f){
+    char buf[128];
+    fputs(fstr(f,buf,sizeof buf),stdout);
+}
+void rt_print_float(double f){
+    rt_write_float(f);
+    putchar('\n');
+}
 
 /* render a value as a C string (Arturo's `to :string`). */
 static char *val_str(Value v){
@@ -820,6 +1070,7 @@ static char *val_str(Value v){
         case V_NULL:   return strdup("null");
         case V_FUNC:   return strdup("function");
         case V_BUILTIN:return strdup(v.u.s);
+        case V_ERROR:  return strdup(v.u.s?v.u.s:"");
         case V_RANGE:  snprintf(b,64,"%ld..%ld",v.u.range.lo,v.u.range.hi); return strdup(b);
         case V_BLOCK: {
             /* host `to :string` of a block wraps the elements in brackets */
@@ -834,7 +1085,7 @@ static char *val_str(Value v){
         }
         case V_DICT: {
             size_t cap=32, len=0; char *out=xmalloc(cap); out[0]=0;
-            strcpy(out,"#["); len=2;
+            strcpy(out,"["); len=1;
             for(int i=0;i<v.u.dict->n;i++){
                 char *s=val_str(v.u.dict->vals[i]);
                 size_t need=len+strlen(v.u.dict->keys[i])+1+strlen(s)+1+1;
@@ -954,6 +1205,525 @@ static Value v_block_cpy(Value **items, int n){
     Value **it=(Value**)xmalloc(n*sizeof(Value*));
     for(int i=0;i<n;i++){ it[i]=(Value*)xmalloc(sizeof(Value)); it[i][0]=items[i][0]; }
     return v_block(it,n);
+}
+
+/* ---- scalar/text/token predicates --------------------------------------- */
+static Value b_truep(Env*e,Value*a,int n){ return v_bool(a[0].k==V_BOOL && a[0].u.b); }
+static Value b_falsep(Env*e,Value*a,int n){ return v_bool(a[0].k==V_BOOL && !a[0].u.b); }
+static Value b_onep(Env*e,Value*a,int n){
+    Value v=a[0];
+    if(v.k==V_INT) return v_bool(v.u.i==1);
+    if(v.k==V_FLOAT) return v_bool(v.u.f==1.0);
+    if(v.k==V_STR) return v_bool(strlen(v.u.s)==1);
+    if(v.k==V_BLOCK) return v_bool(v.u.block.b->n==1);
+    if(v.k==V_DICT) return v_bool(v.u.dict->n==1);
+    if(v.k==V_RANGE) return v_bool(labs(v.u.range.hi-v.u.range.lo)+1==1);
+    return v_bool(0);
+}
+static Value b_asciip(Env*e,Value*a,int n){
+    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? (char[]){a[0].u.c,0} : a[0].u.s);
+    for(;*s;s++) if(*s>127) return v_bool(0);
+    return v_bool(1);
+}
+static Value b_whitespacep(Env*e,Value*a,int n){
+    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? (char[]){a[0].u.c,0} : a[0].u.s);
+    if(!*s) return v_bool(0);
+    for(;*s;s++) if(!isspace(*s)) return v_bool(0);
+    return v_bool(1);
+}
+static Value b_lowerp(Env*e,Value*a,int n){
+    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? (char[]){a[0].u.c,0} : a[0].u.s);
+    for(;*s;s++) if(!islower(*s)) return v_bool(0);
+    return v_bool(1);
+}
+static Value b_upperp(Env*e,Value*a,int n){
+    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? (char[]){a[0].u.c,0} : a[0].u.s);
+    for(;*s;s++) if(!isupper(*s)) return v_bool(0);
+    return v_bool(1);
+}
+static Value b_numericp(Env*e,Value*a,int n){
+    char buf[2]={0,0}; const char *s;
+    if(a[0].k==V_CHAR){ buf[0]=a[0].u.c; s=buf; } else s=a[0].u.s;
+    if(!s || !*s) return v_bool(0);
+    char *end=NULL; (void)strtod(s,&end);
+    return v_bool(end && end!=s && *end=='\0');
+}
+static Value b_prefixp(Env*e,Value*a,int n){
+    size_t p=strlen(a[1].u.s); return v_bool(!strncmp(a[0].u.s,a[1].u.s,p));
+}
+static Value b_suffixp(Env*e,Value*a,int n){
+    size_t s=strlen(a[0].u.s), p=strlen(a[1].u.s);
+    return v_bool(p<=s && !memcmp(a[0].u.s+s-p,a[1].u.s,p));
+}
+static Value b_betweenp(Env*e,Value*a,int n){
+    if(a[0].k==V_STR && a[1].k==V_STR && a[2].k==V_STR)
+        return v_bool(strcmp(a[0].u.s,a[1].u.s)>=0 && strcmp(a[0].u.s,a[2].u.s)<=0);
+    double x=as_float(a[0]), lo=as_float(a[1]), hi=as_float(a[2]);
+    return v_bool(x>=lo && x<=hi);
+}
+static int value_same(Value a, Value b){
+    if(a.k!=b.k) return 0;
+    switch(a.k){
+        case V_NULL: return 1;
+        case V_INT: return a.u.i==b.u.i;
+        case V_FLOAT: return a.u.f==b.u.f;
+        case V_CHAR: return a.u.c==b.u.c;
+        case V_BOOL: return a.u.b==b.u.b;
+        case V_RANGE: return a.u.range.lo==b.u.range.lo && a.u.range.hi==b.u.range.hi;
+        case V_BLOCK:
+        case V_INLINE:
+            if(a.u.block.b->n!=b.u.block.b->n) return 0;
+            for(int i=0;i<a.u.block.b->n;i++) if(!value_same(*a.u.block.b->items[i],*b.u.block.b->items[i])) return 0;
+            return 1;
+        case V_DICT:
+            if(a.u.dict->n!=b.u.dict->n) return 0;
+            for(int i=0;i<a.u.dict->n;i++){
+                int j=dict_find(b,a.u.dict->keys[i]);
+                if(j<0 || !value_same(a.u.dict->vals[i],b.u.dict->vals[j])) return 0;
+            }
+            return 1;
+        case V_PATH:
+        case V_PATHLABEL:
+        case V_PATHLITERAL:
+            if(a.u.path.nsegs!=b.u.path.nsegs) return 0;
+            for(int i=0;i<a.u.path.nsegs;i++) if(strcmp(a.u.path.segs[i],b.u.path.segs[i])) return 0;
+            return 1;
+        case V_FUNC: return a.u.fn.body==b.u.fn.body && a.u.fn.closure==b.u.fn.closure;
+        default:
+            if(IS_STRLIKE(a.k) || a.k==V_REGEX || a.k==V_ATTRIBUTE || a.k==V_ATTRIBUTELABEL || a.k==V_BUILTIN)
+                return !strcmp(a.u.s?a.u.s:"",b.u.s?b.u.s:"");
+            return 0;
+    }
+}
+static Value b_samep(Env*e,Value*a,int n){ return v_bool(value_same(a[0],a[1])); }
+
+/* ---- aggregate and number-theory helpers -------------------------------- */
+static Block *numeric_block(Value v, const char *name){
+    if(v.k!=V_BLOCK){ die(name); return NULL; }
+    return v.u.block.b;
+}
+static Value b_allp(Env*e,Value*a,int n){
+    Block *xs=numeric_block(a[0],"all?: expected block");
+    for(int i=0;i<xs->n;i++) if(xs->items[i]->k!=V_BOOL || !xs->items[i]->u.b) return v_bool(0);
+    return v_bool(1);
+}
+static Value b_anyp(Env*e,Value*a,int n){
+    Block *xs=numeric_block(a[0],"any?: expected block");
+    for(int i=0;i<xs->n;i++) if(xs->items[i]->k==V_BOOL && xs->items[i]->u.b) return v_bool(1);
+    return v_bool(0);
+}
+static Value b_average(Env*e,Value*a,int n){
+    Block *xs=numeric_block(a[0],"average: expected block");
+    if(xs->n==0) die("average: empty block");
+    double sum=0.0; for(int i=0;i<xs->n;i++) sum+=as_float(*xs->items[i]);
+    return v_float(sum/(double)xs->n);
+}
+static Value b_clamp(Env*e,Value*a,int n){
+    Value x=a[0], lo, hi;
+    if(a[1].k==V_RANGE){ lo=v_int(a[1].u.range.lo); hi=v_int(a[1].u.range.hi); }
+    else {
+        Block *bounds=numeric_block(a[1],"clamp: expected range or block");
+        if(bounds->n<2) die("clamp: expected two bounds");
+        lo=*bounds->items[0]; hi=*bounds->items[1];
+    }
+    if(as_float(x)<as_float(lo)) return lo;
+    if(as_float(x)>as_float(hi)) return hi;
+    return x;
+}
+static Value b_exp(Env*e,Value*a,int n){ return v_float(exp(as_float(a[0]))); }
+static Value b_factorial(Env*e,Value*a,int n){
+    long x=as_int(a[0]); if(x<0) die("factorial: expected non-negative integer");
+    long r=1; for(long i=2;i<=x;i++) r*=i; return v_int(r);
+}
+static Value b_factors(Env*e,Value*a,int n){
+    long x=labs(as_int(a[0])); if(x==0) die("factors: zero has infinitely many factors");
+    int count=0; for(long i=1;i<=x/i;i++) if(x%i==0) count+=(i==x/i?1:2);
+    Value **items=(Value**)xmalloc((size_t)count*sizeof(Value*)); int at=0;
+    for(long i=1;i<=x;i++) if(x%i==0){ items[at]=(Value*)xmalloc(sizeof(Value)); *items[at++]=v_int(i); }
+    return v_block(items,count);
+}
+static Value b_hypot(Env*e,Value*a,int n){ return v_float(hypot(as_float(a[0]),as_float(a[1]))); }
+static Value b_lcm(Env*e,Value*a,int n){
+    Block *xs=numeric_block(a[0],"lcm: expected block");
+    if(xs->n==0) return v_int(1);
+    long r=labs(as_int(*xs->items[0]));
+    for(int i=1;i<xs->n;i++){ long x=labs(as_int(*xs->items[i])); r=(r==0||x==0)?0:labs((r/gcd_pair(r,x))*x); }
+    return v_int(r);
+}
+static int value_num_cmp(const void *pa,const void *pb){
+    const Value *a=(const Value*)pa,*b=(const Value*)pb;
+    double x=as_float(*a),y=as_float(*b); return (x>y)-(x<y);
+}
+static Value b_median(Env*e,Value*a,int n){
+    Block *xs=numeric_block(a[0],"median: expected block");
+    if(xs->n==0) die("median: empty block");
+    Value *copy=(Value*)xmalloc((size_t)xs->n*sizeof(Value));
+    for(int i=0;i<xs->n;i++) copy[i]=*xs->items[i];
+    qsort(copy,(size_t)xs->n,sizeof(Value),value_num_cmp);
+    Value r;
+    if(xs->n&1) r=copy[xs->n/2];
+    else r=v_float((as_float(copy[xs->n/2-1])+as_float(copy[xs->n/2]))/2.0);
+    free(copy); return r;
+}
+static Value b_powmod(Env*e,Value*a,int n){
+    long base=as_int(a[0]), expn=as_int(a[1]), modn=as_int(a[2]);
+    if(expn<0 || modn==0) die("powmod: invalid exponent or modulus");
+    long result=1%modn; base%=modn;
+    while(expn){ if(expn&1) result=(long)(((__int128)result*base)%modn); expn>>=1; if(expn) base=(long)(((__int128)base*base)%modn); }
+    return v_int(result);
+}
+static Value b_primep(Env*e,Value*a,int n){
+    long x=as_int(a[0]); if(x<2) return v_bool(0); if(x%2==0) return v_bool(x==2);
+    for(long d=3;d<=x/d;d+=2) if(x%d==0) return v_bool(0);
+    return v_bool(1);
+}
+static double block_variance(Value v){
+    Block *xs=numeric_block(v,"variance: expected block");
+    double mean=0.0; for(int i=0;i<xs->n;i++) mean+=as_float(*xs->items[i]); mean/=xs->n;
+    double sum=0.0; for(int i=0;i<xs->n;i++){ double d=as_float(*xs->items[i])-mean; sum+=d*d; }
+    return sum/xs->n;
+}
+static Value b_variance(Env*e,Value*a,int n){ return v_float(block_variance(a[0])); }
+static Value b_deviation(Env*e,Value*a,int n){ return v_float(sqrt(block_variance(a[0]))); }
+static Value b_skewness(Env*e,Value*a,int n){
+    Block *xs=numeric_block(a[0],"skewness: expected block");
+    double mean=0.0; for(int i=0;i<xs->n;i++) mean+=as_float(*xs->items[i]); mean/=xs->n;
+    double m2=0.0,m3=0.0;
+    for(int i=0;i<xs->n;i++){
+        double d=as_float(*xs->items[i])-mean, d2=d*d;
+        m2+=d2; m3+=d2*d;
+    }
+    m2/=xs->n; m3/=xs->n;
+    return v_float(m3/pow(m2,1.5));
+}
+static Value b_kurtosis(Env*e,Value*a,int n){
+    Block *xs=numeric_block(a[0],"kurtosis: expected block");
+    double mean=0.0; for(int i=0;i<xs->n;i++) mean+=as_float(*xs->items[i]); mean/=xs->n;
+    double m2=0.0,m4=0.0;
+    for(int i=0;i<xs->n;i++){
+        double d=as_float(*xs->items[i])-mean, d2=d*d;
+        m2+=d2; m4+=d2*d2;
+    }
+    m2/=xs->n; m4/=xs->n;
+    return v_float(m4/(m2*m2)-3.0);
+}
+
+/* ---- collection construction and relations ------------------------------ */
+static Value b_digits(Env*e,Value*a,int n){
+    long x=labs(as_int(a[0])); long p=1; int count=1;
+    while(x/p>=10){ p*=10; count++; }
+    Value **items=(Value**)xmalloc((size_t)count*sizeof(Value*));
+    for(int i=0;i<count;i++){ items[i]=(Value*)xmalloc(sizeof(Value)); *items[i]=v_int((x/p)%10); p/=10; }
+    return v_block(items,count);
+}
+static Value b_couple(Env*e,Value*a,int n){
+    Block *x=numeric_block(a[0],"couple: expected block");
+    Block *y=numeric_block(a[1],"couple: expected block");
+    int count=x->n<y->n?x->n:y->n;
+    Value **items=(Value**)xmalloc((size_t)count*sizeof(Value*));
+    for(int i=0;i<count;i++){
+        Value **pair=(Value**)xmalloc(2*sizeof(Value*));
+        pair[0]=(Value*)xmalloc(sizeof(Value)); *pair[0]=*x->items[i];
+        pair[1]=(Value*)xmalloc(sizeof(Value)); *pair[1]=*y->items[i];
+        items[i]=(Value*)xmalloc(sizeof(Value)); *items[i]=v_block(pair,2);
+    }
+    return v_block(items,count);
+}
+static int ordered_pair(Value a,Value b){
+    if((a.k==V_INT||a.k==V_FLOAT) && (b.k==V_INT||b.k==V_FLOAT)) return as_float(a)<=as_float(b);
+    char *sa=val_str(a),*sb=val_str(b); int ok=strcmp(sa,sb)<=0; free(sa); free(sb); return ok;
+}
+static Value b_sortedp(Env*e,Value*a,int n){
+    Block *xs=numeric_block(a[0],"sorted?: expected block");
+    for(int i=1;i<xs->n;i++) if(!ordered_pair(*xs->items[i-1],*xs->items[i])) return v_bool(0);
+    return v_bool(1);
+}
+static Value b_tally(Env*e,Value*a,int n){
+    Value v=a[0]; int count=v.k==V_BLOCK?v.u.block.b->n:(v.k==V_STR?(int)strlen(v.u.s):-1);
+    if(count<0) die("tally: expected block or string");
+    char **keys=NULL; Value *vals=NULL; int used=0;
+    for(int i=0;i<count;i++){
+        Value item;
+        if(v.k==V_BLOCK) item=*v.u.block.b->items[i]; else item=v_str((char[]){v.u.s[i],0});
+        char *key=val_str(item); int found=-1;
+        for(int j=0;j<used;j++) if(!strcmp(keys[j],key)){ found=j; break; }
+        if(found>=0){ vals[found].u.i++; free(key); }
+        else {
+            keys=(char**)xrealloc(keys,(size_t)(used+1)*sizeof(char*));
+            vals=(Value*)xrealloc(vals,(size_t)(used+1)*sizeof(Value));
+            keys[used]=key; vals[used]=v_int(1); used++;
+        }
+    }
+    return v_dict(keys,vals,used);
+}
+static int block_contains_value(Block *xs,Value needle){
+    for(int i=0;i<xs->n;i++) if(value_eq(*xs->items[i],needle)) return 1;
+    return 0;
+}
+static Value b_disjointp(Env*e,Value*a,int n){
+    Block *x=numeric_block(a[0],"disjoint?: expected block"),*y=numeric_block(a[1],"disjoint?: expected block");
+    for(int i=0;i<x->n;i++) if(block_contains_value(y,*x->items[i])) return v_bool(0);
+    return v_bool(1);
+}
+static Value b_intersectp(Env*e,Value*a,int n){ Value r=b_disjointp(e,a,n); r.u.b=!r.u.b; return r; }
+static Value b_subsetp(Env*e,Value*a,int n){
+    Block *x=numeric_block(a[0],"subset?: expected block"),*y=numeric_block(a[1],"subset?: expected block");
+    for(int i=0;i<x->n;i++) if(!block_contains_value(y,*x->items[i])) return v_bool(0);
+    return v_bool(1);
+}
+static Value b_supersetp(Env*e,Value*a,int n){ Value rev[2]={a[1],a[0]}; return b_subsetp(e,rev,2); }
+
+static Value make_block_slice(Block *src, const int *indices, int count){
+    Value **items=(Value**)xmalloc((size_t)(count?count:1)*sizeof(Value*));
+    for(int i=0;i<count;i++){
+        items[i]=(Value*)xmalloc(sizeof(Value));
+        *items[i]=*src->items[indices[i]];
+    }
+    return v_block(items,count);
+}
+static Value b_permutate(Env*e,Value*a,int n);
+static void permutation_fill(Block *src,int depth,int *order,int *used,Value **out,int *at){
+    if(depth==src->n){
+        out[*at]=(Value*)xmalloc(sizeof(Value));
+        *out[(*at)++]=make_block_slice(src,order,src->n);
+        return;
+    }
+    for(int i=0;i<src->n;i++)if(!used[i]){
+        used[i]=1; order[depth]=i;
+        permutation_fill(src,depth+1,order,used,out,at);
+        used[i]=0;
+    }
+}
+static Value b_permutate(Env*e,Value*a,int n){
+    Block *src=numeric_block(a[0],"permutate: expected block");
+    size_t count=1; for(int i=2;i<=src->n;i++) count*=(size_t)i;
+    Value **items=(Value**)xmalloc((count?count:1)*sizeof(Value*));
+    int *order=(int*)xmalloc((size_t)(src->n?src->n:1)*sizeof(int));
+    int *used=(int*)xmalloc((size_t)(src->n?src->n:1)*sizeof(int));
+    memset(used,0,(size_t)(src->n?src->n:1)*sizeof(int));
+    int at=0; permutation_fill(src,0,order,used,items,&at); free(order); free(used);
+    return v_block(items,at);
+}
+
+/* ---- in-place collection/string transforms ------------------------------ */
+typedef struct { int kind; const char *var; Value container; int index; } MutTarget;
+static Value mut_load(Env *e, Value receiver, MutTarget *target){
+    memset(target,0,sizeof *target); target->index=-1;
+    if(receiver.k!=V_PATH) return receiver;
+    if(receiver.u.path.nsegs==1){
+        target->kind=1; target->var=receiver.u.path.segs[0];
+        return env_get(e,target->var);
+    }
+    target->kind=2;
+    if(path_target(e,receiver,&target->container,&target->index)<0) die("mutation path not found");
+    return target->container.u.dict->vals[target->index];
+}
+static void mut_store(Env *e, MutTarget *target, Value value){
+    if(target->kind==1) env_set(e,target->var,value);
+    else if(target->kind==2) target->container.u.dict->vals[target->index]=value;
+}
+static Value b_divmod(Env*e,Value*a,int n){
+    MutTarget target;Value left=mut_load(e,a[0],&target),quotient,remainder;
+    if(left.k==V_FLOAT||a[1].k==V_FLOAT){
+        double divisor=as_float(a[1]);if(divisor==0.0)die("division by zero");
+        quotient=v_float(as_float(left)/divisor);remainder=v_float(fmod(as_float(left),divisor));
+    }else{
+        long divisor=as_int(a[1]);if(divisor==0)die("division by zero");
+        quotient=v_int(as_int(left)/divisor);remainder=v_int(as_int(left)%divisor);
+    }
+    Value **items=(Value**)xmalloc(2*sizeof(Value*));
+    items[0]=(Value*)xmalloc(sizeof(Value));*items[0]=quotient;
+    items[1]=(Value*)xmalloc(sizeof(Value));*items[1]=remainder;
+    Value result=v_block(items,2);
+    if(target.kind){mut_store(e,&target,result);return v_null();}
+    return result;
+}
+static void block_replace(Block *dst, Value **items, int n){
+    dst->items=items; dst->n=n; dst->cap=n;
+}
+static Value b_powerset(Env*e,Value*a,int n){
+    MutTarget t; Value source=mut_load(e,a[0],&t);
+    if(source.k!=V_BLOCK)die("powerset: expected block");
+    Block *src=source.u.block.b;
+    if(src->n>62)die("powerset: input too large");
+    size_t count=(size_t)1u<<src->n;
+    Value **sets=(Value**)xmalloc(count*sizeof(Value*));
+    int *indices=(int*)xmalloc((size_t)(src->n?src->n:1)*sizeof(int));
+    for(size_t mask=0;mask<count;mask++){
+        int used=0; for(int i=0;i<src->n;i++)if(mask&((size_t)1u<<i))indices[used++]=i;
+        sets[mask]=(Value*)xmalloc(sizeof(Value));
+        *sets[mask]=make_block_slice(src,indices,used);
+    }
+    free(indices);
+    Value result=v_block(sets,(int)count);
+    if(t.kind){mut_store(e,&t,result);return v_null();}
+    return result;
+}
+static Value b_capitalize(Env*e,Value*a,int n){
+    MutTarget t; Value v=mut_load(e,a[0],&t); if(v.k!=V_STR) die("capitalize: expected string");
+    Value r=v_str(v.u.s); if(r.u.s[0]) r.u.s[0]=(char)toupper((unsigned char)r.u.s[0]); mut_store(e,&t,r); return v_null();
+}
+static Value b_chop(Env*e,Value*a,int n){
+    MutTarget t; Value v=mut_load(e,a[0],&t);
+    if(v.k==V_STR){ size_t len=strlen(v.u.s); char *s=(char*)xmalloc(len+1); memcpy(s,v.u.s,len+1); if(len)s[len-1]=0; Value r=v_str(s); free(s); mut_store(e,&t,r); return v_null(); }
+    if(v.k==V_BLOCK){ if(v.u.block.b->n)v.u.block.b->n--; return v_null(); }
+    die("chop: expected string or block"); return v_null();
+}
+static Value b_empty_value(Env*e,Value*a,int n){
+    MutTarget t; Value v=mut_load(e,a[0],&t);
+    if(v.k==V_STR){ Value r=v_str(""); mut_store(e,&t,r); return v_null(); }
+    if(v.k==V_BLOCK){ v.u.block.b->n=0; return v_null(); }
+    if(v.k==V_DICT){ v.u.dict->n=0; return v_null(); }
+    die("empty: unsupported value"); return v_null();
+}
+static void flatten_into(Block *src, Value ***out, int *n, int *cap){
+    for(int i=0;i<src->n;i++){
+        Value v=*src->items[i];
+        if(v.k==V_BLOCK) flatten_into(v.u.block.b,out,n,cap);
+        else { if(*n>=*cap){ *cap=*cap?*cap*2:8; *out=(Value**)xrealloc(*out,(size_t)*cap*sizeof(Value*)); } (*out)[*n]=(Value*)xmalloc(sizeof(Value)); *(*out)[(*n)++]=v; }
+    }
+}
+static Value b_flatten(Env*e,Value*a,int n){
+    MutTarget t; Value v=mut_load(e,a[0],&t); if(v.k!=V_BLOCK) die("flatten: expected block");
+    Value **items=NULL; int count=0,cap=0; flatten_into(v.u.block.b,&items,&count,&cap); block_replace(v.u.block.b,items,count); return v_null();
+}
+static char *indent_text(const char *s, int remove){
+    size_t len=strlen(s),cap=len*5+8,at=0; char *out=(char*)xmalloc(cap); int line=1;
+    for(size_t i=0;i<len;){
+        if(line){
+            if(remove){ int k=0; while(k<4 && s[i]==' '){ i++; k++; } }
+            else { memcpy(out+at,"    ",4); at+=4; }
+            line=0;
+        }
+        if(i>=len) break; out[at++]=s[i]; if(s[i++]=='\n') line=1;
+    }
+    out[at]=0; return out;
+}
+static Value b_indent(Env*e,Value*a,int n){ MutTarget t; Value v=mut_load(e,a[0],&t); if(v.k!=V_STR)die("indent: expected string"); char*s=indent_text(v.u.s,0); Value r=v_str(s);free(s);mut_store(e,&t,r);return v_null(); }
+static Value b_outdent(Env*e,Value*a,int n){ MutTarget t; Value v=mut_load(e,a[0],&t); if(v.k!=V_STR)die("outdent: expected string"); char*s=indent_text(v.u.s,1); Value r=v_str(s);free(s);mut_store(e,&t,r);return v_null(); }
+static Value b_pad(Env*e,Value*a,int n){
+    MutTarget t; Value v=mut_load(e,a[0],&t); if(v.k!=V_STR)die("pad: expected string"); long width=as_int(a[1]); size_t len=strlen(v.u.s);
+    if(width>(long)len){ char*s=(char*)xmalloc((size_t)width+1); memset(s,' ',(size_t)width-len); memcpy(s+width-len,v.u.s,len+1); Value r=v_str(s);free(s);mut_store(e,&t,r); }
+    return v_null();
+}
+static Value b_prepend(Env*e,Value*a,int n){
+    MutTarget t; Value v=mut_load(e,a[0],&t);
+    if(v.k==V_BLOCK){ Block*b=v.u.block.b; block_grow(b,b->n+1); memmove(b->items+1,b->items,(size_t)b->n*sizeof(Value*)); b->items[0]=(Value*)xmalloc(sizeof(Value)); *b->items[0]=a[1]; b->n++; return v_null(); }
+    if(v.k==V_STR){ char*prefix=val_str(a[1]); char*s=(char*)xmalloc(strlen(prefix)+strlen(v.u.s)+1); strcpy(s,prefix);strcat(s,v.u.s);Value r=v_str(s);free(prefix);free(s);mut_store(e,&t,r);return v_null(); }
+    die("prepend: unsupported value"); return v_null();
+}
+static Value b_remove(Env*e,Value*a,int n){
+    MutTarget t; Value v=mut_load(e,a[0],&t);
+    if(v.k==V_BLOCK){ Block*b=v.u.block.b; int at=0; for(int i=0;i<b->n;i++) if(!value_eq(*b->items[i],a[1])) b->items[at++]=b->items[i]; b->n=at; return v_null(); }
+    if(v.k==V_STR){ char*needle=val_str(a[1]); size_t nl=strlen(needle); if(!nl){free(needle);return v_null();} const char*p=v.u.s;size_t cap=strlen(p)+1,at=0;char*out=(char*)xmalloc(cap);while(*p){if(!strncmp(p,needle,nl))p+=nl;else out[at++]=*p++;}out[at]=0;Value r=v_str(out);free(out);free(needle);mut_store(e,&t,r);return v_null(); }
+    die("remove: unsupported value"); return v_null();
+}
+static Value b_repeat(Env*e,Value*a,int n){
+    MutTarget t; Value v=mut_load(e,a[0],&t); long times=as_int(a[1]); if(times<0)times=0;
+    if(v.k==V_STR){size_t len=strlen(v.u.s),total=len*(size_t)times;char*s=(char*)xmalloc(total+1);for(long i=0;i<times;i++)memcpy(s+(size_t)i*len,v.u.s,len);s[total]=0;Value r=v_str(s);free(s);mut_store(e,&t,r);return v_null();}
+    if(v.k==V_BLOCK){Block*b=v.u.block.b;int old=b->n,total=(int)(old*times);Value**items=(Value**)xmalloc((size_t)total*sizeof(Value*));for(int i=0;i<total;i++){items[i]=(Value*)xmalloc(sizeof(Value));*items[i]=*b->items[i%old];}block_replace(b,items,total);return v_null();}
+    die("repeat: unsupported value"); return v_null();
+}
+static Value b_rotate(Env*e,Value*a,int n){
+    MutTarget t; Value v=mut_load(e,a[0],&t); long by=as_int(a[1]);
+    if(v.k==V_BLOCK){Block*b=v.u.block.b;if(!b->n)return v_null();int k=(int)(by%b->n);if(k<0)k+=b->n;Value**items=(Value**)xmalloc((size_t)b->n*sizeof(Value*));for(int i=0;i<b->n;i++)items[(i+k)%b->n]=b->items[i];block_replace(b,items,b->n);return v_null();}
+    if(v.k==V_STR){int len=(int)strlen(v.u.s);if(!len)return v_null();int k=(int)(by%len);if(k<0)k+=len;char*s=(char*)xmalloc((size_t)len+1);for(int i=0;i<len;i++)s[(i+k)%len]=v.u.s[i];s[len]=0;Value r=v_str(s);free(s);mut_store(e,&t,r);return v_null();}
+    die("rotate: unsupported value"); return v_null();
+}
+static int value_ptr_cmp(const void*pa,const void*pb){Value*a=*(Value*const*)pa,*b=*(Value*const*)pb;if((a->k==V_INT||a->k==V_FLOAT)&&(b->k==V_INT||b->k==V_FLOAT)){double x=as_float(*a),y=as_float(*b);return(x>y)-(x<y);}char*sa=val_str(*a),*sb=val_str(*b);int r=strcmp(sa,sb);free(sa);free(sb);return r;}
+static Value b_sort(Env*e,Value*a,int n){MutTarget t;Value v=mut_load(e,a[0],&t);if(v.k!=V_BLOCK)die("sort: expected block");qsort(v.u.block.b->items,(size_t)v.u.block.b->n,sizeof(Value*),value_ptr_cmp);return v_null();}
+static Value b_squeeze(Env*e,Value*a,int n){
+    MutTarget t;Value v=mut_load(e,a[0],&t);
+    if(v.k==V_STR){size_t len=strlen(v.u.s),at=0;char*s=(char*)xmalloc(len+1);for(size_t i=0;i<len;i++)if(i==0||v.u.s[i]!=v.u.s[i-1])s[at++]=v.u.s[i];s[at]=0;Value r=v_str(s);free(s);mut_store(e,&t,r);return v_null();}
+    if(v.k==V_BLOCK){Block*b=v.u.block.b;int at=0;for(int i=0;i<b->n;i++)if(i==0||!value_eq(*b->items[i],*b->items[i-1]))b->items[at++]=b->items[i];b->n=at;return v_null();}
+    die("squeeze: unsupported value");return v_null();
+}
+static Value b_strip(Env*e,Value*a,int n){MutTarget t;Value v=mut_load(e,a[0],&t);if(v.k!=V_STR)die("strip: expected string");const char*s=v.u.s;while(*s&&isspace((unsigned char)*s))s++;size_t len=strlen(s);while(len&&isspace((unsigned char)s[len-1]))len--;char*out=(char*)xmalloc(len+1);memcpy(out,s,len);out[len]=0;Value r=v_str(out);free(out);mut_store(e,&t,r);return v_null();}
+static Value b_unique(Env*e,Value*a,int n){
+    MutTarget t;Value v=mut_load(e,a[0],&t);
+    if(v.k==V_BLOCK){Block*b=v.u.block.b;int at=0;for(int i=0;i<b->n;i++){int seen=0;for(int j=0;j<at;j++)if(value_eq(*b->items[j],*b->items[i])){seen=1;break;}if(!seen)b->items[at++]=b->items[i];}b->n=at;return v_null();}
+    if(v.k==V_STR){size_t len=strlen(v.u.s),at=0;char*out=(char*)xmalloc(len+1);for(size_t i=0;i<len;i++){int seen=0;for(size_t j=0;j<at;j++)if(out[j]==v.u.s[i]){seen=1;break;}if(!seen)out[at++]=v.u.s[i];}out[at]=0;Value r=v_str(out);free(out);mut_store(e,&t,r);return v_null();}
+    die("unique: unsupported value");return v_null();
+}
+
+/* ---- reciprocal trigonometry and bit operations ------------------------- */
+static Value b_sec(Env*e,Value*a,int n){return v_float(1.0/cos(as_float(a[0])));}
+static Value b_sech(Env*e,Value*a,int n){return v_float(1.0/cosh(as_float(a[0])));}
+static Value b_csec(Env*e,Value*a,int n){return v_float(1.0/sin(as_float(a[0])));}
+static Value b_csech(Env*e,Value*a,int n){return v_float(1.0/sinh(as_float(a[0])));}
+static Value b_ctan(Env*e,Value*a,int n){return v_float(1.0/tan(as_float(a[0])));}
+static Value b_ctanh(Env*e,Value*a,int n){return v_float(1.0/tanh(as_float(a[0])));}
+static Value b_asec(Env*e,Value*a,int n){return v_float(acos(1.0/as_float(a[0])));}
+static Value b_asech(Env*e,Value*a,int n){return v_float(acosh(1.0/as_float(a[0])));}
+static Value b_acsec(Env*e,Value*a,int n){return v_float(asin(1.0/as_float(a[0])));}
+static Value b_acsech(Env*e,Value*a,int n){return v_float(asinh(1.0/as_float(a[0])));}
+static Value b_actan(Env*e,Value*a,int n){return v_float(atan(1.0/as_float(a[0])));}
+static Value b_actanh(Env*e,Value*a,int n){return v_float(atanh(1.0/as_float(a[0])));}
+static Value b_atan2(Env*e,Value*a,int n){return v_float(atan2(as_float(a[0]),as_float(a[1])));}
+static Value b_gamma(Env*e,Value*a,int n){return v_float(tgamma(as_float(a[0])));}
+static Value bit_result(Env*e,Value receiver,long result){
+    if(receiver.k==V_PATH){MutTarget t; (void)mut_load(e,receiver,&t);mut_store(e,&t,v_int(result));return v_null();}
+    return v_int(result);
+}
+static Value b_bit_and(Env*e,Value*a,int n){return bit_result(e,a[0],as_int(a[0].k==V_PATH?mut_load(e,a[0],&(MutTarget){0}):a[0])&as_int(a[1]));}
+static Value b_bit_or(Env*e,Value*a,int n){return bit_result(e,a[0],as_int(a[0].k==V_PATH?mut_load(e,a[0],&(MutTarget){0}):a[0])|as_int(a[1]));}
+static Value b_bit_xor(Env*e,Value*a,int n){return bit_result(e,a[0],as_int(a[0].k==V_PATH?mut_load(e,a[0],&(MutTarget){0}):a[0])^as_int(a[1]));}
+static Value b_bit_not(Env*e,Value*a,int n){return bit_result(e,a[0],~as_int(a[0].k==V_PATH?mut_load(e,a[0],&(MutTarget){0}):a[0]));}
+static Value b_bit_nand(Env*e,Value*a,int n){return bit_result(e,a[0],~(as_int(a[0].k==V_PATH?mut_load(e,a[0],&(MutTarget){0}):a[0])&as_int(a[1])));}
+static Value b_bit_nor(Env*e,Value*a,int n){return bit_result(e,a[0],~(as_int(a[0].k==V_PATH?mut_load(e,a[0],&(MutTarget){0}):a[0])|as_int(a[1])));}
+static Value b_bit_xnor(Env*e,Value*a,int n){return bit_result(e,a[0],~(as_int(a[0].k==V_PATH?mut_load(e,a[0],&(MutTarget){0}):a[0])^as_int(a[1])));}
+static Value b_shl(Env*e,Value*a,int n){return bit_result(e,a[0],as_int(a[0].k==V_PATH?mut_load(e,a[0],&(MutTarget){0}):a[0])<<as_int(a[1]));}
+static Value b_shr(Env*e,Value*a,int n){return bit_result(e,a[0],as_int(a[0].k==V_PATH?mut_load(e,a[0],&(MutTarget){0}):a[0])>>as_int(a[1]));}
+static Value b_nandp(Env*e,Value*a,int n){return v_bool(!(v_truthy(a[0])&&v_truthy(a[1])));}
+static Value b_norp(Env*e,Value*a,int n){return v_bool(!(v_truthy(a[0])||v_truthy(a[1])));}
+static Value b_xorp(Env*e,Value*a,int n){return v_bool(v_truthy(a[0])!=v_truthy(a[1]));}
+static Value b_xnorp(Env*e,Value*a,int n){return v_bool(v_truthy(a[0])==v_truthy(a[1]));}
+
+/* ---- comparison, membership, and string distance ------------------------ */
+static Value b_coalesce(Env*e,Value*a,int n){return a[0].k==V_NULL?a[1]:a[0];}
+static Value b_compare(Env*e,Value*a,int n){
+    int cmp;
+    if((a[0].k==V_INT||a[0].k==V_FLOAT)&&(a[1].k==V_INT||a[1].k==V_FLOAT)){double x=as_float(a[0]),y=as_float(a[1]);cmp=(x>y)-(x<y);}
+    else {char*x=val_str(a[0]),*y=val_str(a[1]);cmp=strcmp(x,y);free(x);free(y);cmp=(cmp>0)-(cmp<0);}
+    return v_int(cmp);
+}
+static Value b_inp(Env*e,Value*a,int n){
+    if(a[1].k==V_BLOCK)return v_bool(block_contains_value(a[1].u.block.b,a[0]));
+    if(a[1].k==V_STR){char*needle=val_str(a[0]);int found=strstr(a[1].u.s,needle)!=NULL;free(needle);return v_bool(found);}
+    if(a[1].k==V_DICT){char*key=val_str(a[0]);int found=dict_find(a[1],key)>=0;free(key);return v_bool(found);}
+    die("in?: unsupported collection");return v_null();
+}
+static Value b_infinitep(Env*e,Value*a,int n){return v_bool(a[0].k==V_FLOAT&&isinf(a[0].u.f));}
+static Value b_levenshtein(Env*e,Value*a,int n){
+    const unsigned char*s=(unsigned char*)a[0].u.s,*t=(unsigned char*)a[1].u.s;size_t ns=strlen((char*)s),nt=strlen((char*)t);
+    int*row=(int*)xmalloc((nt+1)*sizeof(int));for(size_t j=0;j<=nt;j++)row[j]=(int)j;
+    for(size_t i=1;i<=ns;i++){int prev=row[0];row[0]=(int)i;for(size_t j=1;j<=nt;j++){int old=row[j],cost=s[i-1]==t[j-1]?0:1;int ins=row[j-1]+1,del=old+1,sub=prev+cost;row[j]=ins<del?(ins<sub?ins:sub):(del<sub?del:sub);prev=old;}}
+    int result=row[nt];free(row);return v_int(result);
+}
+static Value b_jaro(Env*e,Value*a,int n){
+    const char*s=a[0].u.s,*t=a[1].u.s;int ls=(int)strlen(s),lt=(int)strlen(t);if(!ls&&!lt)return v_float(1.0);if(!ls||!lt)return v_float(0.0);
+    int range=(ls>lt?ls:lt)/2-1;if(range<0)range=0;unsigned char*sm=(unsigned char*)calloc((size_t)ls,1),*tm=(unsigned char*)calloc((size_t)lt,1);if(!sm||!tm)die("out of memory");
+    int matches=0;for(int i=0;i<ls;i++){int lo=i-range;if(lo<0)lo=0;int hi=i+range+1;if(hi>lt)hi=lt;for(int j=lo;j<hi;j++)if(!tm[j]&&s[i]==t[j]){sm[i]=1;tm[j]=1;matches++;break;}}
+    if(!matches){free(sm);free(tm);return v_float(0.0);}int trans=0,j=0;for(int i=0;i<ls;i++)if(sm[i]){while(!tm[j])j++;if(s[i]!=t[j])trans++;j++;}
+    free(sm);free(tm);double m=matches;return v_float((m/ls+m/lt+(m-trans/2.0)/m)/3.0);
+}
+static int type_matches(Value spec,Value value){
+    /* Arturo accepts a block in the signature for other predicate forms, but
+     * it is not a union of type values (`is? [:integer :floating] 1.5` is
+     * false). Only a scalar :type performs this direct kind check. */
+    if(spec.k==V_BLOCK)return 0;
+    const char*name=spec.u.s?spec.u.s:"";if(*name==':')name++;return !strcmp(name,type_name(value));
+}
+static Value b_isp(Env*e,Value*a,int n){return v_bool(type_matches(a[0],a[1]));}
+
+static Value b_difference(Env*e,Value*a,int n){
+    MutTarget t;Value left=mut_load(e,a[0],&t);if(left.k!=V_BLOCK||a[1].k!=V_BLOCK)die("difference: expected blocks");Block*x=left.u.block.b,*y=a[1].u.block.b;int at=0;for(int i=0;i<x->n;i++)if(!block_contains_value(y,*x->items[i]))x->items[at++]=x->items[i];x->n=at;return v_null();
+}
+static Value b_intersection(Env*e,Value*a,int n){
+    MutTarget t;Value left=mut_load(e,a[0],&t);if(left.k!=V_BLOCK||a[1].k!=V_BLOCK)die("intersection: expected blocks");Block*x=left.u.block.b,*y=a[1].u.block.b;int at=0;for(int i=0;i<x->n;i++){int duplicate=0;for(int j=0;j<at;j++)if(value_eq(*x->items[j],*x->items[i])){duplicate=1;break;}if(!duplicate&&block_contains_value(y,*x->items[i]))x->items[at++]=x->items[i];}x->n=at;return v_null();
+}
+static Value b_union(Env*e,Value*a,int n){
+    MutTarget t;Value left=mut_load(e,a[0],&t);if(left.k!=V_BLOCK||a[1].k!=V_BLOCK)die("union: expected blocks");Block*x=left.u.block.b,*y=a[1].u.block.b;for(int i=0;i<y->n;i++)if(!block_contains_value(x,*y->items[i]))block_append(left,*y->items[i]);return v_null();
 }
 
 /* `replace s from to` — replace all occurrences of `from` with `to`. */
@@ -1106,8 +1876,10 @@ static Value b_reverse(Env*e,Value*a,int n){
 }
 /* `ensure pred msg` — assert; die on failure. */
 static Value b_ensure(Env*e,Value*a,int n){
-    if(!v_truthy(a[0])){ const char *m=(n>1&&a[1].k==V_STR)?a[1].u.s:"assertion failed"; die(m); }
-    return a[0];
+    Value condition=a[0];
+    if(condition.k==V_BLOCK)condition=evalSeq(e,condition.u.block.b->items,condition.u.block.b->n);
+    if(!v_truthy(condition))die("assertion failed");
+    return v_null();
 }
 /* `array coll` — block to an array (block-like here). */
 static Value b_array(Env*e,Value*a,int n){
@@ -1207,26 +1979,63 @@ static Value b_args(Env*e,Value*a,int n){
 
 static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"print",b_print},{"add",b_add},{"sub",b_sub},{"mul",b_mul},{"div",b_div},
-    {"fdiv",b_fdiv},{"mod",b_mod},{"pow",b_pow},{"neg",b_neg},{"inc",b_inc},
+    {"fdiv",b_fdiv},{"mod",b_mod},{"divmod",b_divmod},{"pow",b_pow},{"neg",b_neg},{"inc",b_inc},
+    {"numerator",b_numerator},{"denominator",b_denominator},
     {"dec",b_dec},{"equal?",b_equal},{"notEqual?",b_notEqual},{"greater?",b_greater},{"less?",b_less},
     {"and?",b_and},{"or?",b_or},{"not?",b_not},{"size",b_size},{"first",b_first},
     {"last",b_last},{"append",b_append},{"pop",b_pop},{"makeDict",b_makeDict},{"set",b_set},
     {"get",b_get},{"empty?",b_empty},{"call",b_call},{"type",b_type},
     {"concat",b_concat},{"range",b_range},{"key?",b_key},
-    {"map",b_map},{"select",b_select},{"loop",b_loop},
+    {"map",b_map},{"select",b_select},{"filter",b_filter},{"every?",b_every},{"some?",b_some},
+    {"chunk",b_chunk},{"cluster",b_cluster},{"gather",b_gather},{"arrange",b_arrange},
+    {"enumerate",b_enumerate},{"maximum",b_maximum},{"minimum",b_minimum},{"loop",b_loop},
     {"to",b_to},{"replace",b_replace},{"joinWith",b_joinWith},
     {"lower",b_lower},{"upper",b_upper},{"index",b_index},{"slice",b_slice},
     {"split",b_split},{"take",b_take},{"drop",b_drop},{"reverse",b_reverse},
     {"ensure",b_ensure},{"array",b_array},{"case",b_case},
     {"read",b_read},{"write",b_write},{"execute",b_execute},{"args",b_args},
-    {"insert",b_insert},{"break",b_break},{"do",b_do},{"null?",b_isNull},{"contains?",b_contains},
+    {"insert",b_insert},{"break",b_break},{"continue",b_continue},{"do",b_do},{"null?",b_isNull},{"contains?",b_contains},
     {"greaterOrEqual?",b_ge},{"lessOrEqual?",b_le},{"join",b_join},{"try",b_try},
+    {"throw",b_throw},{"throws?",b_throwsp},{"error?",b_errorp},
+    {"panic",b_panic},{"defined?",b_definedp},
     {"abs",b_abs},{"ceil",b_ceil},{"floor",b_floor},{"even?",b_even},{"odd?",b_odd},
     {"positive?",b_positive},{"negative?",b_negative},{"zero?",b_zero},
+    {"round",b_round},{"sqrt",b_sqrt},{"ln",b_ln},{"log",b_log},
+    {"sin",b_sin},{"cos",b_cos},{"tan",b_tan},
+    {"asin",b_asin},{"acos",b_acos},{"atan",b_atan},
+    {"sinh",b_sinh},{"cosh",b_cosh},{"tanh",b_tanh},
+    {"asinh",b_asinh},{"acosh",b_acosh},{"atanh",b_atanh},{"gcd",b_gcd},
     {"min",b_min},{"max",b_max},{"sum",b_sum},{"product",b_product},
     {"keys",b_keys},{"values",b_values},{"block?",b_blockp},{"dictionary?",b_dictp},
     {"integer?",b_intp},{"floating?",b_floatp},{"string?",b_stringp},{"logical?",b_logicalp},
     {"char?",b_charp},{"function?",b_functionp},{"range?",b_rangep},
+    {"word?",b_wordp},{"label?",b_labelp},{"literal?",b_literalp},{"symbol?",b_symbolp},
+    {"type?",b_typep},{"inline?",b_inlinep},{"path?",b_pathp},{"pathLabel?",b_pathlabelp},
+    {"pathLiteral?",b_pathliteralp},{"regex?",b_regexp},{"attribute?",b_attributep},
+    {"attributeLabel?",b_attributelabelp},{"true?",b_truep},{"false?",b_falsep},
+    {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
+    {"lower?",b_lowerp},{"upper?",b_upperp},{"numeric?",b_numericp},
+    {"prefix?",b_prefixp},{"suffix?",b_suffixp},{"between?",b_betweenp},{"same?",b_samep},
+    {"all?",b_allp},{"any?",b_anyp},
+    {"average",b_average},{"clamp",b_clamp},{"exp",b_exp},{"factorial",b_factorial},
+    {"factors",b_factors},{"hypot",b_hypot},{"lcm",b_lcm},{"median",b_median},
+    {"powmod",b_powmod},{"prime?",b_primep},{"variance",b_variance},{"deviation",b_deviation},
+    {"skewness",b_skewness},{"kurtosis",b_kurtosis},
+    {"digits",b_digits},{"couple",b_couple},{"sorted?",b_sortedp},{"tally",b_tally},
+    {"permutate",b_permutate},{"powerset",b_powerset},
+    {"disjoint?",b_disjointp},{"intersect?",b_intersectp},{"subset?",b_subsetp},{"superset?",b_supersetp},
+    {"capitalize",b_capitalize},{"chop",b_chop},{"empty",b_empty_value},{"flatten",b_flatten},
+    {"indent",b_indent},{"outdent",b_outdent},{"pad",b_pad},{"prepend",b_prepend},
+    {"remove",b_remove},{"repeat",b_repeat},{"rotate",b_rotate},{"sort",b_sort},
+    {"squeeze",b_squeeze},{"strip",b_strip},{"unique",b_unique},
+    {"sec",b_sec},{"sech",b_sech},{"csec",b_csec},{"csech",b_csech},{"ctan",b_ctan},{"ctanh",b_ctanh},
+    {"asec",b_asec},{"asech",b_asech},{"acsec",b_acsec},{"acsech",b_acsech},{"actan",b_actan},{"actanh",b_actanh},
+    {"atan2",b_atan2},{"gamma",b_gamma},{"and",b_bit_and},{"or",b_bit_or},{"not",b_bit_not},
+    {"nand",b_bit_nand},{"nor",b_bit_nor},{"xor",b_bit_xor},{"xnor",b_bit_xnor},{"shl",b_shl},{"shr",b_shr},
+    {"nand?",b_nandp},{"nor?",b_norp},{"xor?",b_xorp},{"xnor?",b_xnorp},
+    {"coalesce",b_coalesce},{"compare",b_compare},{"in?",b_inp},{"infinite?",b_infinitep},
+    {"levenshtein",b_levenshtein},{"jaro",b_jaro},{"is?",b_isp},
+    {"difference",b_difference},{"intersection",b_intersection},{"union",b_union},
     {NULL,NULL}
 };
 
@@ -1238,7 +2047,7 @@ int rt_builtin(const char *name, Env *e, Value *args, int n, Value *out) {
 /* zero-arity builtins: when a bare word names one and it is NOT bound as a
  * variable, the host CALLS it (`args`, `break`) rather than yielding a value. */
 static int rt_zero_arity(const char *name){
-    static const char *z[] = {"args","break",NULL};
+    static const char *z[] = {"args","break","continue",NULL};
     for (int i=0; z[i]; i++) if (!strcmp(z[i], name)) return 1;
     return 0;
 }
@@ -1329,7 +2138,10 @@ static Value path_read(Env *e, Value p);
  * `if` branch, while `loop spec\muts [m][body]` must feed `loop` its two block
  * args. -1 means "scan to the boundary" (the old behaviour). */
 static int fn_arity(const char *name){
-    if (!strcmp(name,"loop")||!strcmp(name,"map")||!strcmp(name,"select")) return 3;
+    if (!strcmp(name,"loop")||!strcmp(name,"map")||!strcmp(name,"select")
+        ||!strcmp(name,"filter")||!strcmp(name,"every?")||!strcmp(name,"some?")
+        ||!strcmp(name,"arrange")||!strcmp(name,"enumerate")
+        ||!strcmp(name,"maximum")||!strcmp(name,"minimum")) return 3;
     if (!strcmp(name,"not?")||!strcmp(name,"first")||!strcmp(name,"last")
         ||!strcmp(name,"do")
         ||!strcmp(name,"size")||!strcmp(name,"type")||!strcmp(name,"pop")) return 1;
@@ -1343,7 +2155,10 @@ static int fn_arity(const char *name){
  * (loop/map/select params+action), never evaluated here? */
 static int block_arg(const char *name, int idx){
     if (!strcmp(name,"do") && idx==0) return 1;
-    if ((!strcmp(name,"loop")||!strcmp(name,"map")||!strcmp(name,"select")) && idx>=1) return 1;
+    if ((!strcmp(name,"loop")||!strcmp(name,"map")||!strcmp(name,"select")
+         ||!strcmp(name,"filter")||!strcmp(name,"every?")||!strcmp(name,"some?")
+         ||!strcmp(name,"arrange")||!strcmp(name,"enumerate")
+         ||!strcmp(name,"maximum")||!strcmp(name,"minimum")) && idx>=1) return 1;
     return 0;
 }
 
@@ -1644,7 +2459,7 @@ Value runSeq(Env *e, IR **seq, int n) {
     Value result = v_null();
     for (int i=0;i<n;i++) {
         result = runNode0(e, seq[i]);
-        if (rt_ret_set) break;
+        if (rt_ret_set || rt_brk_set || rt_cont_set) break;
     }
     return result;
 }
@@ -1739,6 +2554,11 @@ static Value runNode0(Env *e, IR *node) {
         env_define_body(e, node->name, v);
         return v;
     }
+    if (!strcmp(node->op,"let")) {
+        Value v = runNode0(e, node->args[0]);
+        env_let(e, node->name, v);
+        return v;
+    }
     if (!strcmp(node->op,"block")) {
         Value **items=(Value**)xmalloc((node->nargs+1)*sizeof(Value*));
         for (int i=0;i<node->nargs;i++){
@@ -1760,6 +2580,47 @@ static Value runNode0(Env *e, IR *node) {
             return rv;
         }
         if (node->nargs>2 && node->args[2]) return runNode0(e, node->args[2]);
+        return v_null();
+    }
+    if (!strcmp(node->op,"unless")) {
+        Value cond=runNode0(e,node->args[0]);
+        if(!v_truthy(cond)) return runNode0(e,node->args[1]);
+        return v_null();
+    }
+    if (!strcmp(node->op,"switch")) {
+        Value cond=runNode0(e,node->args[0]);
+        return runNode0(e,node->args[v_truthy(cond)?1:2]);
+    }
+    if (!strcmp(node->op,"when")) {
+        for(int i=0;i+1<node->nargs;i+=2){
+            Value cond=runNode0(e,node->args[i]);
+            if(v_truthy(cond)) return runNode0(e,node->args[i+1]);
+        }
+        return v_null();
+    }
+    if (!strcmp(node->op,"using")) {
+        Value value=runNode0(e,node->args[0]);
+        Env *child=env_new(e);
+        env_define_local(child,"this",value);
+        child->rebind_parent=1;
+        IR *body=node->args[1];
+        if(body && body->op && !strcmp(body->op,"__seq"))
+            return runSeq(child,body->args,body->nargs);
+        return body?runNode0(child,body):v_null();
+    }
+    if (!strcmp(node->op,"try") || !strcmp(node->op,"throws?")) {
+        int predicate=!strcmp(node->op,"throws?");
+        jmp_buf jb;jmp_buf *prev=g_try_jmp;g_try_jmp=&jb;
+        if(setjmp(jb)==0){
+            (void)runNode0(e,node->args[0]);g_try_jmp=prev;
+            return predicate?v_bool(0):v_null();
+        }
+        g_try_jmp=prev;
+        return predicate?v_bool(1):v_error(g_last_error);
+    }
+    if (!strcmp(node->op,"ensure")) {
+        Value condition=runNode0(e,node->args[0]);
+        if(!v_truthy(condition))die("assertion failed");
         return v_null();
     }
     if (!strcmp(node->op,"do")) {
@@ -1784,23 +2645,29 @@ static Value runNode0(Env *e, IR *node) {
         rt_ret_set = 1;
         return rt_ret_val;
     }
+    if (!strcmp(node->op,"break")) { rt_brk_set=1; return v_null(); }
+    if (!strcmp(node->op,"continue")) { rt_cont_set=1; return v_null(); }
     if (!strcmp(node->op,"while")) {
-        rt_brk_set=0;
+        rt_brk_set=0; rt_cont_set=0;
         while (1) {
             Value cond = runNode0(e, node->args[0]); if (rt_ret_set) break;
             if (!v_truthy(cond)) break;
             runNode0(e, node->args[1]); if (rt_ret_set || rt_brk_set) break;
+            rt_cont_set=0;
         }
+        rt_brk_set=0; rt_cont_set=0;
         if (rt_ret_set) return rt_ret_val;
         return v_null();
     }
     if (!strcmp(node->op,"until")) {
-        rt_brk_set=0;
+        rt_brk_set=0; rt_cont_set=0;
         while (1) {
-            runNode0(e, node->args[0]); if (rt_ret_set) break;
+            runNode0(e, node->args[0]); if (rt_ret_set || rt_brk_set) break;
+            rt_cont_set=0;
             Value cond = runNode0(e, node->args[1]); if (rt_ret_set) break;
             if (v_truthy(cond)) break;
         }
+        rt_brk_set=0; rt_cont_set=0;
         if (rt_ret_set) return rt_ret_val;
         return v_null();
     }
@@ -1810,7 +2677,7 @@ static Value runNode0(Env *e, IR *node) {
         IR *body = node->args[2];
         IR **body_items = body && body->op && !strcmp(body->op,"__seq") ? body->args : &body;
         int body_n = body && body->op && !strcmp(body->op,"__seq") ? body->nargs : 1;
-        rt_brk_set=0;
+        rt_brk_set=0; rt_cont_set=0;
         if (coll.k==V_DICT) {
             Dict *dd=coll.u.dict;
             for (int i=0;i<dd->n;i++) {
@@ -1824,6 +2691,7 @@ static Value runNode0(Env *e, IR *node) {
                 child->rebind_parent=1;
                 runSeq(child, body_items, body_n);
                 if (rt_ret_set || rt_brk_set) break;
+                rt_cont_set=0;
             }
         } else if (coll.k==V_STR) {
             int count=(int)strlen(coll.u.s);
@@ -1834,6 +2702,7 @@ static Value runNode0(Env *e, IR *node) {
                 child->rebind_parent=1;
                 runSeq(child, body_items, body_n);
                 if (rt_ret_set || rt_brk_set) break;
+                rt_cont_set=0;
             }
         } else if (coll.k==V_BLOCK || coll.k==V_RANGE) {
             int count = coll.k==V_BLOCK ? coll.u.block.b->n
@@ -1848,9 +2717,10 @@ static Value runNode0(Env *e, IR *node) {
                 child->rebind_parent=1;
                 runSeq(child, body_items, body_n);
                 if (rt_ret_set || rt_brk_set) break;
+                rt_cont_set=0;
             }
         } else die("loop: unsupported collection");
-        rt_brk_set=0;
+        rt_brk_set=0; rt_cont_set=0;
         if (rt_ret_set) return rt_ret_val;
         return v_null();
     }

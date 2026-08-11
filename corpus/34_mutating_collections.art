@@ -1,0 +1,50 @@
+; in-place string and block transforms through literal references
+s: "hello world"
+capitalize 's
+print s
+chop 's
+print s
+
+e: "abc"
+empty 'e
+print e
+f: [1 [2 [3]] 4]
+flatten 'f
+print f
+i: "a\nb"
+indent 'i
+print i
+outdent 'i
+print i
+p: "x"
+pad 'p 3
+print p
+q: [2 3]
+prepend 'q 1
+print q
+r: [1 2 3 2]
+remove 'r 2
+print r
+u: "ab"
+repeat 'u 3
+print u
+v: [1 2 3 4]
+rotate 'v 1
+print v
+w: [3 1 2]
+sort 'w
+print w
+x: "aaabcc"
+squeeze 'x
+print x
+y: "  hi \n"
+strip 'y
+print y
+z: [1 2 1 3 2]
+unique 'z
+print z
+
+; nested path write-back for immutable strings
+d: #[text: "arturo"]
+capitalize 'd\text
+print d\text

@@ -1,0 +1,9 @@
+; adjacent grouping, global grouping, and keyed gathering with captured locals
+cutoff: 4
+print chunk @[1 2 3 4 5] [x][x < cutoff]
+print chunk @[1 2 4 5 7 8] [x][even? x]
+print cluster @[1 2 3 4 5] [x][x % 3]
+print gather @[1 2 3 4 5] [x][x % 3]
+
+f: function [m][cluster @[1 2 3 4 5] [x][x % m]]
+print f 2

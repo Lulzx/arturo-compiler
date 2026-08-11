@@ -1,0 +1,18 @@
+; comparison, membership, type checks, and string distance
+print coalesce null 0
+print coalesce null false
+print coalesce 2 3
+print compare 1 2
+print compare 2 2
+print compare "b" "a"
+print in? 2 [1 2 3]
+print in? 4 [1 2 3]
+print in? "bc" "abcd"
+print in? "z" "abcd"
+print infinite? 5
+print levenshtein "kitten" "sitting"
+print jaro "martha" "marhta"
+print is? :integer 1
+print is? :floating 1
+print is? :string "x"
+print is? [:integer :floating] 1.5

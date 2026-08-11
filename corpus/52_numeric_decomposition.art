@@ -1,0 +1,18 @@
+; quotient/remainder pairs and exact rational components of scalar numbers
+print divmod 17 5
+print divmod 7.5 2
+
+x: 17
+divmod 'x 5
+print x
+
+print numerator 5
+print denominator 5
+print numerator 1.5
+print denominator 1.5
+print numerator 0.1
+print denominator 0.1
+print numerator 2.25
+print denominator 2.25
+
+print error? try [divmod 1 0]

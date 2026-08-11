@@ -46,7 +46,11 @@ NOT_MUTATING: #[
 ;-----------------------------------------------
 PURE_INTRINSICS: #[
     "add": true  "sub": true  "mul": true  "div": true  "fdiv": true
-    "mod": true  "pow": true  "divmod": true
+    ; `divmod` yields an inline pair in the host. Donating it during a fold
+    ; leaks both values onto the host stack and corrupts later IR nodes, so it
+    ; remains a runtime call even though it has no side effects for value args.
+    "mod": true  "pow": true
+    "numerator": true  "denominator": true
     "equal?": true  "notEqual?": true  "less?": true  "greater?": true
     "lessOrEqual?": true  "greaterOrEqual?": true
     "and?": true  "or?": true
@@ -54,6 +58,36 @@ PURE_INTRINSICS: #[
     "size": true  "first": true  "last": true  "inc": true  "dec": true
     "type": true  "to": true
     "append": true  "not": true  "and": true  "or": true
+    "round": true  "sqrt": true  "ln": true  "log": true
+    "sin": true  "cos": true  "tan": true
+    "asin": true  "acos": true  "atan": true
+    "sinh": true  "cosh": true  "tanh": true
+    "asinh": true  "acosh": true  "atanh": true  "gcd": true
+    "word?": true  "label?": true  "literal?": true  "symbol?": true
+    "type?": true  "inline?": true  "path?": true  "pathLabel?": true
+    "pathLiteral?": true  "regex?": true  "attribute?": true
+    "attributeLabel?": true  "true?": true  "false?": true  "one?": true
+    "ascii?": true  "whitespace?": true  "lower?": true  "upper?": true
+    "numeric?": true  "prefix?": true  "suffix?": true
+    "between?": true  "same?": true  "all?": true  "any?": true
+    "average": true  "clamp": true  "exp": true  "factorial": true
+    ; `factors` is pure but returns a block, and the C constant serializer is
+    ; intentionally scalar-only. Keep it runtime-evaluated until aggregate
+    ; constants are representable by every backend.
+    "hypot": true  "lcm": true  "median": true
+    "powmod": true  "prime?": true  "variance": true  "deviation": true
+    "skewness": true  "kurtosis": true
+    "sorted?": true  "disjoint?": true  "intersect?": true
+    "subset?": true  "superset?": true
+    "sec": true  "sech": true  "csec": true  "csech": true
+    "ctan": true  "ctanh": true  "asec": true  "asech": true
+    "acsec": true  "acsech": true  "actan": true  "actanh": true
+    "atan2": true  "gamma": true  "nand": true  "nor": true
+    "xor": true  "xnor": true  "shl": true  "shr": true
+    "nand?": true  "nor?": true  "xor?": true  "xnor?": true
+    "coalesce": true  "compare": true  "in?": true  "infinite?": true
+    "levenshtein": true  "jaro": true  "is?": true
+    "defined?": true
 ]
 
 pureIntrinsic?: function [name][ key? PURE_INTRINSICS name ]

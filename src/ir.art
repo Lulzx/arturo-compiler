@@ -38,11 +38,13 @@ escapeString: function [s][
     out: @[]
     loop s [ch][
         c: to :string ch
-        if c = "\\" -> addItem out "\\\\"
-        if c = "\"" -> addItem out "\\\""
-        if c <> "\\" [
-            if c <> "\"" -> addItem out c
-        ]
+        escaped: false
+        if c = "\\" [ addItem out "\\\\" escaped: true ]
+        if c = "\"" [ addItem out "\\\"" escaped: true ]
+        if c = "\n" [ addItem out "\\n" escaped: true ]
+        if c = "\r" [ addItem out "\\r" escaped: true ]
+        if c = "\t" [ addItem out "\\t" escaped: true ]
+        if not? escaped -> addItem out c
     ]
     join out
 ]
@@ -194,6 +196,12 @@ ir2art: function [node][
         ex: ir2art node\expr
         return node\name ++ ": " ++ ex
     ]
+    if "let" = op [
+        ex: ir2art node\expr
+        return "let '" ++ node\name ++ " " ++ ex
+    ]
+    if "break" = op -> return "break"
+    if "continue" = op -> return "continue"
     if "function" = op [
         pr: renderValue node\args\0
         bd: ir2artSeq node\args\1
@@ -203,6 +211,45 @@ ir2art: function [node][
         cd: ir2art node\args\0
         ys: ir2artSeq node\args\1
         return "if " ++ cd ++ " [" ++ ys ++ "]"
+    ]
+    if "unless" = op [
+        cd: ir2art node\args\0
+        ac: ir2artSeq node\args\1
+        return "unless " ++ cd ++ " [" ++ ac ++ "]"
+    ]
+    if "switch" = op [
+        cd: ir2art node\args\0
+        ys: ir2artSeq node\args\1
+        ns: ir2artSeq node\args\2
+        return "switch " ++ cd ++ " [" ++ ys ++ "] [" ++ ns ++ "]"
+    ]
+    if "when" = op [
+        parts: @[]
+        j: 0
+        while [(j + 1) < size node\args][
+            addItem parts (ir2art node\args\[j])
+            body: ir2artSeq node\args\[j + 1]
+            addItem parts ("[" ++ body ++ "]")
+            j: j + 2
+        ]
+        return "when [" ++ (joinWith parts " ") ++ "]"
+    ]
+    if "using" = op [
+        valueText: ir2art node\args\0
+        bodyText: ir2artSeq node\args\1
+        return "using " ++ valueText ++ " [" ++ bodyText ++ "]"
+    ]
+    if "try" = op [
+        bodyText: ir2artSeq node\args\0
+        return "try [" ++ bodyText ++ "]"
+    ]
+    if "throws?" = op [
+        bodyText: ir2artSeq node\args\0
+        return "throws? [" ++ bodyText ++ "]"
+    ]
+    if "ensure" = op [
+        conditionText: ir2artSeq node\args\0
+        return "ensure [" ++ conditionText ++ "]"
     ]
     if "do" = op [
         ; a body is emitted as a seq; an expression as a single node
@@ -374,6 +421,17 @@ ir2artRefCall: function [node idx][
     ; `call` builtin, and a renamed word carries no arity, so the
     ; grouping of every call through it silently came apart.
     invocation: (ir2art node\fn) ++ " " ++ (joinWith parts " ")
+    ; These host primitives replace the referenced block rather than mutating
+    ; its shared body. A temporary alias therefore needs an explicit write-back
+    ; when the original reference is nested inside a container.
+    name: irCalleeName node\fn
+    replacement: false
+    if "difference" = name -> replacement: true
+    if "intersection" = name -> replacement: true
+    if "union" = name -> replacement: true
+    if replacement [
+        return "do [" ++ tmp ++ ": " ++ place ++ " " ++ invocation ++ " " ++ place ++ ": " ++ tmp ++ "]"
+    ]
     "do [" ++ tmp ++ ": " ++ place ++ " " ++ invocation ++ "]"
 ]
 
@@ -427,6 +485,10 @@ foldNode: function [node][
     if "define" = op [
         fe: foldNode node\expr
         return #[op: "define" name: node\name expr: fe]
+    ]
+    if "let" = op [
+        fe: foldNode node\expr
+        return #[op: "let" name: node\name expr: fe]
     ]
     if "call" = op [
         ff: foldNode node\fn

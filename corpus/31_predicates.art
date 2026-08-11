@@ -1,0 +1,40 @@
+; scalar, text, structural, and lexer-token predicates
+print numeric? "12.5"
+print numeric? "1e3"
+print numeric? "twelve"
+print true? true
+print true? 1
+print false? false
+print false? null
+print one? 1
+print one? "x"
+print one? [1]
+print one? 1..2
+print ascii? "compiler"
+print ascii? "λ"
+print whitespace? " \t"
+print whitespace? " x"
+print lower? "compiler"
+print lower? "Compiler"
+print upper? "ARTURO"
+print upper? "Arturo"
+print prefix? "compiler" "comp"
+print suffix? "compiler" "iler"
+print between? 5 1 10
+print between? 11 1 10
+print same? 1 1
+print same? 1 1.0
+print same? [1 [2]] [1 [2]]
+
+print "word" print word? first to :block "foo"
+print "label" print label? first to :block "foo: 1"
+print "literal" print literal? first to :block "'foo"
+print "symbol" print symbol? first to :block "+"
+print "type" print type? first to :block ":integer"
+print "inline" print inline? first to :block "(1 + 2)"
+print "path" print path? first to :block "foo\\bar"
+print "pathlabel" print pathLabel? first to :block "foo\\bar: 1"
+print "pathliteral" print pathLiteral? first to :block "'foo\\bar"
+print "regex" print regex? first to :block "{/a/}"
+print "attribute" print attribute? first to :block ".foo"
+print "attributelabel" print attributeLabel? first to :block ".foo: 1"

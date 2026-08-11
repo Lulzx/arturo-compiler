@@ -1,0 +1,15 @@
+; continue skips the remainder of the current iteration; break exits only the
+; innermost loop.
+i: 0
+while [i < 5][
+    i: i + 1
+    if i = 2 [continue]
+    if i = 4 [break]
+    print i
+]
+print i
+
+loop 1..4 [n][
+    if n = 2 [continue]
+    print n
+]

@@ -1,0 +1,21 @@
+; lazy structured failure values and predicates
+ok: try [1 + 2]
+print type ok
+print ok
+
+err: try [throw "boom"]
+print type err
+print error? err
+print err
+
+print throws? [throw "bad"]
+print throws? [1 + 2]
+arithmetic: try [1 / 0]
+print type arithmetic
+print error? arithmetic
+print throws? [1 / 0]
+
+f: function [msg][try [throw msg]]
+captured: f "inside"
+print error? captured
+print captured

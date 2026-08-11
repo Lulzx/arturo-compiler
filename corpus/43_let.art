@@ -1,0 +1,14 @@
+; explicit reference assignment updates the nearest existing binding; a
+; missing binding is created in the current frame.
+x: 1
+f: function [][
+    let 'x 2
+    let 'created 7
+    print x
+    print created
+]
+f
+print x
+
+let 'top 4
+print top

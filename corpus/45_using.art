@@ -1,0 +1,16 @@
+; dynamic `this` scope, outer rebinding, nesting, and result propagation
+x: 1
+print using 7 [x + this]
+using 7 [x: x + this]
+print x
+
+this: 99
+using 7 [
+    print this
+    using 8 [print this]
+    print this
+]
+print this
+
+f: function [n][using n [this + 1]]
+print f 4

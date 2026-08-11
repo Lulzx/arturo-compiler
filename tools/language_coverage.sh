@@ -7,8 +7,15 @@ native=$(mktemp)
 trap 'rm -f "$declared" "$native"' EXIT
 
 sed -n 's/^    "\([^"]*\)":.*/\1/p' src/intrinsics.art | sort -u >"$declared"
-grep -Eo '\{"[^"]+",b_[A-Za-z0-9_]+' runtime/runtime.c \
-    | sed 's/^{"//; s/",b_.*//' | sort -u >"$native"
+{
+    # Donated primitives implemented by the standalone runtime.
+    grep -Eo '\{"[^"]+",b_[A-Za-z0-9_]+' runtime/runtime.c \
+        | sed 's/^{"//; s/",b_.*//'
+    # Structural language declarations are compiler-owned rules, not runtime
+    # builtin calls. They still implement declared language surface and must
+    # not be reported as missing merely because they bypass BUILTINS.
+    sed -n 's/^defRule "\([^"]*\)".*/\1/p' src/kernel.art
+} | sort -u >"$native"
 
 declared_count=$(wc -l <"$declared" | tr -d ' ')
 native_count=$(wc -l <"$native" | tr -d ' ')

@@ -1,0 +1,7 @@
+; type-registry membership, independent of variable bindings
+print defined? :integer
+print defined? :error
+print defined? :quantity
+print defined? "foo"
+print defined? "dictionary"
+print defined? "not-a-type"

@@ -145,12 +145,10 @@ cMutating?: function [fn][
     if :dictionary = type fn [
         if fn\op = "intrinsic" [
             nm: to :string fn\name
-            if nm = "insert" [ return true ]
-            if nm = "append" [ return true ]
-            if nm = "pop"    [ return true ]
-            if nm = "set"    [ return true ]
-            if nm = "inc"    [ return true ]
-            if nm = "dec"    [ return true ]
+            ; Mutation metadata is generated from Arturo's declared
+            ; PathLiteral arguments. Keeping a second hand-written list here
+            ; silently dropped every newly implemented mutator.
+            return mutatesThroughRef? nm
         ]
     ]
     false
@@ -246,6 +244,39 @@ cIf: function [n][
         return "ir_op(\"if\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ ", " ++ elsec ++ "}, 3)"
     ]
     "ir_op(\"if\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ "}, 2)"
+]
+cUnless: function [n][
+    condc: cNode n\args\0
+    actionc: cNode n\args\1
+    "ir_op(\"unless\", (IR*[]){" ++ condc ++ ", " ++ actionc ++ "}, 2)"
+]
+cSwitch: function [n][
+    condc: cNode n\args\0
+    yesc: cNode n\args\1
+    noc: cNode n\args\2
+    "ir_op(\"switch\", (IR*[]){" ++ condc ++ ", " ++ yesc ++ ", " ++ noc ++ "}, 3)"
+]
+cWhen: function [n][
+    parts: @[]
+    loop n\args [a][ addItem parts (cNode a) ]
+    "ir_op(\"when\", (IR*[]){" ++ (joinWith parts ", ") ++ "}, " ++ (to :string (size n\args)) ++ ")"
+]
+cUsing: function [n][
+    valuec: cNode n\args\0
+    bodyc: cNode n\args\1
+    "ir_op(\"using\", (IR*[]){" ++ valuec ++ ", " ++ bodyc ++ "}, 2)"
+]
+cTry: function [n][
+    bodyc: cNode n\args\0
+    "ir_op(\"try\", (IR*[]){" ++ bodyc ++ "}, 1)"
+]
+cThrows: function [n][
+    bodyc: cNode n\args\0
+    "ir_op(\"throws?\", (IR*[]){" ++ bodyc ++ "}, 1)"
+]
+cEnsure: function [n][
+    bodyc: cNode n\args\0
+    "ir_op(\"ensure\", (IR*[]){" ++ bodyc ++ "}, 1)"
 ]
 
 ; ---- complex (computed-key) paths -----------------------------------------
@@ -422,11 +453,21 @@ cNode: function [n][
         ; ir_intrinsic — cCallee handles that.
         "intrinsic"    -> "ir_word(" ++ (quoteC (to :string n\name)) ++ ")"
         "define"       -> cDefine n
+        "let"          -> cLet n
+        "break"        -> "ir_op(\"break\", NULL, 0)"
+        "continue"     -> "ir_op(\"continue\", NULL, 0)"
         "block"        -> cBlock n\items
         "call"         -> cCall n
         "function"     -> cFunction n
         "do"           -> cDo n
         "if"           -> cIf n
+        "unless"       -> cUnless n
+        "switch"       -> cSwitch n
+        "when"         -> cWhen n
+        "using"        -> cUsing n
+        "try"          -> cTry n
+        "throws?"      -> cThrows n
+        "ensure"       -> cEnsure n
         "while"        -> cWhile n
         "until"        -> cUntil n
         "loop"         -> cLoop n
@@ -441,6 +482,11 @@ cDefine: function [n][
     e: cNullConst
     if not? :null = type n\expr [ e: cNode n\expr ]
     "ir_define(" ++ (quoteC (to :string n\name)) ++ ", " ++ e ++ ")"
+]
+cLet: function [n][
+    e: cNullConst
+    if not? :null = type n\expr [ e: cNode n\expr ]
+    "ir_let(" ++ (quoteC (to :string n\name)) ++ ", " ++ e ++ ")"
 ]
 cDo: function [n][
     a: cNode n\args\0
@@ -493,7 +539,7 @@ directStmt: function [n][
     t: type a\value
     if :string = t [ return "puts(" ++ (quoteC a\value) ++ ");" ]
     if :integer = t [ return "puts(" ++ (quoteC (to :string a\value)) ++ ");" ]
-    if :floating = t [ return "printf(\"%g\\n\", (double)" ++ (to :string a\value) ++ ");" ]
+    if :floating = t [ return "rt_print_float((double)" ++ (to :string a\value) ++ ");" ]
     if :char = t [ return "fputs(" ++ (quoteC (to :string a\value)) ++ ", stdout); putchar('\\n');" ]
     if :logical = t [
         if a\value [ return "puts(\"true\");" ]
@@ -625,6 +671,11 @@ nativeExpr: function [n state][
         fnDef: get state\funcs n\fn\name
         params: fnDef\args\0
         fnBody: fnDef\args\1
+        ; Only the canonical function shape is eligible for direct inlining.
+        ; A host grouping quirk can preserve a single body node as a dictionary
+        ; instead of a sequence; indexing that as `fnBody\0` used to abort the
+        ; entire bootstrap rather than simply declining the optimization.
+        if :block <> type fnBody [ return nativeFail ]
         if (size params) <> size n\args [ return nativeFail ]
         argValues: @[]
         good: true
@@ -685,12 +736,21 @@ nativeExpr: function [n state][
             j: j + 1
         ]
         prefix: nativeSeq prefixNodes state
+        if or? (:dictionary <> type prefix) [not? key? prefix "ok"] [
+            prefix: #[ok: false kind: "" code: ""]
+        ]
         if not? prefix\ok [ good: false ]
         tailNode: last fnBody
         tail: nativeExpr tailNode state
+        if or? (:dictionary <> type tail) [not? key? tail "ok"] [
+            tail: #[ok: false kind: "" code: ""]
+        ]
         tailStatement: ""
         if not? tail\ok [
             tailSeq: nativeSeq @[tailNode] state
+            if or? (:dictionary <> type tailSeq) [not? key? tailSeq "ok"] [
+                tailSeq: #[ok: false kind: "" code: ""]
+            ]
             if not? tailSeq\ok [ good: false ]
             if tailSeq\ok [ tailStatement: tailSeq\code ]
         ]
@@ -966,6 +1026,11 @@ nativeExpr: function [n state][
         return nativeResult true "int" ("(" ++ left\code ++ " % " ++ right\code ++ ")")
     ]
     if "pow" = name [
+        ; Arturo preserves integer type for non-negative integer powers, but a
+        ; negative exponent becomes floating. The typed path cannot represent
+        ; that value-dependent result kind, so integer operands use the dynamic
+        ; runtime, which performs the correct dispatch.
+        if and? ("int" = left\kind) ("int" = right\kind) [ return nativeFail ]
         if not? nativeNumeric? left\kind [ return nativeFail ]
         if not? nativeNumeric? right\kind [ return nativeFail ]
         return nativeResult true "float" ("pow((double)(" ++ left\code ++ "), (double)(" ++ right\code ++ "))")
@@ -1250,7 +1315,7 @@ nativePrint: function [r][
     if "null" = r\kind [ return "puts(\"null\");" ]
     if "string" = r\kind [ return "puts(" ++ r\code ++ ");" ]
     if "int" = r\kind [ return "printf(\"%ld\\n\", (long)(" ++ r\code ++ "));" ]
-    if "float" = r\kind [ return "printf(\"%g\\n\", (double)(" ++ r\code ++ "));" ]
+    if "float" = r\kind [ return "rt_print_float((double)(" ++ r\code ++ "));" ]
     if "bool" = r\kind [ return "puts((" ++ r\code ++ ") ? \"true\" : \"false\");" ]
     if "range" = r\kind [ return "printf(\"%ld..%ld\\n\", (long)(" ++ r\code ++ ").lo, (long)(" ++ r\code ++ ").hi);" ]
     if "dynamic" = r\kind [ return "ds_print(" ++ r\code ++ ");" ]
@@ -1600,11 +1665,11 @@ nativeProgram: function [ir][
         helpers: "static char *dc_concat(const char *a, const char *b){ size_t na=strlen(a), nb=strlen(b); char *r=(char*)malloc(na+nb+1); memcpy(r,a,na); memcpy(r+na,b,nb+1); return r; }\n\n"
     ]
     if state\dynamic [
-        helpers: helpers ++ "typedef struct DSeq DSeq;\ntypedef struct { int tag; long i; double f; const char *s; DSeq *b; } DScalar;\nstruct DSeq { DScalar *items; size_t n; };\nstatic DScalar ds_null(void){ return (DScalar){0,0,0,NULL,NULL}; }\nstatic DScalar ds_int(long x){ return (DScalar){1,x,0,NULL,NULL}; }\nstatic DScalar ds_float(double x){ return (DScalar){2,0,x,NULL,NULL}; }\nstatic DScalar ds_string(const char *x){ return (DScalar){3,0,0,x,NULL}; }\nstatic DScalar ds_bool(int x){ return (DScalar){4,x,0,NULL,NULL}; }\nstatic DSeq ds_block(DScalar *x,size_t n){ return (DSeq){x,n}; }\nstatic DScalar ds_seq(DSeq x){ DSeq *p=(DSeq*)malloc(sizeof(DSeq)); *p=x; return (DScalar){5,0,0,NULL,p}; }\nstatic int ds_truth(DScalar x){ return x.tag != 0 && (x.tag != 4 || x.i); }\nstatic void ds_print_inner(DScalar x){ if(x.tag==0) printf(\"null\"); else if(x.tag==1) printf(\"%ld\",x.i); else if(x.tag==2) printf(\"%g\",x.f); else if(x.tag==3) printf(\"%s\",x.s); else if(x.tag==4) printf(x.i?\"true\":\"false\"); else { printf(\"[\"); for(size_t i=0;i<x.b->n;i++){ if(i)printf(\" \"); ds_print_inner(x.b->items[i]); } printf(\"]\"); } }\nstatic void ds_print(DScalar x){ ds_print_inner(x); putchar('\\n'); }\nstatic void ds_print_seq(DSeq x){ for(size_t i=0;i<x.n;i++){ ds_print_inner(x.items[i]); putchar(' '); } putchar('\\n'); }\n\n"
+        helpers: helpers ++ "typedef struct DSeq DSeq;\ntypedef struct { int tag; long i; double f; const char *s; DSeq *b; } DScalar;\nstruct DSeq { DScalar *items; size_t n; };\nstatic DScalar ds_null(void){ return (DScalar){0,0,0,NULL,NULL}; }\nstatic DScalar ds_int(long x){ return (DScalar){1,x,0,NULL,NULL}; }\nstatic DScalar ds_float(double x){ return (DScalar){2,0,x,NULL,NULL}; }\nstatic DScalar ds_string(const char *x){ return (DScalar){3,0,0,x,NULL}; }\nstatic DScalar ds_bool(int x){ return (DScalar){4,x,0,NULL,NULL}; }\nstatic DSeq ds_block(DScalar *x,size_t n){ return (DSeq){x,n}; }\nstatic DScalar ds_seq(DSeq x){ DSeq *p=(DSeq*)malloc(sizeof(DSeq)); *p=x; return (DScalar){5,0,0,NULL,p}; }\nstatic int ds_truth(DScalar x){ return x.tag != 0 && (x.tag != 4 || x.i); }\nstatic void ds_print_inner(DScalar x){ if(x.tag==0) printf(\"null\"); else if(x.tag==1) printf(\"%ld\",x.i); else if(x.tag==2) rt_write_float(x.f); else if(x.tag==3) printf(\"%s\",x.s); else if(x.tag==4) printf(x.i?\"true\":\"false\"); else { printf(\"[\"); for(size_t i=0;i<x.b->n;i++){ if(i)printf(\" \"); ds_print_inner(x.b->items[i]); } printf(\"]\"); } }\nstatic void ds_print(DScalar x){ ds_print_inner(x); putchar('\\n'); }\nstatic void ds_print_seq(DSeq x){ for(size_t i=0;i<x.n;i++){ ds_print_inner(x.items[i]); putchar(' '); } putchar('\\n'); }\n\n"
     ]
     content: body\code
     if not? empty? content [ content: "\t" ++ (replace content "\n" "\n\t") ++ "\n" ]
-    "/* typed native C: no IR interpreter */\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\ntypedef struct { long lo, hi; } DRange;\n\n" ++ helpers ++ "int main(void){\n" ++ content ++ "\treturn 0;\n}\n"
+    "/* typed native C: no IR interpreter */\n#include \"runtime.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\ntypedef struct { long lo, hi; } DRange;\n\n" ++ helpers ++ "int main(void){\n" ++ content ++ "\treturn 0;\n}\n"
 ]
 
 directProgram: function [ir][
@@ -1646,12 +1711,18 @@ directProgram: function [ir][
     if hasGeneric [
         return "/* hybrid C: direct statements plus the dynamic fallback */\n#include \"runtime.h\"\n#include <stdio.h>\n\nint main(int argc, char **argv){\n\truntime_set_args(argc, argv);\n\tEnv *e = env_new(NULL);\n" ++ body ++ "\treturn 0;\n}\n"
     ]
-    "/* direct C: this program needs no Arturo runtime */\n#include <stdio.h>\n\nint main(void){\n" ++ body ++ "\treturn 0;\n}\n"
+    "/* direct C */\n#include \"runtime.h\"\n#include <stdio.h>\n\nint main(void){\n" ++ body ++ "\treturn 0;\n}\n"
 ]
 
 compileToC: function [src][
-    ir: fold (compileToIR src)
-    native: nativeProgram ir
+    rawIR: compileToIR src
+    ir: fold rawIR
+    native: ""
+    ; Typed lowering is an optimization, never the semantic fallback. Large
+    ; self-host inputs are far outside its scalar subset and can trip host
+    ; value-stack/index defects merely while proving ineligibility. Decline
+    ; that probe and let the complete dynamic emitter handle the same IR.
+    if 50000 > (size src) [ native: nativeProgram ir ]
     if not? empty? native [ return native ]
     direct: directProgram ir
     if not? empty? direct [ return direct ]
