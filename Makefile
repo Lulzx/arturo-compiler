@@ -11,7 +11,7 @@ RUNTIME_A = runtime/runtime.a
 SOURCES  = src/intrinsics.art src/semantics.art src/front.art src/kernel.art \
            src/ir.art src/backend.art src/cbackend.art runtime/runtime.c
 
-.PHONY: ncomp test verify check clean
+.PHONY: ncomp test verify compat check clean
 
 # The native compiler: emitted by its own C backend, linked against runtime.c.
 ncomp: $(NCCOMP)
@@ -33,7 +33,12 @@ test:
 verify: ncomp
 	bash tools/selfhost_test.sh
 
-check: test verify
+# Deliberate improvements over pinned host defects have their own expected
+# outputs; they do not belong in the host-parity corpus above.
+compat: ncomp
+	bash tools/compat_test.sh
+
+check: test verify compat
 
 clean:
 	rm -f $(NCCOMP) tmp/ncomp_src.art native_compiler

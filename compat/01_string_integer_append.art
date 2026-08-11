@@ -1,0 +1,2 @@
+; Arturo 0.10.0 errors here; native semantics intentionally stringify 13.
+print "n=" ++ 13

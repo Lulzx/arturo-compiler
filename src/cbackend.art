@@ -530,6 +530,10 @@ nativeExpr: function [n state][
         if :integer = rawType [ return nativeResult true "int" (to :string n) ]
         if :floating = rawType [ return nativeResult true "float" (to :string n) ]
         if :string = rawType [ return nativeResult true "string" (quoteC n) ]
+        if :word = rawType [ return nativeResult true "string" (quoteC (to :string n)) ]
+        if :literal = rawType [ return nativeResult true "string" (quoteC (to :string n)) ]
+        if :symbol = rawType [ return nativeResult true "string" (quoteC (to :string n)) ]
+        if :type = rawType [ return nativeResult true "string" (quoteC (":" ++ (to :string n))) ]
         if :logical = rawType [
             if n [ return nativeResult true "bool" "1" ]
             return nativeResult true "bool" "0"
@@ -538,6 +542,7 @@ nativeExpr: function [n state][
     ]
     if not? key? n "op" [ return nativeFail ]
     op: n\op
+    if "passthrough" = op [ return nativeExpr n\src state ]
     if "const" = op [
         if :null = type n\value [ return nativeResult true "null" "0" ]
         t: type n\value
@@ -558,6 +563,48 @@ nativeExpr: function [n state][
         ]
         return nativeFail
     ]
+    if "block" = op [
+        return nativeBlockResult n\items state
+    ]
+    if "do" = op [
+        seq: n\args\0
+        if :dictionary = type seq [
+            loaded: nativeExpr seq state
+            if not? loaded\ok [ return nativeFail ]
+            if "block" <> loaded\kind [ return nativeFail ]
+            if not? key? state\blockitems loaded\code [ return nativeFail ]
+            seq: get state\blockitems loaded\code
+            rawNode: nativeRawNode seq "" null
+            if rawNode\ok [ return nativeExpr (foldNode rawNode\node) state ]
+        ]
+        if :block <> type seq [ return nativeFail ]
+        if empty? seq [ return nativeResult true "null" "0" ]
+        ; Expression-form direct do is safe here when preceding elements are
+        ; inert values; the last value is the block result.
+        if 1 < size seq [
+            k: 0
+            while [k < dec (size seq)][
+                preNode: seq\[k]
+                if and? (:dictionary = type preNode) ("define" = preNode\op) [
+                    pre: nativeExpr preNode\expr state
+                    if not? pre\ok [ return nativeFail ]
+                    set state\vars preNode\name pre
+                ]
+                if not? and? (:dictionary = type preNode) ("define" = preNode\op) [
+                    pre: nativeExpr preNode state
+                    if not? pre\ok [ return nativeFail ]
+                ]
+                k: k + 1
+            ]
+        ]
+        return nativeExpr (last seq) state
+    ]
+    if "function" = op [
+        ident: "df_" ++ (to :string state\functionnext)
+        state\functionnext: state\functionnext + 1
+        set state\functionvals ident n
+        return nativeResult true "function" ident
+    ]
     if "range" = op [
         fromv: nativeExpr n\args\0 state
         tov: nativeExpr n\args\1 state
@@ -573,44 +620,236 @@ nativeExpr: function [n state][
     ; to native expressions. This preserves call-by-value for this pure subset
     ; and avoids shipping the closure/IR machinery for ordinary helpers.
     if "load" = n\fn\op [
+        if "makeDict" = n\fn\name [ return nativeMakeDict n state ]
         if not? key? state\funcs n\fn\name [ return nativeFail ]
         fnDef: get state\funcs n\fn\name
         params: fnDef\args\0
         fnBody: fnDef\args\1
-        if 1 <> size fnBody [ return nativeFail ]
         if (size params) <> size n\args [ return nativeFail ]
-        saved: @[]
-        had: @[]
+        argValues: @[]
         good: true
         j: 0
-        loop params [p][
-            pname: to :string p
-            existed: key? state\vars pname
-            addItem had existed
-            old: nativeFail
-            if existed [ old: get state\vars pname ]
-            addItem saved old
-            av: nativeExpr n\args\[j] state
+        loop n\args [aNode][
+            av: nativeExpr aNode state
             if not? av\ok [ good: false ]
-            if av\ok [ set state\vars pname av ]
-            j: j + 1
+            addItem argValues av
         ]
-        result: nativeFail
-        if good [ result: nativeExpr fnBody\0 state ]
-        j: 0
+        if not? good [ return nativeFail ]
+        ; Compile a call in its own lexical map. For multi-statement functions,
+        ; parameters become local C variables so loops may update them.
+        outerVars: state\vars
+        localVars: #[]
+        loop outerVars [k v][ set localVars k v ]
+        state\vars: localVars
+        if 1 = size fnBody [
+            j: 0
+            loop params [p][
+                set state\vars (to :string p) argValues\[j]
+                j: j + 1
+            ]
+            result: nativeExpr fnBody\0 state
+            state\vars: outerVars
+            return result
+        ]
+        decls: @[]
         loop params [p][
             pname: to :string p
-            if had\[j] [ set state\vars pname saved\[j] ]
-            if not? had\[j] [
-                unavailable: nativeFail
-                set state\vars pname unavailable
+            av: argValues\[j]
+            ctype: nativeCType av\kind
+            if empty? ctype [
+                set state\vars pname av
+            ]
+            if not? empty? ctype [
+                cname: "dp_" ++ (to :string state\next)
+                state\next: state\next + 1
+                addItem decls (ctype ++ " " ++ cname ++ " = " ++ av\code ++ ";")
+                set state\vars pname (nativeResult true av\kind cname)
             ]
             j: j + 1
         ]
-        return result
+        if empty? fnBody [ state\vars: outerVars return nativeResult true "null" "0" ]
+        savedReturnKind: state\returnKind
+        savedReturnVar: state\returnVar
+        savedReturnLabel: state\returnLabel
+        savedTerminated: state\terminated
+        state\returnKind: ""
+        state\returnVar: "dr_" ++ (to :string state\next)
+        state\next: state\next + 1
+        state\returnLabel: "dl_" ++ (to :string state\next)
+        state\next: state\next + 1
+        state\terminated: false
+        prefixNodes: @[]
+        j: 0
+        while [j < dec (size fnBody)][
+            addItem prefixNodes fnBody\[j]
+            j: j + 1
+        ]
+        prefix: nativeSeq prefixNodes state
+        if not? prefix\ok [ good: false ]
+        tailNode: last fnBody
+        tail: nativeExpr tailNode state
+        tailStatement: ""
+        if not? tail\ok [
+            tailSeq: nativeSeq @[tailNode] state
+            if not? tailSeq\ok [ good: false ]
+            if tailSeq\ok [ tailStatement: tailSeq\code ]
+        ]
+        explicitKind: state\returnKind
+        resultKind: explicitKind
+        if empty? resultKind [
+            if tail\ok [ resultKind: tail\kind ]
+        ]
+        if and? (not? empty? explicitKind) tail\ok [
+            if explicitKind <> tail\kind [ good: false ]
+        ]
+        ctype: nativeCType resultKind
+        if empty? ctype [ good: false ]
+        code: ""
+        if good [
+            pieces: @[]
+            loop decls [d][ addItem pieces d ]
+            if not? empty? explicitKind [ addItem pieces (ctype ++ " " ++ state\returnVar ++ ";") ]
+            if not? empty? prefix\code [ addItem pieces prefix\code ]
+            if tail\ok [
+                if empty? explicitKind [ addItem pieces tail\code ]
+                if not? empty? explicitKind [ addItem pieces (state\returnVar ++ " = " ++ tail\code ++ ";") ]
+            ]
+            if not? empty? tailStatement [ addItem pieces tailStatement ]
+            if not? empty? explicitKind [
+                addItem pieces (state\returnLabel ++ ":")
+                addItem pieces state\returnVar
+            ]
+            code: "({ " ++ (joinWith pieces "\n") ++ "; })"
+        ]
+        state\vars: outerVars
+        state\returnKind: savedReturnKind
+        state\returnVar: savedReturnVar
+        state\returnLabel: savedReturnLabel
+        state\terminated: savedTerminated
+        if not? good [ return nativeFail ]
+        return nativeResult true resultKind code
     ]
     if "intrinsic" <> n\fn\op [ return nativeFail ]
     name: n\fn\name
+
+    if "map" = name [ return nativeHigher n state false ]
+    if "select" = name [ return nativeHigher n state true ]
+
+    if "get" = name [
+        if 2 <> size n\args [ return nativeFail ]
+        owner: nativeExpr n\args\0 state
+        if not? owner\ok [ return nativeFail ]
+        if "block" = owner\kind [
+            index: nativeExpr n\args\1 state
+            if not? index\ok [ return nativeFail ]
+            if "int" <> index\kind [ return nativeFail ]
+            if not? key? state\blockitems owner\code [ return nativeFail ]
+            items: get state\blockitems owner\code
+            keyNode: n\args\1
+            if :dictionary = type keyNode [
+                if "const" = keyNode\op [
+                    if :integer = type keyNode\value [
+                        numericIndex: keyNode\value
+                        if (0 =< numericIndex) [
+                            if (numericIndex < size items) [ return nativeExpr items\[numericIndex] state ]
+                        ]
+                    ]
+                ]
+            ]
+            state\dynamic: true
+            return nativeResult true "dynamic" ("(" ++ owner\code ++ ").items[" ++ index\code ++ "]")
+        ]
+        if "dict" <> owner\kind [ return nativeFail ]
+        keyText: nativeKeyText n\args\1
+        if empty? keyText [ return nativeFail ]
+        fields: get state\dicts owner\code
+        if not? key? fields keyText [ return nativeResult true "null" "0" ]
+        found: get fields keyText
+        return found
+    ]
+    if "key?" = name [
+        if 2 <> size n\args [ return nativeFail ]
+        owner: nativeExpr n\args\0 state
+        if not? owner\ok [ return nativeFail ]
+        if "dict" <> owner\kind [ return nativeFail ]
+        keyText: nativeKeyText n\args\1
+        if empty? keyText [ return nativeFail ]
+        fields: get state\dicts owner\code
+        if key? fields keyText [ return nativeResult true "bool" "1" ]
+        return nativeResult true "bool" "0"
+    ]
+    if "set" = name [
+        if 3 <> size n\args [ return nativeFail ]
+        owner: nativeExpr n\args\0 state
+        if not? owner\ok [ return nativeFail ]
+        if "dict" <> owner\kind [ return nativeFail ]
+        keyText: nativeKeyText n\args\1
+        if empty? keyText [ return nativeFail ]
+        value: nativeExpr n\args\2 state
+        if not? value\ok [ return nativeFail ]
+        fields: get state\dicts owner\code
+        set fields keyText value
+        return value
+    ]
+    if "call" = name [
+        if 2 <> size n\args [ return nativeFail ]
+        callable: nativeExpr n\args\0 state
+        argv: nativeExpr n\args\1 state
+        if not? callable\ok [ return nativeFail ]
+        if not? argv\ok [ return nativeFail ]
+        if "function" <> callable\kind [ return nativeFail ]
+        if "block" <> argv\kind [ return nativeFail ]
+        if not? key? state\functionvals callable\code [ return nativeFail ]
+        if not? key? state\blockitems argv\code [ return nativeFail ]
+        tempName: "callable_" ++ (to :string state\functionnext)
+        state\functionnext: state\functionnext + 1
+        set state\funcs tempName (get state\functionvals callable\code)
+        fnLoad: #[op: "load" name: tempName]
+        callArgs: @[]
+        loop (get state\blockitems argv\code) [item][
+            if :dictionary = type item [ addItem callArgs item ]
+            if :dictionary <> type item [ addItem callArgs (nativeTokenNode item "") ]
+        ]
+        return nativeExpr #[op: "call" fn: fnLoad args: callArgs] state
+    ]
+
+    if "pop" = name [
+        if 1 <> size n\args [ return nativeFail ]
+        refNode: n\args\0
+        if :dictionary <> type refNode [ return nativeFail ]
+        if "passthrough" <> refNode\op [ return nativeFail ]
+        owner: nativeRefValue refNode\src state
+        if not? owner\ok [ return nativeFail ]
+        if "block" <> owner\kind [ return nativeFail ]
+        if not? key? state\blockitems owner\code [ return nativeFail ]
+        items: get state\blockitems owner\code
+        if empty? items [ return nativeResult true "null" "0" ]
+        popped: nativeExpr (last items) state
+        kept: @[]
+        j: 0
+        while [j < dec (size items)][ addItem kept items\[j] j: j + 1 ]
+        set state\blockitems owner\code kept
+        return popped
+    ]
+    if "append" = name [
+        if 2 <> size n\args [ return nativeFail ]
+        refNode: n\args\0
+        if :dictionary = type refNode [
+            if "passthrough" = refNode\op [
+                owner: nativeRefValue refNode\src state
+                if owner\ok [
+                    if "block" = owner\kind [
+                        if key? state\blockitems owner\code [
+                            items: get state\blockitems owner\code
+                            addItem items n\args\1
+                            set state\blockitems owner\code items
+                            return owner
+                        ]
+                    ]
+                ]
+            ]
+        ]
+    ]
 
     ; size of a literal block needs no block runtime representation.
     if "size" = name [
@@ -623,6 +862,14 @@ nativeExpr: function [n state][
         if not? one\ok [ return nativeFail ]
         if "string" = one\kind [ return nativeResult true "int" ("(long)strlen(" ++ one\code ++ ")") ]
         if "range" = one\kind [ return nativeResult true "int" ("(long)(labs((" ++ one\code ++ ").hi - (" ++ one\code ++ ").lo) + 1)") ]
+        if "block" = one\kind [
+            if key? state\blockitems one\code [ return nativeResult true "int" (to :string (size (get state\blockitems one\code))) ]
+            return nativeResult true "int" ("(long)(" ++ one\code ++ ").n")
+        ]
+        if "dict" = one\kind [
+            fields: get state\dicts one\code
+            return nativeResult true "int" (to :string (size fields))
+        ]
         return nativeFail
     ]
     if "type" = name [
@@ -635,6 +882,7 @@ nativeExpr: function [n state][
         if "string" = one\kind [ tn: ":string" ]
         if "bool" = one\kind [ tn: ":logical" ]
         if "null" = one\kind [ tn: ":null" ]
+        if "dict" = one\kind [ tn: ":dictionary" ]
         if empty? tn [ return nativeFail ]
         return nativeResult true "string" (quoteC tn)
     ]
@@ -732,6 +980,16 @@ nativeExpr: function [n state][
     if "greaterOrEqual?" = name [ cmp: ">=" ]
     if not? empty? cmp [
         if and? ("string" = left\kind) ("string" = right\kind) [
+            leftLiteral: false
+            rightLiteral: false
+            if not? empty? left\code [ leftLiteral: "\"" = slice left\code 0 0 ]
+            if not? empty? right\code [ rightLiteral: "\"" = slice right\code 0 0 ]
+            if and? (and? leftLiteral rightLiteral) (or? ("equal?" = name) ("notEqual?" = name)) [
+                literalEqual: left\code = right\code
+                if "notEqual?" = name [ literalEqual: not? literalEqual ]
+                if literalEqual [ return nativeResult true "bool" "1" ]
+                return nativeResult true "bool" "0"
+            ]
             return nativeResult true "bool" ("(strcmp(" ++ left\code ++ ", " ++ right\code ++ ") " ++ cmp ++ " 0)")
         ]
         if and? (nativeNumeric? left\kind) (nativeNumeric? right\kind) [
@@ -744,10 +1002,248 @@ nativeExpr: function [n state][
     nativeFail
 ]
 
+nativeKeyText: function [n][
+    if :dictionary <> type n [ return to :string n ]
+    if "const" = n\op [
+        if :null = type n\value [ return "" ]
+        return to :string n\value
+    ]
+    if "passthrough" = n\op [
+        if :null = type n\src [ return "" ]
+        return to :string n\src
+    ]
+    ""
+]
+
+nativeRefValue: function [src state][
+    if :literal = type src [
+        name: to :string src
+        if key? state\vars name [ return get state\vars name ]
+        return nativeFail
+    ]
+    if :pathliteral = type src [
+        parts: to :block src
+        if empty? parts [ return nativeFail ]
+        base: to :string parts\0
+        if not? key? state\vars base [ return nativeFail ]
+        current: get state\vars base
+        j: 1
+        while [j < size parts][
+            if "dict" <> current\kind [ return nativeFail ]
+            fields: get state\dicts current\code
+            keyText: to :string parts\[j]
+            if not? key? fields keyText [ return nativeFail ]
+            current: get fields keyText
+            j: j + 1
+        ]
+        return current
+    ]
+    nativeFail
+]
+
+nativeBlockResult: function [items state][
+    boxedItems: @[]
+    goodItems: true
+    loop items [item][
+        ri: nativeExpr item state
+        if not? ri\ok [ goodItems: false ]
+        if ri\ok [
+            bi: nativeBox ri
+            if empty? bi [ goodItems: false ]
+            if not? empty? bi [ addItem boxedItems bi ]
+        ]
+    ]
+    if not? goodItems [ return nativeFail ]
+    state\blocks: true
+    state\dynamic: true
+    blockCode: "ds_block((DScalar[]){" ++ (joinWith boxedItems ", ") ++ "}, " ++ (to :string (size boxedItems)) ++ ")"
+    set state\blockitems blockCode items
+    nativeResult true "block" blockCode
+]
+
+nativeMakeDict: function [n state][
+    if 0 <> (size n\args) % 2 [ return nativeFail ]
+    fields: #[]
+    good: true
+    j: 0
+    while [j < size n\args][
+        keyText: nativeKeyText n\args\[j]
+        if empty? keyText [ good: false ]
+        value: nativeExpr n\args\[j + 1] state
+        if not? value\ok [ good: false ]
+        if and? good (not? empty? keyText) [ set fields keyText value ]
+        j: j + 2
+    ]
+    if not? good [ return nativeFail ]
+    ident: "dd_" ++ (to :string state\dictnext)
+    state\dictnext: state\dictnext + 1
+    set state\dicts ident fields
+    nativeResult true "dict" ident
+]
+
+nativeOpName: function [glyph][
+    if "+" = glyph [ return "add" ]
+    if "-" = glyph [ return "sub" ]
+    if "*" = glyph [ return "mul" ]
+    if "/" = glyph [ return "div" ]
+    if "//" = glyph [ return "fdiv" ]
+    if "%" = glyph [ return "mod" ]
+    if "^" = glyph [ return "pow" ]
+    if "++" = glyph [ return "append" ]
+    if "=" = glyph [ return "equal?" ]
+    if "<>" = glyph [ return "notEqual?" ]
+    if "<" = glyph [ return "less?" ]
+    if ">" = glyph [ return "greater?" ]
+    if "=<" = glyph [ return "lessOrEqual?" ]
+    if ">=" = glyph [ return "greaterOrEqual?" ]
+    ""
+]
+
+nativeTokenNode: function [token paramName][
+    if :dictionary = type token [ return token ]
+    r: #[]
+    if and? (:word = type token) ((to :string token) = paramName) [
+        r\op: "load"
+        r\name: paramName
+        return r
+    ]
+    r\op: "const"
+    r\value: token
+    r
+]
+
+nativeRawToken: function [token paramName replacement][
+    if not? empty? paramName [
+        tokenType: type token
+        if or? (:word = tokenType) (:string = tokenType) [
+            if (to :string token) = paramName [ return nativeTokenNode replacement "" ]
+        ]
+    ]
+    if :inline = type token [
+        nested: nativeRawNode (to :block token) paramName replacement
+        if nested\ok [ return nested\node ]
+        return null
+    ]
+    nativeTokenNode token paramName
+]
+
+nativeRawNode: function [items paramName replacement][
+    fail: #[ok: false node: null]
+    if 1 = size items [ return #[ok: true node: nativeRawToken items\0 paramName replacement] ]
+    fnName: ""
+    args: @[]
+    if 2 = size items [
+        fnName: to :string items\0
+        addItem args (nativeRawToken items\1 paramName replacement)
+    ]
+    if 3 = size items [
+        fnName: nativeOpName (to :string items\1)
+        addItem args (nativeRawToken items\0 paramName replacement)
+        addItem args (nativeRawToken items\2 paramName replacement)
+    ]
+    if empty? fnName [ return fail ]
+    fn: #[op: "intrinsic" name: fnName]
+    #[ok: true node: #[op: "call" fn: fn args: args]]
+]
+
+nativeHigher: function [n state selecting][
+    if 3 <> size n\args [ return nativeFail ]
+    coll: n\args\0
+    params: n\args\1
+    action: n\args\2
+    collItems: @[]
+    if :dictionary = type coll [
+        if "block" = coll\op [ collItems: coll\items ]
+        if "load" = coll\op [
+            loadedColl: nativeExpr coll state
+            if loadedColl\ok [
+                if "block" = loadedColl\kind [
+                    if key? state\blockitems loadedColl\code [ collItems: get state\blockitems loadedColl\code ]
+                ]
+            ]
+        ]
+    ]
+    if empty? collItems [ return nativeFail ]
+    paramName: ""
+    if :dictionary = type params [
+        if "block" = params\op [
+            if not? empty? params\items [ paramName: to :string params\items\0 ]
+        ]
+        if "passthrough" = params\op [ paramName: to :string params\src ]
+    ]
+    if empty? paramName [ return nativeFail ]
+    if :dictionary <> type action [ return nativeFail ]
+    if "block" <> action\op [ return nativeFail ]
+    out: @[]
+    checks: @[]
+    good: true
+    loop collItems [item][
+        itemNode: nativeTokenNode item ""
+        itemValue: nativeExpr itemNode state
+        if not? itemValue\ok [ good: false ]
+        if itemValue\ok [
+            existed: key? state\vars paramName
+            old: nativeFail
+            if existed [ old: get state\vars paramName ]
+            set state\vars paramName itemValue
+            built: nativeRawNode action\items paramName item
+            if not? built\ok [ good: false ]
+            mapped: nativeFail
+            if built\ok [ mapped: nativeExpr built\node state ]
+            if not? mapped\ok [ good: false ]
+            if selecting [
+                if "bool" <> mapped\kind [ good: false ]
+            ]
+            chosen: mapped
+            if selecting [ chosen: itemValue ]
+            if good [
+                boxed: nativeBox chosen
+                if empty? boxed [ good: false ]
+                if not? empty? boxed [
+                    if not? selecting [ addItem out boxed ]
+                    if selecting [ addItem checks #[cond: mapped\code value: boxed] ]
+                ]
+            ]
+            if existed [ set state\vars paramName old ]
+            if not? existed [
+                unavailable: nativeFail
+                set state\vars paramName unavailable
+            ]
+        ]
+    ]
+    if not? good [ return nativeFail ]
+    state\blocks: true
+    state\dynamic: true
+    if selecting [
+        arr: "dh_a" ++ (to :string state\next)
+        state\next: state\next + 1
+        seq: "dh_s" ++ (to :string state\next)
+        state\next: state\next + 1
+        lines: @[]
+        addItem lines ("DScalar *" ++ arr ++ " = (DScalar*)malloc(sizeof(DScalar) * " ++ (to :string (size checks)) ++ ");")
+        addItem lines ("DSeq " ++ seq ++ " = ds_block(" ++ arr ++ ", 0);")
+        loop checks [check][ addItem lines ("if (" ++ check\cond ++ ") " ++ arr ++ "[" ++ seq ++ ".n++] = " ++ check\value ++ ";") ]
+        addItem lines seq
+        return nativeResult true "block" ("({ " ++ (joinWith lines " ") ++ "; })")
+    ]
+    nativeResult true "block" ("ds_block((DScalar[]){" ++ (joinWith out ", ") ++ "}, " ++ (to :string (size out)) ++ ")")
+]
+
 nativeTruth: function [r][
     if "null" = r\kind [ return "0" ]
     if "bool" = r\kind [ return r\code ]
+    if "dynamic" = r\kind [ return "ds_truth(" ++ r\code ++ ")" ]
     "1"
+]
+
+nativeBox: function [r][
+    if "null" = r\kind [ return "ds_null()" ]
+    if "int" = r\kind [ return "ds_int(" ++ r\code ++ ")" ]
+    if "float" = r\kind [ return "ds_float(" ++ r\code ++ ")" ]
+    if "string" = r\kind [ return "ds_string(" ++ r\code ++ ")" ]
+    if "bool" = r\kind [ return "ds_bool(" ++ r\code ++ ")" ]
+    if "block" = r\kind [ return "ds_seq(" ++ r\code ++ ")" ]
+    ""
 ]
 
 nativePrint: function [r][
@@ -757,6 +1253,8 @@ nativePrint: function [r][
     if "float" = r\kind [ return "printf(\"%g\\n\", (double)(" ++ r\code ++ "));" ]
     if "bool" = r\kind [ return "puts((" ++ r\code ++ ") ? \"true\" : \"false\");" ]
     if "range" = r\kind [ return "printf(\"%ld..%ld\\n\", (long)(" ++ r\code ++ ").lo, (long)(" ++ r\code ++ ").hi);" ]
+    if "dynamic" = r\kind [ return "ds_print(" ++ r\code ++ ");" ]
+    if "block" = r\kind [ return "ds_print_seq(" ++ r\code ++ ");" ]
     ""
 ]
 
@@ -766,14 +1264,50 @@ nativeCType: function [kind][
     if "string" = kind [ return "const char *" ]
     if "bool" = kind [ return "int" ]
     if "range" = kind [ return "DRange" ]
+    if "dynamic" = kind [ return "DScalar" ]
+    if "block" = kind [ return "DSeq" ]
     ""
+]
+
+nativeDictLoop: function [n state][
+    fail: nativeFail
+    coll: nativeExpr n\args\0 state
+    if not? coll\ok [ return fail ]
+    if "dict" <> coll\kind [ return fail ]
+    params: n\args\1
+    if 2 <> size params [ return fail ]
+    keyName: to :string params\0
+    valName: to :string params\1
+    keyHad: key? state\vars keyName
+    valHad: key? state\vars valName
+    keyOld: nativeFail
+    valOld: nativeFail
+    if keyHad [ keyOld: get state\vars keyName ]
+    if valHad [ valOld: get state\vars valName ]
+    lines: @[]
+    good: true
+    fields: get state\dicts coll\code
+    loop fields [k v][
+        if good [
+            set state\vars keyName (nativeResult true "string" (quoteC (to :string k)))
+            set state\vars valName v
+            action: nativeSeq n\args\2 state
+            if not? action\ok [ good: false ]
+            if action\ok [ addItem lines action\code ]
+        ]
+    ]
+    if keyHad [ set state\vars keyName keyOld ]
+    if not? keyHad [ set state\vars keyName nativeFail ]
+    if valHad [ set state\vars valName valOld ]
+    if not? valHad [ set state\vars valName nativeFail ]
+    nativeResult good "seq" (joinWith lines "\n")
 ]
 
 nativeSeq: function [ir state][
     lines: @[]
     good: true
     loop ir [n][
-        if good [
+        if and? good (not? state\terminated) [
             handled: false
             if :dictionary = type n [
                 if "define" = n\op [
@@ -787,22 +1321,43 @@ nativeSeq: function [ir state][
                         rv: nativeExpr n\expr state
                         if not? rv\ok [ good: false ]
                         if rv\ok [
+                        if "dict" = rv\kind [
+                            set state\vars n\name rv
+                            handled: true
+                        ]
+                        if "dict" <> rv\kind [
                         if key? state\vars n\name [
                             old: get state\vars n\name
-                            if old\kind <> rv\kind [ good: false ]
+                            if "dynamic" = old\kind [
+                                boxed: nativeBox rv
+                                if empty? boxed [ good: false ]
+                                if not? empty? boxed [ addItem lines (old\code ++ " = " ++ boxed ++ ";") ]
+                            ]
+                            if and? ("dynamic" <> old\kind) (old\kind <> rv\kind) [ good: false ]
                             if old\kind = rv\kind [ addItem lines (old\code ++ " = " ++ rv\code ++ ";") ]
                         ]
                         if not? key? state\vars n\name [
-                            ctype: nativeCType rv\kind
+                            storedKind: rv\kind
+                            initCode: rv\code
+                            if "null" = rv\kind [
+                                storedKind: "dynamic"
+                                initCode: "ds_null()"
+                                state\dynamic: true
+                            ]
+                            ctype: nativeCType storedKind
                             if empty? ctype [ good: false ]
                             if not? empty? ctype [
                                 cname: "dv_" ++ (to :string state\next)
                                 state\next: state\next + 1
-                                stored: nativeResult true rv\kind cname
+                                stored: nativeResult true storedKind cname
                                 set state\vars n\name stored
-                                addItem lines (ctype ++ " " ++ cname ++ " = " ++ rv\code ++ ";")
+                                if "block" = storedKind [
+                                    if key? state\blockitems rv\code [ set state\blockitems cname (get state\blockitems rv\code) ]
+                                ]
+                                addItem lines (ctype ++ " " ++ cname ++ " = " ++ initCode ++ ";")
                             ]
                         ]
+                    ]
                     ]
                     ]
                     handled: true
@@ -818,6 +1373,9 @@ nativeSeq: function [ir state][
                         rv: nativeExpr n\args\0 state
                         if not? rv\ok [ good: false ]
                         if rv\ok [
+                            if "block" = rv\kind [
+                                if key? state\blockitems rv\code [ rv: nativeBlockResult (get state\blockitems rv\code) state ]
+                            ]
                             pc: nativePrint rv
                             if empty? pc [ good: false ]
                             if not? empty? pc [ addItem lines pc ]
@@ -827,7 +1385,9 @@ nativeSeq: function [ir state][
                     if not? isPrint [
                         rv: nativeExpr n state
                         if not? rv\ok [ good: false ]
-                        if rv\ok [ addItem lines ("(void)(" ++ rv\code ++ ");") ]
+                        if rv\ok [
+                            if and? ("dict" <> rv\kind) ("function" <> rv\kind) [ addItem lines ("(void)(" ++ rv\code ++ ");") ]
+                        ]
                         handled: true
                     ]
                 ]
@@ -843,15 +1403,36 @@ nativeSeq: function [ir state][
                     if rv\ok [ addItem lines ("(void)(" ++ rv\code ++ ");") ]
                     handled: true
                 ]
+                if "return" = n\op [
+                    rv: nativeExpr n\args\0 state
+                    if not? rv\ok [ good: false ]
+                    if rv\ok [
+                        if empty? state\returnVar [ good: false ]
+                        if empty? state\returnKind [ state\returnKind: rv\kind ]
+                        if state\returnKind <> rv\kind [ good: false ]
+                        if good [ addItem lines (state\returnVar ++ " = " ++ rv\code ++ "; goto " ++ state\returnLabel ++ ";") ]
+                        if good [ state\terminated: true ]
+                    ]
+                    handled: true
+                ]
                 if "if" = n\op [
                     cond: nativeExpr n\args\0 state
                     if not? cond\ok [ good: false ]
                     if cond\ok [
-                        state\depth: state\depth + 1
-                        yes: nativeSeq n\args\1 state
-                        state\depth: state\depth - 1
-                        if not? yes\ok [ good: false ]
-                        if yes\ok [ addItem lines ("if (" ++ (nativeTruth cond) ++ ") {\n" ++ yes\code ++ "\n}") ]
+                        if and? ("bool" = cond\kind) ("1" = cond\code) [
+                            yes: nativeSeq n\args\1 state
+                            if not? yes\ok [ good: false ]
+                            if yes\ok [ addItem lines yes\code ]
+                        ]
+                        if not? and? ("bool" = cond\kind) (or? ("0" = cond\code) ("1" = cond\code)) [
+                            oldTerminated: state\terminated
+                            state\depth: state\depth + 1
+                            yes: nativeSeq n\args\1 state
+                            state\depth: state\depth - 1
+                            state\terminated: oldTerminated
+                            if not? yes\ok [ good: false ]
+                            if yes\ok [ addItem lines ("if (" ++ (nativeTruth cond) ++ ") {\n" ++ yes\code ++ "\n}") ]
+                        ]
                     ]
                     handled: true
                 ]
@@ -871,6 +1452,13 @@ nativeSeq: function [ir state][
                     handled: true
                 ]
                 if "loop" = n\op [
+                    dictAction: nativeDictLoop n state
+                    if dictAction\ok [
+                        addItem lines dictAction\code
+                        handled: true
+                    ]
+                ]
+                if and? ("loop" = n\op) (not? handled) [
                     coll: n\args\0
                     params: n\args\1
                     if 0 = size params [ good: false ]
@@ -926,6 +1514,44 @@ nativeSeq: function [ir state][
                                 ]
                             ]
                         ]
+                        if empty? elemKind [
+                            loadedColl: nativeExpr coll state
+                            if loadedColl\ok [
+                                if "block" = loadedColl\kind [
+                                    if key? state\blockitems loadedColl\code [
+                                        rawItems: get state\blockitems loadedColl\code
+                                        items: @[]
+                                        loopKind: ""
+                                        loopGood: true
+                                        loop rawItems [item][
+                                            ri: nativeExpr item state
+                                            if not? ri\ok [ loopGood: false ]
+                                            if ri\ok [
+                                                if empty? loopKind [ loopKind: ri\kind ]
+                                                if loopKind <> ri\kind [ loopGood: false ]
+                                                addItem items ri\code
+                                            ]
+                                        ]
+                                        if loopGood [
+                                            ctype: nativeCType loopKind
+                                            if not? empty? ctype [
+                                                arr: "da_" ++ (to :string state\next)
+                                                state\next: state\next + 1
+                                                elemKind: loopKind
+                                                prefix: ctype ++ " " ++ arr ++ "[] = {" ++ (joinWith items ", ") ++ "};\nfor (size_t di=0; di<" ++ (to :string (size items)) ++ "; di++) {\n" ++ ctype ++ " " ++ cname ++ " = " ++ arr ++ "[di];\n"
+                                            ]
+                                        ]
+                                    ]
+                                ]
+                                if "string" = loadedColl\kind [
+                                    elemKind: "string"
+                                    buf: cname ++ "_buf"
+                                    ptr: "dp_" ++ (to :string state\next)
+                                    state\next: state\next + 1
+                                    prefix: "for (const char *" ++ ptr ++ " = " ++ loadedColl\code ++ "; *" ++ ptr ++ "; " ++ ptr ++ "++) {\nchar " ++ buf ++ "[2] = {*" ++ ptr ++ ", 0};\nconst char *" ++ cname ++ " = " ++ buf ++ ";\n"
+                                ]
+                            ]
+                        ]
                         if empty? elemKind [ good: false ]
                         if good [
                             bound: nativeResult true elemKind cname
@@ -953,14 +1579,28 @@ nativeProgram: function [ir][
     state: #[]
     state\vars: #[]
     state\funcs: #[]
+    state\dicts: #[]
+    state\dictnext: 0
+    state\functionvals: #[]
+    state\functionnext: 0
+    state\blockitems: #[]
     state\next: 0
     state\depth: 0
     state\concat: false
+    state\dynamic: false
+    state\blocks: false
+    state\returnKind: ""
+    state\returnVar: ""
+    state\returnLabel: ""
+    state\terminated: false
     body: nativeSeq ir state
     if not? body\ok [ return "" ]
     helpers: ""
     if state\concat [
         helpers: "static char *dc_concat(const char *a, const char *b){ size_t na=strlen(a), nb=strlen(b); char *r=(char*)malloc(na+nb+1); memcpy(r,a,na); memcpy(r+na,b,nb+1); return r; }\n\n"
+    ]
+    if state\dynamic [
+        helpers: helpers ++ "typedef struct DSeq DSeq;\ntypedef struct { int tag; long i; double f; const char *s; DSeq *b; } DScalar;\nstruct DSeq { DScalar *items; size_t n; };\nstatic DScalar ds_null(void){ return (DScalar){0,0,0,NULL,NULL}; }\nstatic DScalar ds_int(long x){ return (DScalar){1,x,0,NULL,NULL}; }\nstatic DScalar ds_float(double x){ return (DScalar){2,0,x,NULL,NULL}; }\nstatic DScalar ds_string(const char *x){ return (DScalar){3,0,0,x,NULL}; }\nstatic DScalar ds_bool(int x){ return (DScalar){4,x,0,NULL,NULL}; }\nstatic DSeq ds_block(DScalar *x,size_t n){ return (DSeq){x,n}; }\nstatic DScalar ds_seq(DSeq x){ DSeq *p=(DSeq*)malloc(sizeof(DSeq)); *p=x; return (DScalar){5,0,0,NULL,p}; }\nstatic int ds_truth(DScalar x){ return x.tag != 0 && (x.tag != 4 || x.i); }\nstatic void ds_print_inner(DScalar x){ if(x.tag==0) printf(\"null\"); else if(x.tag==1) printf(\"%ld\",x.i); else if(x.tag==2) printf(\"%g\",x.f); else if(x.tag==3) printf(\"%s\",x.s); else if(x.tag==4) printf(x.i?\"true\":\"false\"); else { printf(\"[\"); for(size_t i=0;i<x.b->n;i++){ if(i)printf(\" \"); ds_print_inner(x.b->items[i]); } printf(\"]\"); } }\nstatic void ds_print(DScalar x){ ds_print_inner(x); putchar('\\n'); }\nstatic void ds_print_seq(DSeq x){ for(size_t i=0;i<x.n;i++){ ds_print_inner(x.items[i]); putchar(' '); } putchar('\\n'); }\n\n"
     ]
     content: body\code
     if not? empty? content [ content: "\t" ++ (replace content "\n" "\n\t") ++ "\n" ]

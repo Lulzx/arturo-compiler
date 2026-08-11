@@ -29,11 +29,12 @@ the evaluator with its mode flag set to emit.
    Adding a language feature is adding a row.
 2. **Donation.** The kernel owns structure; primitives are donated to the
    host. Full-language output exists from the first compile.
-3. **The host is the authority.** When the kernel and the host disagree, the
-   host wins. The compiled output must match it. The kernel is an
-   independent, structurally explicit model, kept in agreement by
-   differential tests. The kernel is not the truth; it is a testable mirror
-   of the truth.
+3. **The host is the compatibility authority.** When the kernel and the host
+   disagree, the host wins unless the behavior is isolated as a documented
+   host defect. The compiled output must match the host over the pinned parity
+   corpus; a deliberate defect fix is excluded from that byte-identical claim
+   and tested as a compatibility exception instead. The kernel is an
+   independent, structurally explicit model, not an infallible source of truth.
 4. **The invariant.** `eval(env, emit(n)) == eval(env, n)` for every node.
    Compiling is meaning-preserving by construction and by test.
 
@@ -316,6 +317,15 @@ A fourth engine, runIR, evaluates the emitted IR in-kernel. The native
 backend adds a fifth check: a corpus program compiled by `tmp/ncomp` must
 produce the same output as the host (`make verify`).
 
+The equality is scoped to the pinned corpus. A documented compatibility
+exception may intentionally differ from Arturo 0.10.0 when the host cannot
+produce a meaningful value. The first such exception is mixed string append:
+`print "n=" ++ 13` fails in the host (and assignment form can fail silently),
+while the native runtime renders the integer and produces `n=13`. The same
+runtime rule handles logical and character operands. This behavior stays
+outside the host-parity corpus so `make verify` continues to mean exactly
+what it says; exception regressions require a separate expected-output test.
+
 Result protocol: a program's result is the value of its final expression
 (Arturo parity to be pinned). Comparisons use `codify` (canonical text), not
 `=`, because of the `:symbolliteral` equality bug.
@@ -389,8 +399,9 @@ arturo-compiler/
 
 Decisions:
 - One dispatch, one mode flag; rules carry eval+emit. The duality is literal.
-- Donation runs in both modes; the host is the authority; the kernel is a
-  mirror, kept honest by tests.
+- Donation runs in both modes; the host is the compatibility authority over
+  the parity corpus. Deliberate fixes for isolated host defects are documented
+  compatibility exceptions, not silent expansions of the parity claim.
 - Laziness cannot be delegated at runtime; lazy constructs are kernel rules
   or passthrough.
 - One application node, `call`. Host-function delegation is a runtime
