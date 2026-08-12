@@ -1,0 +1,8 @@
+; print-block evaluation, nested data blocks, and join.with separators
+x: 5
+print [x type x]
+print [[1 a] [2 b]]
+lst: ["uno" "dos" "tres"]
+print join.with: "|" lst
+print join.with: "-" [1 2 3]
+print [join.with: " " lst]

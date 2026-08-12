@@ -63,5 +63,14 @@ echo
 echo "Remaining required declarations: $required_count"
 echo "Intentionally unavailable declarations: $unsupported_count"
 echo
+# The compatibility boundary is complete only when every missing declaration
+# has an explicit unsupported decision and nothing classified as unavailable
+# has drifted back into the implemented set.
+if [ "$missing_count" -ne "$unsupported_count" ]; then
+    echo "classification is NOT complete: missing != intentionally unavailable" >&2
+    exit 1
+fi
+echo "Classification: $declared_count/$declared_count declared intrinsics have an explicit product decision."
+echo
 echo "First 25 missing declarations:"
 sed -n '1,25p' "$missing"

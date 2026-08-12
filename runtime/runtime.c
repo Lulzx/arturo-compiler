@@ -1188,7 +1188,26 @@ static Value b_print(Env*e,Value*a,int n){
                      * (`print ["data:" get btc 'data]`), matching the host's
                      * trailing-argument application. */
                     int arity=declared_arity_of(value.u.s);
-                    if(arity>=0&&i+arity<source->n&&!(i+1<source->n&&is_binop(*source->items[i+1]))){
+                    /* `join.with: " " lst` — collect attribute tokens after the
+                     * head before the positional args. */
+                    const char *anames[8]; Value avals[8]; int acnt=0; int at=i+1;
+                    while(at<source->n && acnt<8){
+                        Value t=*source->items[at];
+                        if(t.k==V_ATTRIBUTELABEL){ anames[acnt]=t.u.s; at++; if(at<source->n){ avals[acnt]=*source->items[at]; at++; } acnt++; continue; }
+                        if(t.k==V_ATTRIBUTE){ anames[acnt]=t.u.s; avals[acnt]=v_bool(1); acnt++; at++; continue; }
+                        break;
+                    }
+                    if(acnt>0){
+                        AttrContext saved=g_attrs;
+                        g_attrs.names=anames; g_attrs.values=avals; g_attrs.n=acnt;
+                        if(arity>=0 && at+arity<=source->n){
+                            Value *argv=xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;
+                            for(int j=0;j<arity;j++){argv[j]=*source->items[at+j];if(argv[j].k==V_WORD){if(env_bound(e,argv[j].u.s))argv[j]=env_get(e,argv[j].u.s);else ready=0;}}
+                            if(ready){Value out;if(rt_builtin(value.u.s,e,argv,arity,&out)){value=out;i=at+arity-1;}}
+                            free(argv);
+                        }
+                        g_attrs=saved;
+                    } else if(arity>=0&&i+arity<source->n&&!(i+1<source->n&&is_binop(*source->items[i+1]))){
                         Value *argv=xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;
                         for(int j=0;j<arity;j++){argv[j]=*source->items[i+1+j];if(argv[j].k==V_WORD){if(env_bound(e,argv[j].u.s))argv[j]=env_get(e,argv[j].u.s);else ready=0;}}
                         if(ready){Value out;if(rt_builtin(value.u.s,e,argv,arity,&out)){value=out;i+=arity;}}
@@ -4371,11 +4390,16 @@ static int is_id_in(int c){ return is_id_start(c)||(c>='0'&&c<='9'); }
 static int is_digit(int c){ return c>='0'&&c<='9'; }
 static int in_syms(int c){ return c=='~'||c=='!'||c=='@'||c=='#'||c=='$'||c=='%'||c=='^'||c=='&'||c=='*'||c=='-'||c=='='||c=='+'||c=='<'||c=='>'||c=='/'||c=='|'||c=='?'; }
 
-/* current 1-based line: one plus the number of newlines before the cursor */
+/* current 1-based line: one plus the number of newlines before the cursor.
+ * Positions only ever advance within one lex_source call, so the count is
+ * cached and only the new bytes are rescanned (amortized O(1) per token). */
+static int g_line_scan_pos = 0;
+static int g_line_count = 1;
+static void line_count_reset(void){ g_line_scan_pos = 0; g_line_count = 1; }
 static int lx_line(LX*x){
-    int line=1;
-    for(int i=0;i<x->pos;i++) if(x->s[i]=='\n') line++;
-    return line;
+    for(int i=g_line_scan_pos; i<x->pos && i<x->len; i++) if(x->s[i]=='\n') g_line_count++;
+    g_line_scan_pos = x->pos;
+    return g_line_count;
 }
 
 static void sb_init(SB*s){ s->cap=32; s->len=0; s->b=xmalloc(32); s->b[0]=0; }
@@ -4672,7 +4696,7 @@ static Value parse_path(LX*x, Value root, int asLiteral){
 static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline){
     BLD b; bld_init(&b);
     int oldCapture = g_line_capture;
-    if(isSubInline) g_line_capture = 0;
+    if(isSubBlock || isSubInline) g_line_capture = 0;
     while(1){
         /* skip whitespace and comments */
         while(1){
@@ -4859,6 +4883,7 @@ static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline){
 
 Value lex_source(const char *s){
     LX x; x.s=s; x.pos=0; x.len=(int)strlen(s);
+    line_count_reset();
     line_map_reset();
     return parse_block(&x,0,0,0);
 }

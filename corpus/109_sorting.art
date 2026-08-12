@@ -1,0 +1,6 @@
+; sort, sort.sensitive, color, and join in print blocks
+lst: ["uno" "dos" "tres" "Uno" "Dos" "Tres" "pero" "pero" "ábaco" "abismo" "aberración"]
+print join.with: "|" lst
+print sort lst
+print sort.sensitive lst
+print [join.with: " " lst]

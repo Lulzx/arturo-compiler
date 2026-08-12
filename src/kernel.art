@@ -1342,6 +1342,7 @@ evalCall: function [env node][
     ; object method. Print is simple enough to dispatch directly here.
     if "print" = memberMode [
         value: evalNode env node\args\0 :interpret
+        if :block = type value -> value: kernelEvalBlock env value
         if kernelObject? value [
             hasString: key? value "string"
             if key? value "string" [
@@ -1351,6 +1352,18 @@ evalCall: function [env node][
             if not? hasString -> value: kernelVisibleObject value
         ]
         return delegate "print" @[value]
+    ]
+    if "join" = memberMode [
+        joinAttrs: evalCallAttrs env node :interpret
+        joinedValue: evalNode env node\args\0 :interpret
+        if key? joinAttrs "with" -> return kernelJoinWith joinedValue (to :string joinAttrs\with)
+    ]
+    if "sort" = memberMode [
+        sortAttrs: evalCallAttrs env node :interpret
+        sortColl: evalNode env node\args\0 :interpret
+        if or? (key? sortAttrs "sensitive") [or? (key? sortAttrs "descending") [key? sortAttrs "as"]] [
+            return kernelSort sortColl sortAttrs
+        ]
     ]
     if or? ("keys" = memberMode) ["values" = memberMode] [
         if 1 = size node\args [
@@ -1706,6 +1719,18 @@ runCall: function [env node][
     ]
     if "print" = memberMode [
         value: runNode env node\args\0
+        if :block = type value [
+            blockNode: node\args\0
+            if and? (:dictionary = type blockNode) [key? blockNode "items"] [
+                rawItems: blockNode\items
+                ; a plain block argument keeps raw source tokens and must be
+                ; re-lowered as code; an `@[...]` block already holds evaluated
+                ; IR nodes and must be left alone.
+                if and? (:block = type rawItems) [not? empty? rawItems] [
+                    if not? isIR rawItems\0 -> value: kernelEvalBlock env rawItems
+                ]
+            ]
+        ]
         if kernelObject? value [
             hasString: key? value "string"
             if key? value "string" [
@@ -1715,6 +1740,18 @@ runCall: function [env node][
             if not? hasString -> value: kernelVisibleObject value
         ]
         return delegate "print" @[value]
+    ]
+    if "join" = memberMode [
+        joinAttrs: evalCallAttrs env node :run
+        joinedValue: runNode env node\args\0
+        if key? joinAttrs "with" -> return kernelJoinWith joinedValue (to :string joinAttrs\with)
+    ]
+    if "sort" = memberMode [
+        sortAttrs: evalCallAttrs env node :run
+        sortColl: runNode env node\args\0
+        if or? (key? sortAttrs "sensitive") [or? (key? sortAttrs "descending") [key? sortAttrs "as"]] [
+            return kernelSort sortColl sortAttrs
+        ]
     ]
     if or? ("keys" = memberMode) ["values" = memberMode] [
         if 1 = size node\args [
@@ -1846,13 +1883,118 @@ kernelConstruct: function [env typeName values][
     instance
 ]
 
+; `print [a b]`-style: a block argument is CODE, so each grouped element is
+; evaluated and the results are collected into the block value the host prints.
+kernelEvalBlock: function [env blk][
+    grouped: lowerBlock blk
+    out: @[]
+    loop grouped [item][ addItem out (evalNode env item :interpret) ]
+    out
+]
+
+; `join.with: "sep" block` — the attribute form is kernel-owned because the
+; host donation boundary cannot carry call attributes.
+kernelJoinWith: function [coll sep][
+    if :block <> type coll -> return to :string coll
+    out: ""
+    first: true
+    loop coll [item][
+        if not? first -> out: out ++ sep
+        out: out ++ (to :string item)
+        first: false
+    ]
+    out
+]
+
+; `sort.sensitive` / `sort.descending` — the attribute forms are kernel-owned
+; for the same reason as join.with.  Plain `sort` (the locale collation form)
+; stays delegated to the host.  The comparator mirrors the host: bytewise
+; case-sensitive string order, case-insensitive (stable) default, and numeric
+; ordering for numbers.
+kernelSortCompare: function [a b sensitive descending][
+    ; nested-function scoping shadows assignments, so compare by early return.
+    adjust: function [v][
+        if descending [
+            result: neg v
+            return result
+        ]
+        v
+    ]
+    if and? (:integer = type a) [:integer = type b] [
+        if a < b [
+            result: adjust (neg 1)
+            return result
+        ]
+        if b < a [
+            result: adjust 1
+            return result
+        ]
+        return 0
+    ]
+    if and? (:floating = type a) [:floating = type b] [
+        if a < b [
+            result: adjust (neg 1)
+            return result
+        ]
+        if b < a [
+            result: adjust 1
+            return result
+        ]
+        return 0
+    ]
+    at: to :string a
+    bt: to :string b
+    if sensitive [
+        if at < bt [
+            result: adjust (neg 1)
+            return result
+        ]
+        if bt < at [
+            result: adjust 1
+            return result
+        ]
+        return 0
+    ]
+    la: lower at
+    lb: lower bt
+    if la < lb [
+        result: adjust (neg 1)
+        return result
+    ]
+    if lb < la [
+        result: adjust 1
+        return result
+    ]
+    0
+]
+
+kernelSort: function [coll attrs][
+    if :block <> type coll -> return coll
+    sensitive: key? attrs "sensitive"
+    descending: key? attrs "descending"
+    items: @[]
+    loop coll [it][ addItem items it ]
+    n: size items
+    i: 1
+    while [i < n][
+        j: i
+        while [and? (0 < j) [0 > (kernelSortCompare items\[j] items\[j - 1] sensitive descending)]][
+            swap: items\[j]
+            items\[j]: items\[j - 1]
+            items\[j - 1]: swap
+            j: j - 1
+        ]
+        i: i + 1
+    ]
+    items
+]
+
 kernelVisibleObject: function [obj][
     visible: #[]
     loop obj [name value][
         hidden: prefix? name "__"
         if "init" = name -> hidden: true
-        if kernelMethod? value -> hidden: true
-        if not? hidden -> visible\[name]: value
+        if kernelMethod? value -> hidden: true        if not? hidden -> visible\[name]: value
     ]
     visible
 ]
