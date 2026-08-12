@@ -4,3 +4,4 @@ runtime/intrinsic_arity.inc
 tmp/
 *.bcode
 native_compiler
+demo/getbuiltins
