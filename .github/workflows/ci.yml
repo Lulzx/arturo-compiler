@@ -19,12 +19,28 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install pinned Arturo
-        uses: arturo-lang/setup-arturo@v2
-        with:
-          do: compile
-          src: v0.10.0
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download prebuilt Arturo 0.10.0
+        run: |
+          case "${{ runner.os }}" in
+            Linux)
+              case "${{ runner.arch }}" in
+                ARM64) asset="arturo-0.10.0-linux-arm64.zip" ;;
+                *)     asset="arturo-0.10.0-linux-amd64.zip" ;;
+              esac
+              ;;
+            macOS)
+              case "${{ runner.arch }}" in
+                ARM64) asset="arturo-0.10.0-macos-arm64.zip" ;;
+                *)     asset="arturo-0.10.0-macos-amd64.zip" ;;
+              esac
+              ;;
+            *) exit 1 ;;
+          esac
+          curl -fsSL -o arturo.zip \
+            "https://github.com/arturo-lang/arturo/releases/download/v0.10.0/${asset}"
+          unzip -q arturo.zip -d arturo-bin
+          chmod +x arturo-bin/arturo
+          echo "$PWD/arturo-bin" >> "$GITHUB_PATH"
       - name: Differential, native, and compatibility checks
         run: make check
       - name: Address and undefined-behavior sanitizers

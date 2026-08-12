@@ -100,8 +100,8 @@ Or by hand:
     CONTRIBUTING.md               how to add a construct
 
 Built against Arturo 0.10.0, pinned to the revision in `corpus/m1/RESULTS.md`.
-CI builds the `v0.10.0` upstream tag on Linux and macOS before running parity,
-compatibility, ASan, and UBSan checks.
+CI downloads the prebuilt `v0.10.0` release binary on Linux and macOS before
+running parity, compatibility, ASan, and UBSan checks.
 Read `SPEC.md` for the precise proof boundary and design, and
 `LANGUAGE_SUPPORT.md` for the production-readiness gate and the route to full
 language coverage.
