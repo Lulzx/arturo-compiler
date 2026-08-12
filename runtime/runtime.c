@@ -30,6 +30,10 @@
 #endif
 extern char **environ;
 
+/* forward declaration so line_map_add (below, above the allocator
+ * definitions) can grow the line map */
+static void *xrealloc(void *p, size_t n);
+
 /* ---- error handling ----------------------------------------------------- */
 /* `try` uses setjmp/longjmp: die() unwinds to the nearest active try frame
  * instead of exiting when one is set. A linked stack of jmp_bufs lets nested
@@ -39,8 +43,21 @@ static char g_last_error[512];
 static char g_last_error_kind[256]="Runtime Error";
 static int g_custom_error_pending=0;
 static const char *g_source_path = NULL;
+/* source line mapping (diagnostics).  Built by the lexer pass below: one entry
+ * per flat top-level element in the order `to :block` yields. */
+typedef struct { int *lines; int n; } LineMap;
+static LineMap g_line_map = {NULL, 0};
+static void line_map_reset(void){ free(g_line_map.lines); g_line_map.lines=NULL; g_line_map.n=0; }
 typedef struct { const char **names; Value *values; int n; } AttrContext;
 static AttrContext g_attrs = {NULL,NULL,0};
+
+static void line_map_add(int line){
+    if(g_line_map.n%64==0){
+        int cap=g_line_map.n?g_line_map.n+64:64;
+        g_line_map.lines=(int*)xrealloc(g_line_map.lines,(size_t)cap*sizeof(int));
+    }
+    g_line_map.lines[g_line_map.n++]=line;
+}
 typedef struct { int kind; const char *var; Value container; int index; } MutTarget;
 static Value mut_load(Env*e,Value receiver,MutTarget*t);
 static void mut_store(Env*e,MutTarget*t,Value result);
@@ -1149,6 +1166,7 @@ static int object_member_index(Value obj,const char *name){
 static Value object_magic(Env *e,Value obj,const char *name,Value *args,int n){
     int i=object_member_index(obj,name);if(i<0||obj.u.dict->vals[i].k!=V_FUNC)die("missing object magic method");return applyFunc(e,obj.u.dict->vals[i],args,n);
 }
+static int is_binop(Value v);
 static Value b_print(Env*e,Value*a,int n){
     int stringMethod=object_member_index(a[0],"string");
     if(stringMethod>=0&&a[0].u.dict->vals[stringMethod].k==V_FUNC){Value rendered=object_magic(e,a[0],"string",NULL,0);v_print(rendered);return v_null();}
@@ -1157,12 +1175,26 @@ static Value b_print(Env*e,Value*a,int n){
         for(int i=0;i<source->n;i++){
             Value value=*source->items[i];
             if(value.k==V_PATH&&path_is_dyn(value))value=path_read(e,value);
-            if(value.k==V_WORD&&env_bound(e,value.u.s)){
-                Value bound=env_get(e,value.u.s);
-                if(bound.k==V_FUNC||bound.k==V_BUILTIN){
-                    int arity=bound.k==V_FUNC?function_param_count(bound):declared_arity_of(bound.u.s);
-                    if(arity>=0&&i+arity<source->n){Value *argv=xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;for(int j=0;j<arity;j++){argv[j]=*source->items[i+1+j];if(argv[j].k==V_WORD){if(env_bound(e,argv[j].u.s))argv[j]=env_get(e,argv[j].u.s);else ready=0;}}if(ready){value=applyFunc(e,bound,argv,arity);i+=arity;}free(argv);}
-                }else value=bound;
+            if(value.k==V_WORD){
+                int boundHere=env_bound(e,value.u.s);
+                if(boundHere){
+                    Value bound=env_get(e,value.u.s);
+                    if(bound.k==V_FUNC||bound.k==V_BUILTIN){
+                        int arity=bound.k==V_FUNC?function_param_count(bound):declared_arity_of(bound.u.s);
+                        if(arity>=0&&i+arity<source->n){Value *argv=xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;for(int j=0;j<arity;j++){argv[j]=*source->items[i+1+j];if(argv[j].k==V_WORD){if(env_bound(e,argv[j].u.s))argv[j]=env_get(e,argv[j].u.s);else ready=0;}}if(ready){value=applyFunc(e,bound,argv,arity);i+=arity;}free(argv);}
+                    }else value=bound;
+                } else if(rt_builtin_known(value.u.s)){
+                    /* an unbound word naming a builtin is a call head here too
+                     * (`print ["data:" get btc 'data]`), matching the host's
+                     * trailing-argument application. */
+                    int arity=declared_arity_of(value.u.s);
+                    if(arity>=0&&i+arity<source->n&&!(i+1<source->n&&is_binop(*source->items[i+1]))){
+                        Value *argv=xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;
+                        for(int j=0;j<arity;j++){argv[j]=*source->items[i+1+j];if(argv[j].k==V_WORD){if(env_bound(e,argv[j].u.s))argv[j]=env_get(e,argv[j].u.s);else ready=0;}}
+                        if(ready){Value out;if(rt_builtin(value.u.s,e,argv,arity,&out)){value=out;i+=arity;}}
+                        free(argv);
+                    }
+                }
             }
             items[used]=xmalloc(sizeof(Value));*items[used++]=value;
         }
@@ -1791,13 +1823,16 @@ static Value b_le(Env*e,Value*a,int n){
 static Value b_join(Env*e,Value*a,int n){
     Value v=a[0];
     if (v.k!=V_BLOCK) { char *s=val_str(v); return v_str(s); }
+    char *sep=NULL; if(rt_has_attr("with")){Value wv=rt_attr_value("with",v_null());sep=val_str(wv);}
     size_t cap=16,len=0; char *buf=xmalloc(cap); buf[0]=0;
     for (int i=0;i<v.u.block.b->n;i++){
         char *s=val_str(*v.u.block.b->items[i]);
-        size_t t=strlen(s); if (len+t+1>cap){ cap=(len+t)*2; buf=xrealloc(buf,cap); }
+        size_t t=strlen(s);
+        if(sep&&*sep&&i>0){size_t sl=strlen(sep);if(len+t+sl+1>cap){cap=(len+t+sl)*2;buf=xrealloc(buf,cap);}memcpy(buf+len,sep,sl);len+=sl;}
+        if (len+t+1>cap){ cap=(len+t)*2; buf=xrealloc(buf,cap); }
         memcpy(buf+len,s,t); len+=t; free(s);
     }
-    buf[len]=0; Value r=v_str(buf); free(buf); return r;
+    buf[len]=0; Value r=v_str(buf); free(buf); free(sep); return r;
 }
 /* `try [blk]` — success is null; failure is a first-class error value. */
 static Value b_try(Env*e,Value*a,int n){
@@ -1925,6 +1960,7 @@ static Value b_get(Env*e,Value*a,int n){
     }
     if(a[1].k==V_INT&&a[0].k==V_BINARY){long i=a[1].u.i;if(i<0||i>=(long)a[0].u.binary.len)die("get: index out of bounds");return v_int(a[0].u.binary.data[i]);}
     Value d=a[0]; const char *k=key_text(a[1]);
+    if (!k) die("get: invalid (null) key");
     if (d.k!=V_DICT){
         char msg[256];snprintf(msg,sizeof msg,"get: expected dictionary for key '%s' kind %s (got %s '%s')",k?k:"",type_name(a[1]),type_name(d),d.k==V_STR&&d.u.s?d.u.s:"");die(msg);
     }
@@ -4335,6 +4371,13 @@ static int is_id_in(int c){ return is_id_start(c)||(c>='0'&&c<='9'); }
 static int is_digit(int c){ return c>='0'&&c<='9'; }
 static int in_syms(int c){ return c=='~'||c=='!'||c=='@'||c=='#'||c=='$'||c=='%'||c=='^'||c=='&'||c=='*'||c=='-'||c=='='||c=='+'||c=='<'||c=='>'||c=='/'||c=='|'||c=='?'; }
 
+/* current 1-based line: one plus the number of newlines before the cursor */
+static int lx_line(LX*x){
+    int line=1;
+    for(int i=0;i<x->pos;i++) if(x->s[i]=='\n') line++;
+    return line;
+}
+
 static void sb_init(SB*s){ s->cap=32; s->len=0; s->b=xmalloc(32); s->b[0]=0; }
 static void sb_add(SB*s,int c){ if(s->len+2>s->cap){s->cap*=2;s->b=xrealloc(s->b,s->cap);} s->b[s->len++]=(char)c; s->b[s->len]=0; }
 static void sb_adds(SB*s,const char*st){ for(;*st;st++) sb_add(s,*st); }
@@ -4343,6 +4386,14 @@ typedef struct { Value **items; int n, cap; } BLD;
 static void bld_init(BLD*b){ b->cap=8; b->n=0; b->items=xmalloc(b->cap*sizeof(Value*)); }
 static void bld_add(BLD*b,Value v){ if(b->n>=b->cap){ b->cap*=2; b->items=xrealloc(b->items,b->cap*sizeof(Value*)); } b->items[b->n]=(Value*)xmalloc(sizeof(Value)); b->items[b->n][0]=v; b->n++; }
 static Value bld_block(BLD*b){ return v_block(b->items,b->n); }
+
+/* line-map capture: every flat element in `to :block` order gets one entry.
+ * Inline parens are a single element whose contents contribute no entries;
+ * dynamic path segments and blocks do not add entries themselves (the block
+ * open `[` is the one element, its contents are separate flat elements). */
+static int g_line_capture = 1;
+static int g_last_line = 1;
+static void lb_add(BLD*b,Value v){ if(g_line_capture) line_map_add(g_last_line); bld_add(b,v); }
 
 static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline);
 static Value mk_pathkind(VKind k, Value p){ p.k=k; return p; }
@@ -4401,6 +4452,23 @@ static void parse_string(LX*x,SB*v,int stopper){
         }
         if(c=='\r'||c=='\n'){ x->pos++; break; }  /* newline in string: stop */
         sb_add(v,c); x->pos++;
+    }
+}
+
+/* port of parse.nim's parseSafeString: `«« ... »»` — content between the
+ * opening and closing guillemet pairs, CR/LF normalized to LF, no dedent,
+ * terminated by the first `»»` (0xC2 0xBB 0xC2 0xBB). */
+static void parse_safe_string(LX*x,SB*v){
+    x->pos+=4; /* skip «« */
+    while(x->pos<x->len){
+        int c=(unsigned char)lx_at(x);
+        if(c==0xC2 && (unsigned char)lx_peek(x,1)==0xBB &&
+           (unsigned char)lx_peek(x,2)==0xC2 && (unsigned char)lx_peek(x,3)==0xBB){
+            x->pos+=4; break; /* closing »» */
+        }
+        if(c=='\r'){ sb_add(v,'\n'); x->pos++; if(x->pos<x->len&&lx_at(x)=='\n')x->pos++; }
+        else if(c=='\n'){ sb_add(v,'\n'); x->pos++; }
+        else { sb_add(v,c); x->pos++; }
     }
 }
 
@@ -4540,6 +4608,14 @@ static Value parse_curly(LX*x){
     int depth=1;
     while(x->pos<x->len && depth>0){
         int c=lx_at(x);
+        if(verbatim){
+            /* `{: ... :}` closes at `:}`; a bare `}` is content */
+            if(c==':' && (unsigned char)lx_peek(x,1)=='}'){ x->pos+=2; break; }
+            if(c=='\r'){ sb_add(&sb,'\n'); x->pos++; if(x->pos<x->len&&lx_at(x)=='\n')x->pos++; }
+            else if(c=='\n'){ sb_add(&sb,'\n'); x->pos++; }
+            else { sb_add(&sb,c); x->pos++; }
+            continue;
+        }
         if(c=='{'){ depth++; sb_add(&sb,'{'); x->pos++; }
         else if(c=='}'){
             depth--; x->pos++;
@@ -4560,6 +4636,8 @@ static Value parse_curly(LX*x){
             }
             else { sb_add(&sb,'/'); x->pos++; }  /* literal '/' inside pattern */
         }
+        else if(c=='\r'){ sb_add(&sb,'\n'); x->pos++; if(x->pos<x->len&&lx_at(x)=='\n')x->pos++; }
+        else if(c=='\n'){ sb_add(&sb,'\n'); x->pos++; }
         else { sb_add(&sb,c); x->pos++; }
     }
     flags[nflags]=0;
@@ -4584,7 +4662,7 @@ static Value parse_path(LX*x, Value root, int asLiteral){
             SB sb; sb_init(&sb); int hasDot; parse_number(x,&sb,&hasDot);
             if(n>=cap){cap*=2;segs=xrealloc(segs,cap*sizeof(Value));} segs[n++]= hasDot? v_float(atof(sb.b)) : v_int(atol(sb.b)); free(sb.b);
         } else if(c=='[' && !asLiteral){
-            x->pos++; Value sub=parse_block(x,0,1,0);
+            x->pos++; int saveCap=g_line_capture; g_line_capture=0; Value sub=parse_block(x,0,1,0); g_line_capture=saveCap;
             if(n>=cap){cap*=2;segs=xrealloc(segs,cap*sizeof(Value));} segs[n++]=sub;
         } else break;
     }
@@ -4593,6 +4671,8 @@ static Value parse_path(LX*x, Value root, int asLiteral){
 
 static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline){
     BLD b; bld_init(&b);
+    int oldCapture = g_line_capture;
+    if(isSubInline) g_line_capture = 0;
     while(1){
         /* skip whitespace and comments */
         while(1){
@@ -4611,93 +4691,115 @@ static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline){
             if(level!=0 && (isSubBlock||isSubInline)){ /* unterminated: return what we have */ }
             break;
         }
+        g_last_line = lx_line(x);
         int c=lx_at(x);
         if(c=='"'){
             SB sb; sb_init(&sb); parse_string(x,&sb,'"');
-            if(lx_at(x)==':'){ x->pos++; bld_add(&b, v_token(V_LABEL, sb.b)); }
-            else bld_add(&b, v_str(sb.b));
+            if(lx_at(x)==':'){ x->pos++; lb_add(&b, v_token(V_LABEL, sb.b)); }
+            else lb_add(&b, v_str(sb.b));
             free(sb.b);
         } else if(c==':'){
             SB sb; sb_init(&sb); parse_ident(x,&sb,0);
             if(sb.len==0){ free(sb.b); sb.b=NULL;
-                if(lx_at(x)==':'){ x->pos++; bld_add(&b,v_token(V_SYMBOL,"::")); }
-                else if(lx_at(x)=='='){ x->pos++; bld_add(&b,v_token(V_SYMBOL,":=")); }
-                else bld_add(&b,v_token(V_SYMBOL,":"));
+                if(lx_at(x)==':'){ x->pos++; lb_add(&b,v_token(V_SYMBOL,"::")); }
+                else if(lx_at(x)=='='){ x->pos++; lb_add(&b,v_token(V_SYMBOL,":=")); }
+                else lb_add(&b,v_token(V_SYMBOL,":"));
             } else {
                 /* host `newType`: a `:name` whose name is not a known ValueKind
                  * resolves to `:object` (e.g. `:interpret`, `:emit`, `:foo`).
                  * Known names keep their own name. */
-                if(lx_known_type(sb.b)) bld_add(&b, v_token(V_TYPE, sb.b));
-                else bld_add(&b, v_token(V_TYPE, "object"));
+                if(lx_known_type(sb.b)) lb_add(&b, v_token(V_TYPE, sb.b));
+                else lb_add(&b, v_token(V_TYPE, "object"));
                 free(sb.b);
             }
         } else if(is_digit(c)){
             SB sb; sb_init(&sb); int hasDot; parse_number(x,&sb,&hasDot);
             if(!hasDot&&lx_at(x)==':'&&is_digit((unsigned char)lx_peek(x,1))){
                 x->pos++;SB denominator;sb_init(&denominator);while(x->pos<x->len&&is_digit((unsigned char)lx_at(x))){sb_add(&denominator,lx_at(x));x->pos++;}
-                if(lx_at(x)=='`'){x->pos++;SB unit;sb_init(&unit);while(x->pos<x->len&&(is_id_in((unsigned char)lx_at(x))||lx_at(x)=='/'||lx_at(x)=='*'||lx_at(x)=='.')){sb_add(&unit,lx_at(x));x->pos++;}bld_add(&b,v_quantity((double)atol(sb.b)/(double)atol(denominator.b),unit.b));free(unit.b);}
-                else bld_add(&b,v_rational(atol(sb.b),atol(denominator.b)));free(denominator.b);free(sb.b);continue;
+                if(lx_at(x)=='`'){x->pos++;SB unit;sb_init(&unit);while(x->pos<x->len&&(is_id_in((unsigned char)lx_at(x))||lx_at(x)=='/'||lx_at(x)=='*'||lx_at(x)=='.')){sb_add(&unit,lx_at(x));x->pos++;}lb_add(&b,v_quantity((double)atol(sb.b)/(double)atol(denominator.b),unit.b));free(unit.b);}
+                else lb_add(&b,v_rational(atol(sb.b),atol(denominator.b)));free(denominator.b);free(sb.b);continue;
             }
             if(lx_at(x)=='`'){
                 x->pos++;SB unit;sb_init(&unit);while(x->pos<x->len&&(is_id_in((unsigned char)lx_at(x))||lx_at(x)=='/'||lx_at(x)=='*'||lx_at(x)=='.')){sb_add(&unit,lx_at(x));x->pos++;}
-                if(hasDot)bld_add(&b,v_quantity(atof(sb.b),unit.b));else bld_add(&b,v_quantity_int(atol(sb.b),unit.b));free(unit.b);free(sb.b);continue;
+                if(hasDot)lb_add(&b,v_quantity(atof(sb.b),unit.b));else lb_add(&b,v_quantity_int(atol(sb.b),unit.b));free(unit.b);free(sb.b);continue;
             }
             /* exponent */
             if((lx_at(x)=='e'||lx_at(x)=='E') && (is_digit((unsigned char)lx_peek(x,1))||lx_peek(x,1)=='+'||lx_peek(x,1)=='-')){
                 sb_add(&sb,x->s[x->pos]); x->pos++;
                 if(lx_at(x)=='+'||lx_at(x)=='-'){ sb_add(&sb,lx_at(x)); x->pos++; }
                 while(x->pos<x->len && is_digit((unsigned char)x->s[x->pos])){ sb_add(&sb,x->s[x->pos]); x->pos++; }
-                bld_add(&b, v_float(atof(sb.b)));
+                lb_add(&b, v_float(atof(sb.b)));
             } else if(hasDot){
                 char *firstDot=strchr(sb.b,'.');
                 if(firstDot&&strchr(firstDot+1,'.')){
                     if((lx_at(x)=='-'||lx_at(x)=='+')&&isalnum((unsigned char)lx_peek(x,1)))
                         while(x->pos<x->len&&(isalnum((unsigned char)lx_at(x))||lx_at(x)=='.'||lx_at(x)=='-'||lx_at(x)=='+')){sb_add(&sb,lx_at(x));x->pos++;}
-                    bld_add(&b,v_version(sb.b));
+                    lb_add(&b,v_version(sb.b));
                 }
-                else bld_add(&b, v_float(atof(sb.b)));
+                else lb_add(&b, v_float(atof(sb.b)));
             } else {
-                bld_add(&b, v_int(atol(sb.b)));
+                lb_add(&b, v_int(atol(sb.b)));
             }
             free(sb.b);
         } else if((unsigned char)c==0xC3 && (unsigned char)lx_peek(x,1)==0xB8){
-            x->pos+=2;bld_add(&b,v_null());
+            x->pos+=2;lb_add(&b,v_null());
         } else if((unsigned char)c==0xE2 && (unsigned char)lx_peek(x,1)==0x88 && (unsigned char)lx_peek(x,2)==0x9E){
-            x->pos+=3;bld_add(&b,v_float(INFINITY));
+            x->pos+=3;lb_add(&b,v_float(INFINITY));
         } else if((unsigned char)c==0xC2 && (unsigned char)lx_peek(x,1)==0xAB){
-            x->pos+=2;while(lx_at(x)==' '||lx_at(x)=='\t')x->pos++;
-            SB sb;sb_init(&sb);while(x->pos<x->len&&lx_at(x)!='\r'&&lx_at(x)!='\n'){sb_add(&sb,lx_at(x));x->pos++;}
-            while(sb.len>0&&(sb.b[sb.len-1]==' '||sb.b[sb.len-1]=='\t'))sb.b[--sb.len]=0;
-            bld_add(&b,v_str(sb.b));free(sb.b);
+            if((unsigned char)lx_peek(x,2)==0xC2 && (unsigned char)lx_peek(x,3)==0xAB){
+                /* `«« ... »»` multiline string */
+                SB sb;sb_init(&sb);parse_safe_string(x,&sb);lb_add(&b,v_str(sb.b));free(sb.b);
+            } else {
+                x->pos+=2;while(lx_at(x)==' '||lx_at(x)=='\t')x->pos++;
+                SB sb;sb_init(&sb);while(x->pos<x->len&&lx_at(x)!='\r'&&lx_at(x)!='\n'){sb_add(&sb,lx_at(x));x->pos++;}
+                while(sb.len>0&&(sb.b[sb.len-1]==' '||sb.b[sb.len-1]=='\t'))sb.b[--sb.len]=0;
+                lb_add(&b,v_str(sb.b));free(sb.b);
+            }
         } else if(c=='#' && is_id_in((unsigned char)lx_peek(x,1))){
-            x->pos++;SB sb;sb_init(&sb);while(x->pos<x->len&&is_id_in((unsigned char)lx_at(x))){sb_add(&sb,lx_at(x));x->pos++;}bld_add(&b,v_color_hex(sb.b));free(sb.b);
+            x->pos++;SB sb;sb_init(&sb);while(x->pos<x->len&&is_id_in((unsigned char)lx_at(x))){sb_add(&sb,lx_at(x));x->pos++;}lb_add(&b,v_color_hex(sb.b));free(sb.b);
         } else if(in_syms(c)){
-            SB g; sb_init(&g); int isSym=lx_symbol(x,&g);
-            if(isSym && g.len>0) bld_add(&b, v_token(V_SYMBOL, g.b));
-            free(g.b);
+            /* `---` starts a dash multiline string running to EOF: any further
+             * dashes are skipped, the rest is read to EOF and dedented+stripped */
+            if(c=='-' && (unsigned char)lx_peek(x,1)=='-' && (unsigned char)lx_peek(x,2)=='-'){
+                SB sb; sb_init(&sb);
+                x->pos+=3;
+                while(x->pos<x->len && (unsigned char)lx_at(x)=='-') x->pos++;
+                while(x->pos<x->len){
+                    int ch=(unsigned char)lx_at(x);
+                    if(ch=='\r'){ sb_add(&sb,'\n'); x->pos++; if(x->pos<x->len&&lx_at(x)=='\n')x->pos++; }
+                    else if(ch=='\n'){ sb_add(&sb,'\n'); x->pos++; }
+                    else { sb_add(&sb,ch); x->pos++; }
+                }
+                char *norm=dedent_curly_text(sb.b); free(sb.b);
+                lb_add(&b, v_str(norm)); free(norm);
+            } else {
+                SB g; sb_init(&g); int isSym=lx_symbol(x,&g);
+                if(isSym && g.len>0) lb_add(&b, v_token(V_SYMBOL, g.b));
+                free(g.b);
+            }
         } else if(c=='\\'){
             int n=lx_peek(x,1);
             if(is_id_start((unsigned char)n)||n=='['){
                 Value root=v_token(V_WORD,"this");
                 Value p=parse_path(x,root,0);
-                if(lx_at(x)==':'){ x->pos++; bld_add(&b, mk_pathkind(V_PATHLABEL,p)); }
-                else bld_add(&b, p);
-            } else if(n=='\\'){ x->pos+=2; bld_add(&b,v_token(V_SYMBOL,"\\\\")); }
-            else if(n=='/'){ x->pos+=2; bld_add(&b,v_token(V_SYMBOL,"//")); }
-            else { x->pos++; bld_add(&b,v_token(V_SYMBOL,"\\")); }
+                if(lx_at(x)==':'){ x->pos++; lb_add(&b, mk_pathkind(V_PATHLABEL,p)); }
+                else lb_add(&b, p);
+            } else if(n=='\\'){ x->pos+=2; lb_add(&b,v_token(V_SYMBOL,"\\\\")); }
+            else if(n=='/'){ x->pos+=2; lb_add(&b,v_token(V_SYMBOL,"//")); }
+            else { x->pos++; lb_add(&b,v_token(V_SYMBOL,"\\")); }
         } else if(is_id_start(c)){
             SB sb; sb_init(&sb); parse_ident(x,&sb,1);
-            if(sb.len==1 && sb.b[0]=='_'){ bld_add(&b,v_token(V_SYMBOL,"_")); free(sb.b); }
-            else if(lx_at(x)==':'){ x->pos++; bld_add(&b, v_token(V_LABEL, sb.b)); free(sb.b); }
+            if(sb.len==1 && sb.b[0]=='_'){ lb_add(&b,v_token(V_SYMBOL,"_")); free(sb.b); }
+            else if(lx_at(x)==':'){ x->pos++; lb_add(&b, v_token(V_LABEL, sb.b)); free(sb.b); }
             else if(lx_at(x)=='\\' && (is_id_start((unsigned char)lx_peek(x,1))||is_digit((unsigned char)lx_peek(x,1))||lx_peek(x,1)=='[')){
                 Value root=v_token(V_WORD, sb.b); free(sb.b);
                 Value p=parse_path(x,root,0);
-                if(lx_at(x)==':'){ x->pos++; bld_add(&b, mk_pathkind(V_PATHLABEL,p)); }
-                else bld_add(&b, p);
+                if(lx_at(x)==':'){ x->pos++; lb_add(&b, mk_pathkind(V_PATHLABEL,p)); }
+                else lb_add(&b, p);
             } else if(lx_at(x)=='\\'){
-                x->pos++; bld_add(&b, v_token(V_SYMBOL, "\\")); free(sb.b);
+                x->pos++; lb_add(&b, v_token(V_SYMBOL, "\\")); free(sb.b);
             } else {
-                bld_add(&b, v_token(V_WORD, sb.b)); free(sb.b);
+                lb_add(&b, v_token(V_WORD, sb.b)); free(sb.b);
             }
         } else if(c=='\''){
             int initialP=x->pos;
@@ -4707,54 +4809,62 @@ static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline){
                 if(in_syms(lx_at(x))){
                     SB g; sb_init(&g); lx_symbol(x,&g);
                     /* backslash-escape char like '\n' */
-                    if(lx_at(x)=='\''){ x->pos++; bld_add(&b, v_char(g.b[1])); }
-                    else if(!strcmp(g.b,"\\")) { /* \n style */ if(lx_at(x)=='n'){x->pos++;bld_add(&b,v_char('\n'));} else if(lx_at(x)=='t'){x->pos++;bld_add(&b,v_char('\t'));} else bld_add(&b,v_token(V_SYMBOL,g.b)); }
-                    else bld_add(&b, v_token(V_SYMBOLLITERAL, g.b));
+                    if(lx_at(x)=='\''){ x->pos++; lb_add(&b, v_char(g.b[1])); }
+                    else if(!strcmp(g.b,"\\")) { /* \n style */ if(lx_at(x)=='n'){x->pos++;lb_add(&b,v_char('\n'));} else if(lx_at(x)=='t'){x->pos++;lb_add(&b,v_char('\t'));} else lb_add(&b,v_token(V_SYMBOL,g.b)); }
+                    else lb_add(&b, v_token(V_SYMBOLLITERAL, g.b));
                     free(g.b);
                 } else {
-                    x->pos=initialP; SB s2; sb_init(&s2); parse_string(x,&s2,'\''); bld_add(&b, v_char(s2.b[0])); free(s2.b);
+                    x->pos=initialP; SB s2; sb_init(&s2); parse_string(x,&s2,'\''); lb_add(&b, v_char(s2.b[0])); free(s2.b);
                 }
             } else {
                 if(lx_at(x)=='\\' && (is_id_start((unsigned char)lx_peek(x,1))||is_digit((unsigned char)lx_peek(x,1)))){
                     Value root=v_token(V_WORD, sb.b); free(sb.b);
                     Value p=parse_path(x,root,1);
-                    bld_add(&b, mk_pathkind(V_PATHLITERAL,p));
+                    lb_add(&b, mk_pathkind(V_PATHLITERAL,p));
                 } else if(lx_at(x)=='\''){
-                    x->pos++; bld_add(&b, v_char(sb.b[0])); free(sb.b);
+                    x->pos++; lb_add(&b, v_char(sb.b[0])); free(sb.b);
                 } else {
-                    bld_add(&b, v_token(V_LITERAL, sb.b)); free(sb.b);
+                    lb_add(&b, v_token(V_LITERAL, sb.b)); free(sb.b);
                 }
             }
         } else if(c=='`'){
             x->pos++; SB sb; sb_init(&sb);
             while(x->pos<x->len && (is_id_in((unsigned char)x->s[x->pos])||x->s[x->pos]=='.'||x->s[x->pos]=='/')){ sb_add(&sb,x->s[x->pos]); x->pos++; }
-            bld_add(&b, v_unit(sb.b)); free(sb.b);
+            lb_add(&b, v_unit(sb.b)); free(sb.b);
         } else if(c=='.'){
-            if(lx_peek(x,1)=='.'){ x->pos+=2; if(lx_at(x)=='.'){ x->pos++; bld_add(&b,v_token(V_SYMBOL,"...")); } else bld_add(&b,v_token(V_SYMBOL,"..")); }
-            else if(lx_peek(x,1)=='/'){ x->pos+=2; bld_add(&b,v_token(V_SYMBOL,"./")); }
-            else { SB sb; sb_init(&sb); parse_ident(x,&sb,0); if(lx_at(x)==':'){ x->pos++; bld_add(&b,v_token(V_ATTRIBUTELABEL,sb.b)); } else bld_add(&b,v_token(V_ATTRIBUTE,sb.b)); free(sb.b); }
+            if(lx_peek(x,1)=='.'){ x->pos+=2; if(lx_at(x)=='.'){ x->pos++; lb_add(&b,v_token(V_SYMBOL,"...")); } else lb_add(&b,v_token(V_SYMBOL,"..")); }
+            else if(lx_peek(x,1)=='/'){ x->pos+=2; lb_add(&b,v_token(V_SYMBOL,"./")); }
+            else { SB sb; sb_init(&sb); parse_ident(x,&sb,0); if(lx_at(x)==':'){ x->pos++; lb_add(&b,v_token(V_ATTRIBUTELABEL,sb.b)); } else lb_add(&b,v_token(V_ATTRIBUTE,sb.b)); free(sb.b); }
         } else if(c=='['){
-            x->pos++; Value sub=parse_block(x,level+1,1,0); bld_add(&b, sub);
+            x->pos++; Value sub=parse_block(x,level+1,1,0); lb_add(&b, sub);
         } else if(c==']'){
             if(isSubBlock){ x->pos++; break; }
             else break; /* stray */
         } else if(c=='('){
-            x->pos++; Value sub=parse_block(x,level+1,0,1); bld_add(&b, sub);
+            x->pos++; Value sub=parse_block(x,level+1,0,1); lb_add(&b, sub);
         } else if(c==')'){
             if(isSubInline){ x->pos++; break; }
             else break;
         } else if(c=='{'){
-            bld_add(&b, parse_curly(x));
+            lb_add(&b, parse_curly(x));
         } else {
             x->pos++; /* skip unknown byte */
         }
     }
     Value r=bld_block(&b);
+    g_line_capture = oldCapture;
     if(isSubInline) r.k=V_INLINE;
     return r;
 }
 
 Value lex_source(const char *s){
     LX x; x.s=s; x.pos=0; x.len=(int)strlen(s);
+    line_map_reset();
     return parse_block(&x,0,0,0);
+}
+
+int runtime_line_of(const char *src, int index){
+    if(!src) return 0;
+    if(index>=0 && index<g_line_map.n) return g_line_map.lines[index];
+    return 0;
 }

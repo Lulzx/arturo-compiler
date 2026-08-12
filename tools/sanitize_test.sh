@@ -19,7 +19,7 @@ sanitize_source() {
     local source=$1 base=$2 generated="$work/$2"
     ./tmp/ncomp "$root/$source" "$generated" >/dev/null
     "$cc_bin" "${flags[@]}" -Iruntime -c "$generated.c" -o "$generated.o"
-    "$cc_bin" "${flags[@]}" "$generated.o" "$work/runtime.o" -lm "${crypto_lib[@]}" -o "$generated.san"
+    "$cc_bin" "${flags[@]}" "$generated.o" "$work/runtime.o" -lm ${crypto_lib[@]+"${crypto_lib[@]}"} -o "$generated.san"
     mkdir -p "$generated.fs"
     (
         cd "$generated.fs"

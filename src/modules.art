@@ -89,8 +89,7 @@ moduleOnlyNames: function [line][
 modulePackageEntry: function [infoSource][
     lines: moduleSplitOn infoSource "\n"
     loop lines [line][
-        clean: line
-        strip 'clean
+        clean: strip line
         if prefix? clean "entry:" [
             if contains? clean "\"" [
                 entry: moduleQuotedPath clean
@@ -120,8 +119,7 @@ modulePackageEntry: function [infoSource][
 ; `import ./"x.art"` and `import ./{x.art}!`.  A plain quoted filename is also
 ; local according to getEntryForPackage and is resolved relative to the file.
 moduleImportPath: function [line][
-    clean: line
-    strip 'clean
+    clean: strip line
 
     if contains? clean "import.only" [
         if contains? clean "\"" -> return moduleQuotedPath clean
@@ -193,8 +191,7 @@ resolveImports: function [src base active][
             expanded: resolveImports importedSource (modulePathDir fullPath) nextActive
             if and? (not? leanImport) (not? onlyImport) -> out: out ++ @[expanded]
             if leanImport [
-                clean: line
-                strip 'clean
+                clean: strip line
                 replacement: @[]
                 if contains? clean ":" [
                     beforeColon: moduleSplitOn clean ":"

@@ -1269,6 +1269,34 @@ nativeRefValue: function [src state][
 ]
 
 nativeBlockResult: function [items state][
+    ; A block is CODE when it holds words, operators, or attribute tokens; only
+    ; literal data blocks (ints/strings/bools/floats) are typed-native. Decline
+    ; so the dynamic evaluator runs the block as the host does.
+    loop items [item][
+        if :dictionary = type item [
+            if key? item "op" [
+                if "const" = item\op [
+                    cv: item\value
+                    if :word = type cv -> return nativeFail
+                    if :symbol = type cv -> return nativeFail
+                    if :label = type cv -> return nativeFail
+                    if :attribute = type cv -> return nativeFail
+                    if :attributelabel = type cv -> return nativeFail
+                    if :path = type cv -> return nativeFail
+                    if :pathliteral = type cv -> return nativeFail
+                ]
+            ]
+        ]
+        if :dictionary <> type item [
+            if :word = type item -> return nativeFail
+            if :symbol = type item -> return nativeFail
+            if :label = type item -> return nativeFail
+            if :attribute = type item -> return nativeFail
+            if :attributelabel = type item -> return nativeFail
+            if :path = type item -> return nativeFail
+            if :pathliteral = type item -> return nativeFail
+        ]
+    ]
     boxedItems: @[]
     goodItems: true
     loop items [item][
@@ -1925,8 +1953,11 @@ compileToNativeC: function [src outName][
     compileResult: execute.code ("cc " ++ NATIVE_CFLAGS ++ " -c -Iruntime " ++ cPath ++ " -o " ++ outName ++ ".o 2>&1")
     if 0 <> compileResult\code [ panic compileResult\output ]
     cryptoLib: "-lcrypto"
-    if "Darwin" = strip execute "uname -s" -> cryptoLib: ""
-    linkResult: execute.code ("cc " ++ NATIVE_LDFLAGS ++ " " ++ outName ++ ".o runtime/runtime.a -lm " ++ cryptoLib ++ " -o " ++ outName ++ " 2>&1")
+    ldflags: NATIVE_LDFLAGS
+    unameOut: strip execute "uname -s"
+    if "Darwin" = unameOut -> cryptoLib: ""
+    if "Darwin" <> unameOut -> ldflags: "-O1"
+    linkResult: execute.code ("cc " ++ ldflags ++ " " ++ outName ++ ".o runtime/runtime.a -lm " ++ cryptoLib ++ " -o " ++ outName ++ " 2>&1")
     if 0 <> linkResult\code [ panic linkResult\output ]
     outName
 ]

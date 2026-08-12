@@ -94,6 +94,9 @@ Value v_pathv(Value *segv, int n);   /* path built from segment Values (lexer) *
 Value v_token(VKind k, const char *s);  /* word/label/literal/symbol/type/... */
 /* lex an Arturo source string into a block of tokens (the `to :block` lexer) */
 Value lex_source(const char *s);
+/* first 1-based source line of the flat element with the given index (the
+ * block-as-code order that `to :block` produces); 0 when unknown */
+int runtime_line_of(const char *src, int index);
 Value v_func(IR *params, IR **body, int nbody, Env *closure);
 
 /* value access / printing */

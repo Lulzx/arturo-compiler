@@ -46,11 +46,11 @@ check` proves behavior only for the checked-in corpus and compatibility cases.
 The current mechanical boundary is 352/395 declarations: no required
 declarations remain and 43 platform/runtime-internal declarations are intentionally
 unavailable. The local corpus has 106 four-way differential and self-hosted
-native cases, plus thirty-one unmodified tests from the pinned upstream suite. `make unsupported`
+native cases, plus thirty-two unmodified tests from the pinned upstream suite. `make unsupported`
 proves unavailable capabilities fail during compilation without producing an
 executable.
 
-`make sanitize` is the current ASan/UBSan gate across all 106 local and thirty-one
+`make sanitize` is the current ASan/UBSan gate across all 106 local and thirty-two
 vendored-upstream native cases. Leak
 checking remains separate because runtime values still use process-lifetime
 allocation; making ownership explicit is required before LeakSanitizer can be

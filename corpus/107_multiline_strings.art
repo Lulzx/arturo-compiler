@@ -1,0 +1,23 @@
+; multiline and verbatim string forms (pinned host lexer parity)
+s: ««
+line one
+    indented
+line two»»
+print "[" ++ s ++ "]"
+
+c: {
+    hello
+      world
+}
+print "[" ++ c ++ "]"
+
+v: {:
+    hello
+    world
+:}
+print "[" ++ v ++ "]"
+
+f: {!note
+    raw text
+}
+print "[" ++ f ++ "]"
