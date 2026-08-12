@@ -1,3 +1,9 @@
+runtime/*.o
+runtime/*.a
+runtime/intrinsic_arity.inc
+tmp/
+*.bcode
+native_compiler
 demo/getbuiltins
 demo/getbuiltins.c
 demo/getbuiltins.o
