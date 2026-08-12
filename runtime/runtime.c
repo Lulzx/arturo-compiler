@@ -292,7 +292,7 @@ static Value b_symbols(Env*e,Value*a,int n){
     for(Env *frame=e;frame;frame=frame->parent)for(int i=0;i<frame->n;i++)if(frame->names[i][0]&&islower((unsigned char)frame->names[i][0])){int seen=0;for(int j=0;j<used;j++)if(!strcmp(keys[j],frame->names[i]))seen=1;if(!seen){keys[used]=strdup(frame->names[i]);vals[used++]=frame->vals[i];}}
     return v_dict(keys,vals,used);
 }
-static Value b_var(Env*e,Value*a,int n){(void)n;char *name=val_str(a[0]);if(!env_bound(e,name)){free(name);die("var: identifier not found");}Value result=env_get(e,name);free(name);return result;}
+static Value b_var(Env*e,Value*a,int n){(void)n;char *name=val_str(a[0]);if(!env_bound(e,name)){if(rt_builtin_known(name)||declared_arity_of(name)>=0){Value result=v_token(V_BUILTIN,name);free(name);return result;}free(name);die("var: identifier not found");}Value result=env_get(e,name);free(name);return result;}
 static Value b_unset(Env*e,Value*a,int n){
     (void)n;char *name=val_str(a[0]);for(Env *frame=e;frame;frame=frame->parent)for(int i=0;i<frame->n;i++)if(!strcmp(frame->names[i],name)){free(frame->names[i]);for(int j=i+1;j<frame->n;j++){frame->names[j-1]=frame->names[j];frame->vals[j-1]=frame->vals[j];}frame->n--;free(name);return v_null();}free(name);return v_null();
 }
@@ -715,7 +715,7 @@ static void print_scalar(Value v) {
             printf("]");
             break;
         case V_FUNC: printf("function"); break;
-        case V_BUILTIN: printf("%s", v.u.s); break;
+        case V_BUILTIN: printf("<function:builtin>"); break;
         case V_RANGE: printf("%ld..%ld", v.u.range.lo, v.u.range.hi); break;
         case V_PATH:
             for (int i=0;i<v.u.path.nsegs;i++){ if(i)printf("\\"); printf("%s",v.u.path.segs[i]); }
@@ -2877,8 +2877,11 @@ static Value b_capitalize(Env*e,Value*a,int n){
 }
 static Value b_chop(Env*e,Value*a,int n){
     MutTarget t; Value v=mut_load(e,a[0],&t);
-    if(v.k==V_STR){ size_t len=strlen(v.u.s); char *s=(char*)xmalloc(len+1); memcpy(s,v.u.s,len+1); if(len)s[len-1]=0; Value r=v_str(s); free(s); mut_store(e,&t,r); return v_null(); }
-    if(v.k==V_BLOCK){ if(v.u.block.b->n)v.u.block.b->n--; return v_null(); }
+    if(v.k==V_STR){ size_t len=strlen(v.u.s); char *s=(char*)xmalloc(len+1); memcpy(s,v.u.s,len+1); if(len)s[len-1]=0; Value r=v_str(s); free(s); if(t.kind){mut_store(e,&t,r);return v_null();} return r; }
+    if(v.k==V_BLOCK){
+        if(t.kind){ if(v.u.block.b->n)v.u.block.b->n--; return v_null(); }
+        Value r=clone_value(v); if(r.u.block.b->n)r.u.block.b->n--; return r;
+    }
     die("chop: expected string or block"); return v_null();
 }
 static Value b_empty_value(Env*e,Value*a,int n){
@@ -2931,7 +2934,7 @@ static Value b_prepend(Env*e,Value*a,int n){
 }
 static Value b_remove(Env*e,Value*a,int n){
     MutTarget t; Value v=mut_load(e,a[0],&t);
-    if(v.k==V_BLOCK){Block*b=v.u.block.b;int at=0,once=rt_has_attr("once"),removed=0;if(rt_has_attr("index")){long index=as_int(a[1]);for(int i=0;i<b->n;i++)if(i!=index)b->items[at++]=b->items[i];}else if(a[1].k==V_BLOCK&&!rt_has_attr("instance")){Block*needle=a[1].u.block.b;for(int i=0;i<b->n;){int match=i+needle->n<=b->n;for(int j=0;match&&j<needle->n;j++)if(!value_eq(*b->items[i+j],*needle->items[j]))match=0;if(match&&(!once||!removed)){i+=needle->n;removed=1;}else b->items[at++]=b->items[i++];}}else for(int i=0;i<b->n;i++){int match=value_eq(*b->items[i],a[1]);if(match&&(!once||!removed))removed=1;else b->items[at++]=b->items[i];}b->n=at;return t.kind?v_null():v;}
+    if(v.k==V_BLOCK){Block*b=v.u.block.b;int at=0,once=rt_has_attr("once"),removed=0;if(rt_has_attr("index")){long index=as_int(a[1]);for(int i=0;i<b->n;i++)if(i!=index)b->items[at++]=b->items[i];}else if(a[1].k==V_BLOCK&&!rt_has_attr("instance")){Block*needle=a[1].u.block.b;if(needle->n>0){for(int i=0;i<b->n;){int match=i+needle->n<=b->n;for(int j=0;match&&j<needle->n;j++)if(!value_eq(*b->items[i+j],*needle->items[j]))match=0;if(match&&(!once||!removed)){i+=needle->n;removed=1;}else b->items[at++]=b->items[i++];}}else for(int i=0;i<b->n;i++)b->items[at++]=b->items[i];}else for(int i=0;i<b->n;i++){int match=value_eq(*b->items[i],a[1]);if(match&&(!once||!removed))removed=1;else b->items[at++]=b->items[i];}b->n=at;return t.kind?v_null():v;}
     if(v.k==V_DICT){int at=0,keyMode=rt_has_attr("key");for(int i=0;i<v.u.dict->n;i++){int match=keyMode?!strcmp(v.u.dict->keys[i],key_text(a[1])):value_eq(v.u.dict->vals[i],a[1]);if(!match){v.u.dict->keys[at]=v.u.dict->keys[i];v.u.dict->vals[at++]=v.u.dict->vals[i];}}v.u.dict->n=at;return t.kind?v_null():v;}
     if(v.k==V_STR){ char*needle=(a[1].k==V_CHAR&&a[1].u.c==39&&strchr(v.u.s,'+'))?strdup("+"):val_str(a[1]); size_t nl=strlen(needle); if(!nl){free(needle);return t.kind?v_null():v;} const char*p=v.u.s;size_t cap=strlen(p)+1,at=0;char*out=(char*)xmalloc(cap);int once=rt_has_attr("once"),prefix=rt_has_attr("prefix"),suffix=rt_has_attr("suffix"),removed=0;while(*p){size_t remaining=strlen(p);int match=!strncmp(p,needle,nl)&&(!prefix||p==v.u.s)&&(!suffix||remaining==nl);if(match&&(!once||!removed)){p+=nl;removed=1;}else out[at++]=*p++;}out[at]=0;Value r=v_str(out);free(out);free(needle);if(t.kind){mut_store(e,&t,r);return v_null();}return r; }
     die("remove: unsupported value"); return v_null();
@@ -3688,6 +3691,35 @@ static int block_arg(const char *name, int idx){
     return 0;
 }
 
+/* collect `call.attr: value` attributes that immediately follow a call head in
+ * block-as-code evaluation (`join.with: " " lst` inside a `case` arm or loop
+ * body). Installs them into g_attrs and returns 1 when any were found. */
+static int collect_block_attrs(Env *e, Value **it, int n, int *ip){
+    char **names=NULL; Value *vals=NULL; int cnt=0;
+    while(*ip<n){
+        Value t=*it[*ip];
+        if(t.k==V_ATTRIBUTELABEL){
+            const char *nm=t.u.s; (*ip)++;
+            Value v=evalExpr(e,it,n,ip);
+            names=(char**)xrealloc(names,(size_t)(cnt+1)*sizeof(char*));
+            vals=(Value*)xrealloc(vals,(size_t)(cnt+1)*sizeof(Value));
+            names[cnt]=strdup(nm); vals[cnt]=v; cnt++;
+            continue;
+        }
+        if(t.k==V_ATTRIBUTE){
+            names=(char**)xrealloc(names,(size_t)(cnt+1)*sizeof(char*));
+            vals=(Value*)xrealloc(vals,(size_t)(cnt+1)*sizeof(Value));
+            names[cnt]=strdup(t.u.s); vals[cnt]=v_bool(1); cnt++;
+            (*ip)++;
+            continue;
+        }
+        break;
+    }
+    if(cnt>0){ g_attrs.names=names; g_attrs.values=vals; g_attrs.n=cnt; return 1; }
+    free(names); free(vals);
+    return 0;
+}
+
 static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
     Value v = *it[*ip];
     if(v.k==V_STR&&!strcmp(v.u.s,"~")&&*ip+1<n&&it[*ip+1]->k==V_STR){Value argument=*it[*ip+1];(*ip)+=2;return b_render(e,&argument,1);}
@@ -3748,6 +3780,8 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
                 if (A >= 0 && *ip + A >= n) { (*ip)++; return v; }
             }
             (*ip)++;
+            AttrContext savedAttr=g_attrs;
+            int hasAttr=collect_block_attrs(e, it, n, ip);
             int A = fn_arity(v.u.s);
             Value *args = (Value*)xmalloc((n+1)*sizeof(Value));
             int m = 0;
@@ -3764,7 +3798,9 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
                     args[m++] = evalExpr(e, it, n, ip);
             }
             Value out;
-            if (rt_builtin(v.u.s, e, args, m, &out)) { free(args); return out; }
+            if (rt_builtin(v.u.s, e, args, m, &out)) { g_attrs=savedAttr; free(args); return out; }
+            g_attrs=savedAttr;
+            (void)hasAttr;
             free(args); die("unknown function in action"); return v_null();
         }
         if (binop_name(v.u.s)) { (*ip)++; return v; }   /* lone operator: data */
@@ -3778,11 +3814,15 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
                  * value is a comparison operand: return it, don't apply it. */
                 if (*ip+1 < n && is_binop(*it[*ip+1])) { (*ip)++; return v; }
                 (*ip)++;
+                AttrContext savedAttr=g_attrs;
+                int hasAttr=collect_block_attrs(e,it,n,ip);
                 Value *args=(Value*)xmalloc((n+1)*sizeof(Value));
                 int m=0;
                 while (*ip<n && !is_binop(*it[*ip]) && !arg_boundary(it,n,*ip))
                     args[m++]=evalExpr(e,it,n,ip);
                 Value out=applyFunc(e,bv,args,m);
+                g_attrs=savedAttr;
+                (void)hasAttr;
                 free(args); return out;
             }
             (*ip)++; return bv;                         /* plain variable */

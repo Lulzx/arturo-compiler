@@ -1060,9 +1060,14 @@ nativeExpr: function [n state][
                 if owner\ok [
                     if "block" = owner\kind [
                         if key? state\blockitems owner\code [
+                            ; copy the aliased items so the fold is a compile-time
+                            ; optimization, never a mutation of the shared IR the
+                            ; dynamic fallback may still emit
                             items: get state\blockitems owner\code
-                            addItem items n\args\1
-                            set state\blockitems owner\code items
+                            newItems: @[]
+                            loop items [it][ addItem newItems it ]
+                            addItem newItems n\args\1
+                            set state\blockitems owner\code newItems
                             return owner
                         ]
                     ]

@@ -1,0 +1,8 @@
+; chop value form and empty-needle remove (runtime fixes)
+print chop "hello"
+y: ["a" "b" "c"]
+print (y -- [])
+print (y -- ["b"])
+z: "long"
+chop 'z
+print z
