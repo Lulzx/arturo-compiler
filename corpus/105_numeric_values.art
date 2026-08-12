@@ -1,0 +1,4 @@
+print @[ceil 2.1 floor 2.9 to :rational @[neg 7 2]]
+a: 2
+add 'a 1
+print a

@@ -1,0 +1,7 @@
+twice: function [value][value * 2]
+pair: function [left right][left + right]
+print arity\print
+print arity\twice
+print arity\pair
+print key? symbols "twice"
+print call symbols\twice @[21]

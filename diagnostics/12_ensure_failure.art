@@ -1,0 +1,3 @@
+print "before"
+ensure [false]
+print "after"

@@ -1,0 +1,2 @@
+print "load:math"
+double: function [x][x * 2]

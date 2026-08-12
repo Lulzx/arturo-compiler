@@ -1,0 +1,2 @@
+print color #red "plain"
+print color #123456.bold "also plain"

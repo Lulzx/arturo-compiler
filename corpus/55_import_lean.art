@@ -1,0 +1,3 @@
+settings: import.lean relative {../fixtures/modules/settings.art}!
+print settings\answer
+print settings\mode

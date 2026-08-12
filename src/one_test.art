@@ -2,12 +2,13 @@
 ; program in its own process, so value-stack contamination from
 ; one test cannot affect the next. Prints OK or BAD.
 import ./"backend.art"
+import ./"modules.art"
 
 tmpDir: "tmp"
 
 testProgram: function [path][
     execute "mkdir -p tmp"
-    src: read path
+    src: resolveImportsFromFile path
 
     hostOut: runHost path
 
@@ -18,7 +19,7 @@ testProgram: function [path][
     art: renderProgram src
     write art outName
     execute ("arturo -c " ++ outName ++ " 2>&1")
-    compiledOut: execute ("arturo -x " ++ bcodeName ++ " 2>&1")
+    compiledOut: execute ("arturo --no-color -x " ++ bcodeName ++ " 2>&1")
 
     irOut: execute ("arturo --no-color src/ir_runner.art " ++ path ++ " 2>&1")
 

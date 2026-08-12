@@ -1,0 +1,11 @@
+define :car [
+    init: constructor [brand year]
+    compare: sortable 'year
+]
+
+older: to :car ["Ford" 1967]
+newer: to :car ["Nissan" 1991]
+print compare older newer
+print older < newer
+print newer > older
+print older >= newer

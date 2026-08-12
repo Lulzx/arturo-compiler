@@ -1,0 +1,9 @@
+outside: 5
+ns: dictionary [
+    print "namespace:init"
+    answer: outside + 37
+    label: "ready"
+]
+print ns\answer
+print ns\label
+print outside

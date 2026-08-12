@@ -1,0 +1,23 @@
+define :person [
+    init: method [name age][
+        this\name: name
+        this\age: age
+    ]
+    greeting: method [][
+        print this\name
+    ]
+]
+
+a: to :person ["Ada" 36]
+b: to :person ["Grace" 40]
+print a\name
+print b\name
+do [a\greeting]
+do [a\greeting]
+print type a
+print object? a
+print method? get a 'greeting
+print is? :person a
+a\name: "Augusta"
+print a\name
+print b\name

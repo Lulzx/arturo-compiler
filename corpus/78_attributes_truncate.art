@@ -1,0 +1,6 @@
+text: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse erat quam"
+
+print truncate text 30
+print truncate.preserve text 30
+print truncate.with:"---" text 30
+print truncate.preserve.with:"---" text 30

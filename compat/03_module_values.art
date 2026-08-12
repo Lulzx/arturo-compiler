@@ -1,0 +1,9 @@
+utilities: module [
+    answer: 42
+    double: function [x][x * 2]
+]
+export utilities
+print answer
+print call double @[7]
+print utilities\answer
+print call utilities\double @[6]

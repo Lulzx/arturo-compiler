@@ -1,0 +1,14 @@
+define :base [
+    init: constructor [name]
+    identify: method [][print this\name]
+]
+
+define :child is :base [
+    identify: method [][
+        super
+        print "child"
+    ]
+]
+
+a: to :child ["Ada"]
+do [a\identify]

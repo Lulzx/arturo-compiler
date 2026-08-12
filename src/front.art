@@ -63,12 +63,23 @@ import ./"semantics.art"
 ;-----------------------------------------------
 BUILTIN_ARITY: #[]
 INFIX_SYMBOLS: #[]
+PREFIX_SYMBOLS: #[]
 MUTATES: #[]
 
 loop INTRINSICS [nm spec][
     BUILTIN_ARITY\[nm]: spec\arity
     if spec\infix? [
         if 0 < size spec\alias -> INFIX_SYMBOLS\[spec\alias]: nm
+    ]
+    if not? spec\infix? [
+        if 0 < size spec\alias [
+            glyph: spec\alias
+            if glyph <> "$" [
+                if glyph <> "#" [
+                    if glyph <> "@" -> PREFIX_SYMBOLS\[glyph]: nm
+                ]
+            ]
+        ]
     ]
     if not? key? NOT_MUTATING nm [
         loop spec\muts [m][ if m -> MUTATES\[nm]: true ]
@@ -82,6 +93,11 @@ mutatesThroughRef?: function [name][ key? MUTATES name ]
 ;-----------------------------------------------
 ARITY: #[]
 loop BUILTIN_ARITY [k v][ ARITY\[k]: v ]
+; In an overriding method Arturo injects a local zero-argument `super`
+; closure.  It is not a declared builtin, so it cannot come from the
+; generated intrinsic table, but the source still has to be grouped as a
+; call before the class is constructed and that local exists.
+ARITY\super: 0
 
 arityOf: function [name][
     if key? ARITY name [
@@ -105,6 +121,32 @@ infixArityOf: function [name][
 isInfixSymbol: function [el][
     if :symbol <> type el -> return false
     key? INFIX_SYMBOLS (to :string el)
+]
+
+aliasTargetNode: function [name][
+    if key? BUILTIN_ARITY name -> return intrinsicNode name
+    wordNode name
+]
+
+registerAliases: function [blok][
+    i: 0
+    while [i < size blok][
+        el: blok\[i]
+        if :word = type el [
+            if "alias" = to :string el [
+                j: i + 1
+                infixAlias: false
+                if j < size blok [ if :attribute = type blok\[j] [ if "infix" = to :string blok\[j] [infixAlias: true j: j + 1] ] ]
+                if (j + 1) < size blok [
+                    glyph: to :string blok\[j]
+                    target: to :string blok\[j + 1]
+                    if infixAlias -> INFIX_SYMBOLS\[glyph]: target
+                    if not? infixAlias -> PREFIX_SYMBOLS\[glyph]: target
+                ]
+            ]
+        ]
+        i: i + 1
+    ]
 ]
 
 ;-----------------------------------------------
@@ -190,7 +232,7 @@ calleeName: function [n][
     if isLoadNode n -> return n\name
     null
 ]
-callNode:   function [fn args][ #[nodek: "call" fn: fn args: args] ]
+callNode:   function [fn args][ #[nodek: "call" fn: fn args: args attrs: #[]] ]
 defineNode: function [name expr][ #[nodek: "define" name: name args: @[expr]] ]
 
 ;-----------------------------------------------
@@ -213,6 +255,90 @@ isLoadNode: function [n][
 ; spec's pipeline shape.
 ;-----------------------------------------------
 stripComments: function [src][ src ]
+
+; Arturo's donated lexer resolves an unknown custom type token (`:person`) to
+; the generic `:object` type before this compiler can see its spelling. Keep
+; user type identities losslessly by discovering custom-type declarations
+; declarations in the source text and quoting only those type tokens. The
+; object rules consume the preserved spelling (`":person"`) later.
+frontTypeDelimiter?: function [ch][
+    if whitespace? ch -> return true
+    if "[" = ch -> return true
+    if "]" = ch -> return true
+    if "(" = ch -> return true
+    if ")" = ch -> return true
+    if "," = ch -> return true
+    if ";" = ch -> return true
+    false
+]
+
+frontCustomTypeNames: function [src][
+    names: #[]
+    n: size src
+    i: 0
+    quoted: false
+    braced: false
+    commented: false
+    while [i < n][
+        ch: to :string src\[i]
+        handled: false
+        if commented [
+            if "\n" = ch -> commented: false
+            i: i + 1
+            handled: true
+        ]
+        if not? handled [
+            if and? (not? braced) ["\"" = ch] [ quoted: not? quoted i: i + 1 handled: true ]
+        ]
+        if and? (not? handled) [quoted] [ i: i + 1 handled: true ]
+        if not? handled [
+            if and? braced ["}" = ch] [ braced: false i: i + 1 handled: true ]
+        ]
+        if and? (not? handled) [braced] [ i: i + 1 handled: true ]
+        if not? handled [ if "{" = ch [ braced: true i: i + 1 handled: true ] ]
+        if not? handled [ if ";" = ch [ commented: true i: i + 1 handled: true ] ]
+        if not? handled [
+            if (i + 5) < n [
+                if "define" = slice src i (i + 5) [
+                    j: i + 6
+                    skipSpace: true
+                    while [and? (j < n) [skipSpace]][
+                        piece: to :string src\[j]
+                        if whitespace? piece -> j: j + 1
+                        if not? whitespace? piece -> skipSpace: false
+                    ]
+                    if j < n [
+                        if ":" = to :string src\[j] [
+                            k: j + 1
+                            scanName: true
+                            while [and? (k < n) [scanName]][
+                                piece: to :string src\[k]
+                                if frontTypeDelimiter? piece -> scanName: false
+                                if not? frontTypeDelimiter? piece -> k: k + 1
+                            ]
+                            if (j + 1) < k -> names\[(slice src j (k - 1))]: true
+                        ]
+                    ]
+                ]
+            ]
+            i: i + 1
+        ]
+    ]
+    names
+]
+
+prepareSource: function [src][
+    customMarker: "define " ++ ":"
+    if not? contains? src customMarker -> return src
+    names: frontCustomTypeNames src
+    if empty? names -> return src
+    prepared: src
+    loop names [token marker][
+        quotedType: "\"" ++ token ++ "\""
+        prepared: replace prepared token quotedType
+    ]
+    prepared
+]
 
 ;-----------------------------------------------
 ; addItem — append `v` to collection `c` as a SINGLE
@@ -257,7 +383,9 @@ buildPathGet: function [parts][
     if 1 < size parts [
         loop 1..dec (size parts) [j][
             seg: pathSegNode parts\[j]
-            if not? null? seg -> node: callNode (intrinsicNode "get") @[node seg]
+            getter: "get"
+            if j = dec (size parts) -> getter: "pathGet"
+            if not? null? seg -> node: callNode (intrinsicNode getter) @[node seg]
         ]
     ]
     node
@@ -366,19 +494,14 @@ makeDictCall: function [ib][
 ]
 
 ;-----------------------------------------------
-; buildBlockVal — an `@[a b]` value: each element becomes a
-; node (word -> load), collected into a block value node.
+; buildBlockVal — an `@[a b]` value. Its contents are ordinary Arturo
+; expressions, not one expression per lexical token: `@[ceil 2 neg 3]` has
+; two elements. Reuse the normal grouping walk so calls retain their operands
+; before the resulting expressions are collected into a block value node.
 ;-----------------------------------------------
 buildBlockVal: function [blk][
-    out: @[]
-    loop blk [x][
-        ; `@[...]` elements are read, so a word here is a load and
-        ; takes the emitted name. A raw `[...]` is data (or a body
-        ; the host lowers later) and prints verbatim.
-        if :word = type x -> addItem out (wordNode (to :string x))
-        if :word <> type x -> addItem out x
-    ]
-    #[nodek: "blockval" items: out]
+    grouped: lowerWalk blk 0 false
+    #[nodek: "blockval" items: grouped\root]
 ]
 
 ;-----------------------------------------------
@@ -421,7 +544,9 @@ lowerWalk: function [blok start stopAtRoot][
                 if "define" = top\nodek [
                     expr: top\args\0
                     if isCallNode expr [
-                        if "function" = calleeName expr\fn [
+                        bindingKind: calleeName expr\fn
+                        callableBinding: or? ("function" = bindingKind) [or? ("method" = bindingKind) [or? ("constructor" = bindingKind) ["sortable" = bindingKind]]]
+                        if "function" = bindingKind [
                             params: expr\args\0
                             if :block = type params [
                                 cnt: 0
@@ -434,7 +559,7 @@ lowerWalk: function [blok start stopAtRoot][
                         ]
                         ; a call that is not a function: the name is a
                         ; plain variable now — forget any builtin arity
-                        if "function" <> calleeName expr\fn [
+                        if not? callableBinding [
                             ARITY\[top\name]: null
                             noteShadow top\name
                         ]
@@ -454,7 +579,7 @@ lowerWalk: function [blok start stopAtRoot][
     ]
 
     descendCall: function [c fnNode arity][
-        fr: #[nodek: "call" fn: fnNode arity: arity args: @[]]
+        fr: #[nodek: "call" fn: fnNode arity: arity args: @[] attrs: #[]]
         appendToTarget c fr
         addItem c\stack fr
     ]
@@ -477,7 +602,7 @@ lowerWalk: function [blok start stopAtRoot][
         if and? (c\i < c\n - 1) [isInfixSymbol blok\[c\i + 1]] [
             opName: to :string blok\[c\i + 1]
             fnName: INFIX_SYMBOLS\[opName]
-            descendCall c (intrinsicNode fnName) (infixArityOf fnName)
+            descendCall c (aliasTargetNode fnName) (infixArityOf fnName)
             c\i: c\i + 1
         ]
     ]
@@ -500,6 +625,8 @@ lowerWalk: function [blok start stopAtRoot][
             nxt: blok\[c\i + 1]
             argblock: @[]
             subblock: @[]
+            explicitArgs: false
+            partialArgs: false
             if :block = type nxt [
                 idx: 1
                 loop nxt [el2][
@@ -518,11 +645,50 @@ lowerWalk: function [blok start stopAtRoot][
             if :word = type nxt [
                 fnArity: arityOf (to :string nxt)
                 if fnArity > 0 [
+                    if (c\i + 1 + fnArity) < c\n [
+                        loop 1..fnArity [j][
+                            candidate: blok\[c\i + 1 + j]
+                            candidateText: to :string candidate
+                            if "&" = candidateText [ explicitArgs: true ]
+                        ]
+                    ]
+                ]
+                if and? (not? explicitArgs) [fnArity > 1] [
+                    if (c\i + fnArity) < c\n [
+                        firstFixed: blok\[c\i + 2]
+                        if :word <> type firstFixed -> partialArgs: true
+                    ]
+                ]
+                if fnArity > 0 [
                     addItem subblock nxt
-                    loop 0..dec fnArity [j][
-                        w: to :word ("x" ++ to :string (j + 1))
+                    if explicitArgs [
+                        idx: 1
+                        loop 1..fnArity [j][
+                            candidate: blok\[c\i + 1 + j]
+                            isPlaceholder: false
+                            candidateText: to :string candidate
+                            if "&" = candidateText [ isPlaceholder: true ]
+                            if isPlaceholder [
+                                w: to :word ("x" ++ to :string idx)
+                                addItem argblock w
+                                addItem subblock w
+                                idx: idx + 1
+                            ]
+                            if not? isPlaceholder -> addItem subblock candidate
+                        ]
+                    ]
+                    if partialArgs [
+                        w: to :word "x1"
                         addItem argblock w
                         addItem subblock w
+                        loop 1..dec fnArity [j][ addItem subblock blok\[c\i + 1 + j] ]
+                    ]
+                    if and? (not? explicitArgs) [not? partialArgs] [
+                        loop 0..dec fnArity [j][
+                            w: to :word ("x" ++ to :string (j + 1))
+                            addItem argblock w
+                            addItem subblock w
+                        ]
                     ]
                 ]
                 if fnArity < 1 -> addItem subblock nxt
@@ -532,7 +698,9 @@ lowerWalk: function [blok start stopAtRoot][
             ]
             appendValue c argblock
             appendValue c subblock
-            c\i: c\i + 2
+            if explicitArgs [ c\i: c\i + 2 + fnArity ]
+            if partialArgs [ c\i: c\i + 1 + fnArity ]
+            if and? (not? explicitArgs) [not? partialArgs] [ c\i: c\i + 2 ]
         ]
         if not? hasNext [
             appendValue c blok\[c\i]
@@ -557,16 +725,22 @@ lowerWalk: function [blok start stopAtRoot][
         if :word = type el [
             name: to :string el
             if name = "true" [
+                rewind ctx
+                tryInfix ctx
                 appendValue ctx true
                 ctx\i: ctx\i + 1
                 ctx\processed: ctx\processed + 1
             ]
             if name = "false" [
+                rewind ctx
+                tryInfix ctx
                 appendValue ctx false
                 ctx\i: ctx\i + 1
                 ctx\processed: ctx\processed + 1
             ]
             if name = "null" [
+                rewind ctx
+                tryInfix ctx
                 appendValue ctx null
                 ctx\i: ctx\i + 1
                 ctx\processed: ctx\processed + 1
@@ -575,6 +749,16 @@ lowerWalk: function [blok start stopAtRoot][
                 if name <> "false" [
                     if name <> "null" [
                         ar: arityOf name
+                        ; `type? value` is the value-kind predicate, while
+                        ; `type? value :kind` is Arturo's optional typed form.
+                        ; The generated table records the required operand;
+                        ; promote this call only when the optional type token
+                        ; is visibly present after a simple first operand.
+                        if name = "type?" [
+                            if (ctx\i + 2) < ctx\n [
+                                if :type = type blok\[ctx\i + 2] -> ar: 2
+                            ]
+                        ]
                         ; A word of arity 0 consumes no operands, so
                         ; it is a leaf: opening a call frame for it
                         ; parks a frame that nothing will ever
@@ -618,6 +802,12 @@ lowerWalk: function [blok start stopAtRoot][
 
         if :symbol = type el [
             name: to :string el
+            if key? PREFIX_SYMBOLS name [
+                targetName: PREFIX_SYMBOLS\[name]
+                descendCall ctx (aliasTargetNode targetName) (arityOf targetName)
+                ctx\i: ctx\i + 1
+                ctx\processed: ctx\processed + 1
+            ]
             if name = "$" [
                 descendCall ctx (intrinsicNode "function") 2
                 ctx\i: ctx\i + 1
@@ -647,8 +837,12 @@ lowerWalk: function [blok start stopAtRoot][
                     ctx\processed: ctx\processed + 1
                 ]
                 if not? blockAhead [
-                    appendValue ctx el
-                    ctx\i: ctx\i + 1
+                    ; Prefix evaluation also materializes iterable values:
+                    ; `@1..3` and `@first.n: 2 range` become evaluated blocks.
+                    sub: lowerWalk blok (ctx\i + 1) true
+                    blockType: to :type "block"
+                    appendValue ctx (callNode (intrinsicNode "to") @[blockType sub\root\0])
+                    ctx\i: sub\i
                     ctx\processed: ctx\processed + 1
                 ]
             ]
@@ -666,7 +860,7 @@ lowerWalk: function [blok start stopAtRoot][
                 ctx\i: sub\i
                 ctx\processed: ctx\processed + 1
             ]
-            if name <> "$" [
+            if and? (name <> "$") [not? key? PREFIX_SYMBOLS name] [
                 if name <> "#" [
                     if name <> "@" [
                         if name <> "=>" [
@@ -703,17 +897,64 @@ lowerWalk: function [blok start stopAtRoot][
             ctx\processed: ctx\processed + 1
         ]
 
+        ; Function attributes occur directly after a call head. A labelled
+        ; attribute consumes one complete expression as its value; a plain
+        ; attribute is the logical flag `true`. They belong to the pending
+        ; call frame and never consume positional arity.
+        if :attributelabel = type el [
+            attached: false
+            if not? empty? ctx\stack [
+                fr: last ctx\stack
+                if "call" = fr\nodek [
+                    sub: lowerWalk blok (ctx\i + 1) true
+                    if not? empty? sub\root [
+                        fr\attrs\[(to :string el)]: sub\root\0
+                        ctx\i: sub\i
+                        ctx\processed: ctx\processed + 1
+                        attached: true
+                    ]
+                ]
+            ]
+            if not? attached [
+                appendValue ctx el
+                ctx\i: ctx\i + 1
+                ctx\processed: ctx\processed + 1
+            ]
+        ]
+
+        if :attribute = type el [
+            attached: false
+            if not? empty? ctx\stack [
+                fr: last ctx\stack
+                if "call" = fr\nodek [
+                    fr\attrs\[(to :string el)]: true
+                    ctx\i: ctx\i + 1
+                    ctx\processed: ctx\processed + 1
+                    attached: true
+                ]
+            ]
+            if not? attached [
+                appendValue ctx el
+                ctx\i: ctx\i + 1
+                ctx\processed: ctx\processed + 1
+            ]
+        ]
+
         ; plain value (literal / block / inline / char / etc.)
         if :label <> type el [
             if :word <> type el [
                 if :symbol <> type el [
                     if :path <> type el [
                         if :pathlabel <> type el [
-                            rewind ctx
-                            tryInfix ctx
-                            appendValue ctx el
-                            ctx\i: ctx\i + 1
-                            ctx\processed: ctx\processed + 1
+                            if :attribute <> type el [
+                                if :attributelabel <> type el [
+                                    rewind ctx
+                                    tryInfix ctx
+                                    appendValue ctx el
+                                    ctx\i: ctx\i + 1
+                                    ctx\processed: ctx\processed + 1
+                                ]
+                            ]
                         ]
                     ]
                 ]
@@ -738,6 +979,7 @@ lowerWalk: function [blok start stopAtRoot][
 ; Public entry: lower a whole raw block
 ;-----------------------------------------------
 lowerBlock: function [blok][
+    registerAliases blok
     res: lowerWalk blok 0 false
     res\root
 ]

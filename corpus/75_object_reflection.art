@@ -1,0 +1,14 @@
+define :base [
+    init: constructor [name age]
+    identify: method [][print this\name]
+]
+
+define :child is :base [
+    identify: method [][super]
+    study: method [][print "study"]
+]
+
+a: to :child ["Ada" 20]
+loop methods a [methodName][print methodName]
+loop keys a [fieldName][print fieldName]
+loop values a [fieldValue][print fieldValue]

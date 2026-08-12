@@ -1,0 +1,16 @@
+define :person [
+    init: constructor [name age]
+    identify: method [][print this\name]
+]
+
+define :student is :person [
+    student: method [][print "student"]
+]
+
+a: to :student ["Ada" 20]
+print a\name
+print a\age
+do [a\identify]
+do [a\student]
+print type a
+print is? :student a

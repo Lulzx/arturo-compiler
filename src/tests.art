@@ -25,7 +25,10 @@ go: function [][
         ; whole corpus
         files: list "corpus"
         loop files [f][
-            if f <> "corpus/m1" [
+            ; Only .art programs are corpus cases.  Leftover expected-output
+            ; or artifact files must not inflate the count by "passing"
+            ; trivially (both engines print nothing and agree).
+            if and? (f <> "corpus/m1") [suffix? f ".art"] [
                 out: execute ("arturo --no-color src/one_test.art " ++ f ++ " 2>&1")
                 if contains? out "OK" -> passed: passed + 1
                 if not? contains? out "OK" -> failed: failed + 1

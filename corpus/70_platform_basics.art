@@ -1,0 +1,4 @@
+prints "hello"
+print " world"
+print process\id > 0
+print string? path\current

@@ -1,0 +1,11 @@
+print parse "123"
+print parse "[1 2 3]"
+print translate "the brown fox jumped" #[brown: "green" fox: "wolf" jumped: "flew"]
+path: "/this/is/some/path.txt"
+print extract.directory path
+print extract.basename path
+print extract.filename path
+print extract.extension path
+greeting: "hello"
+x: 2
+print render "|greeting|, your number is |x|"

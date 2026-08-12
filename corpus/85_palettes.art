@@ -1,0 +1,5 @@
+print palette.triad #red
+print palette.tetrad #red
+print palette.split #red
+print palette.monochrome #red
+print palette.analogous.size:10 #red

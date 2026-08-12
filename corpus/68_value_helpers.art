@@ -1,0 +1,8 @@
+print angle to :complex [1 1]
+print reciprocal 3
+print reciprocal to :rational [3 2]
+print reciprocal 3.2
+print leap? 2000
+print leap? 1900
+print leap? 2024
+print null? timestamp "a-file-that-does-not-exist"

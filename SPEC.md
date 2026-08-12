@@ -352,27 +352,28 @@ source, then the compiler's own source (the self-host check).
 
 ## 12. Error model
 
-Kernel errors are values, not host panics. An evaluation that fails produces
-a `#[error: message]` value (or throws a kernel marker) so the kernel never
-depends on host panic behavior. Arturo 0.10.0 panics unwind incorrectly
-through `try` (a known bug). `try`/`except` in source is donated until the
-kernel owns an error model; program-level `try` around kernel-owned
-constructs is a v1 concern.
+Kernel and native failures are structured values while caught by `try` and
+become stable stderr diagnostics with nonzero status when uncaught. The native
+runtime carries the original source filename. Exact upstream presentation,
+source-line spans, and Arturo-level stack frames remain a tooling concern; the
+semantic error paths are covered by `make diagnostics` and the caught-error
+corpus.
 
 ## 13. Language surface backlog
 
 | Construct | v0 | Path to ownership |
 | --- | --- | --- |
-| `method`, `$`, arrow bodies, `=>` | delegated/passthrough | lowering → `function` |
-| arithmetic/comparison/io builtins | delegated | stay delegated (env-independent) |
-| `set`, `assign` | delegated | kernel rule after host-parity pin |
-| paths `a/b`, symbols `'x` | delegated/passthrough | kernel rules (note `=` bug) |
-| parens `( .. )` | passthrough | lowering |
-| string interpolation | passthrough | lowering |
+| `method`, `$`, arrow bodies, `=>` | owned | keep method/closure parity cases green |
+| portable arithmetic/comparison/I/O | native runtime | expand edge and negative tests |
+| mutation and assignment | owned | keep reference/write-back parity cases green |
+| paths and symbols | owned | preserve token kinds through every backend |
+| parens `( .. )` | owned | lowering |
+| string interpolation/rendering | owned portable surface | extend nested interpolation parity |
 | loops (`loop`, `while`, `until`, ranges) | kernel rules | owned (lazy bodies; explicit range IR) |
-| `import` / modules | passthrough | later, after the driver |
-| objects / classes | passthrough | later |
-| `try` / `except` | passthrough | after §12 error model |
+| `import` / modules/packages | compile-time resolver | recursive/selective/local/package tests |
+| objects / classes | owned | constructors, inheritance, `super`, reflection, ordering |
+| `try`, `throw`, `ensure`, `panic` | owned | add source-line and stack-frame metadata |
+| external service handles | unavailable | compile-time rejection policy |
 
 Lazy constructs always take the kernel-rule path, never delegation.
 

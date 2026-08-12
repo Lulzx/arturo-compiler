@@ -1,0 +1,8 @@
+c: to :color [15 45 87]
+d: to :color "#FF0080"
+print c
+print d
+print color? c
+print type c
+print c = to :color "#0F2D57"
+print to :string d

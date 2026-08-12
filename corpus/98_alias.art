@@ -1,0 +1,5 @@
+addThem: function [x y][x + y]
+alias.infix {<=>} 'addThem!
+print 2 <=> 3
+alias '--> 'neg!
+print --> 7

@@ -1,0 +1,32 @@
+source: [1 2 3 4]
+other: [3 4 5 6]
+
+a: new source
+b: #[value: new source]
+difference 'a other
+difference 'b\value other
+print a
+print b\value
+print a = b\value
+
+c: new source
+d: #[value: new source]
+intersection 'c other
+intersection 'd\value other
+print c
+print d\value
+print c = d\value
+
+e: new source
+f: #[value: new source]
+powerset 'e
+powerset 'f\value
+print e = f\value
+
+g: new source
+h: #[value: new source]
+union 'g other
+union 'h\value other
+print g
+print h\value
+print g = h\value

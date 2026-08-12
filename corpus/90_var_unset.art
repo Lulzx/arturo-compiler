@@ -1,0 +1,7 @@
+answer: 42
+print var 'answer
+adder: function [x][x + 1]
+f: var 'adder
+print call f @[9]
+unset 'answer
+print defined? 'answer

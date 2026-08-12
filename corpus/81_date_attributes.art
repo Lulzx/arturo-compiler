@@ -1,0 +1,7 @@
+d: to :date "2024-01-31T12:00:00+05:30"
+
+print after.days:2 d
+print before.hours:3 d
+print after.months:1 d
+print before.years:1 d
+print after.weeks:1.hours:2 d

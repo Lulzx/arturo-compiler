@@ -1,0 +1,170 @@
+; TODO(Tests\scopes) verify & update related unit tests
+;  tests need to be verified + add more for `with` and `.import` (if it stays in)
+;  labels: easy, unit-test
+
+; NORMAL FUNCTION CALL
+; from the inside we can access the outer variable
+; but not modify it
+
+x: 1
+print ["x before:" x]
+
+f: function[][
+    x: x+10
+	print ["x in f:" x]
+]
+
+f
+print ["x after:" x]
+
+; FUNCTION CALL WITH .EXPORT
+; from the inside we can access the outer variable
+; and modify it
+
+y: 1
+print ["y before:" y]
+
+g: function [] .export:[y][
+    y: y+10
+	print ["y in g:" y]
+]
+
+g
+print ["y after:" y]
+
+; NESTED FUNCTION CALLS
+; the local variables should remain intact
+; between different function calls
+
+z: function[x][
+	s: x
+	print ["in Z: x=" x ", s=" s]
+]
+
+w: function[x y][
+	s: x
+	print ["in W: x=" x ", s=" s]
+	do y
+	print ["in W: x=" x ", s=" s]
+]
+
+w 10 [z 20]
+
+; NESTED FUNCTION CALLS (WITH STRINGS)
+; as above
+
+l: function[x][
+	m: x
+	print ["in L: x=" x ", m=" m]
+]
+
+k: function[x y][
+	m: x
+	do y
+	print ["in K: x=" x ", m=" m]
+]
+
+k "boom" [l "zoom"]
+
+; RECURSIVE FUNCTION
+; the local variables should remain intact
+; between different function calls
+
+fibo: function [n][
+	q: 3*n
+	print ["in fibo" n ", q =" q]
+	switch n<2 [ 
+		print ["in fibo" n ", q =" q]
+		1
+	][ 
+		ret: add fibo n-1 fibo n-2
+		print ["in fibo" n ", q =" q]
+		ret
+	]
+]
+
+loop [3 4] 'r [
+	print ["fibo" r "=" fibo r]
+]
+
+; MULTIPLE NESTED DO-BLOCKS
+; children can access and modify parents' scope symbols
+; and also(!) create new ones in them
+
+do [
+	a:9
+	do [	
+		b:4
+		x:a+b
+		do [	
+			y:x+b
+			print [x a b y]
+		]
+
+		print [x a b y]
+	]
+
+	switch set? 'b [
+ 		print [a b y x]
+ 	][
+ 		print "b: not set -> NOT CORRECT"
+ 	]
+]
+
+; LOOP BLOCK
+; the injected parameters have to remain local (in that case 'o)
+; and be removed afterwards
+
+j: 0 
+
+loop [1 2 3 4] 'o [
+	j: j + o
+]
+
+print ["j :" j]
+
+switch set? 'o [
+	print o
+][
+	print "o: not set -> CORRECT"
+]
+
+; LOOP BLOCK WITH INTERNAL VARS
+; the injected parameters and variables have to remain local
+; and be removed afterwards
+; all other ones (e.g. 'h) will be exported
+
+j: 0 
+
+loop [1 2 3 4] 'o [
+	j: j + o
+	h: 2*o
+]
+
+print ["j :" j]
+
+switch set? 'o [
+	print o
+][
+	print "o: not set -> CORRECT"
+]
+
+switch set? 'h [
+	print h
+][
+	print "h: not set -> NOT CORRECT"
+]
+
+; MAP BLOCK
+; the injected parameters have to remain local (e.g. 'm)
+; and be removed afterwards
+
+print map [1 2 3 4] 'm [
+	2*m
+]
+
+switch set? 'm [
+	print m
+][
+	print "m: not set -> CORRECT"
+]

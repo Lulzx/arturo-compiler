@@ -1,0 +1,5 @@
+capture: function [x][with [x][x "fixed"]]
+saved: capture 10
+print saved
+x: 99
+print saved

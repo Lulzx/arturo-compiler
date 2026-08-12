@@ -1,0 +1,2 @@
+print "load:custom-package"
+customPackageValue: 6 * 7

@@ -1,0 +1,15 @@
+print dup 7
+discard 99
+print "discarded"
+
+print decouple [[1 "a"] [2 "b"] [3 "c"]]
+d: #[a: 1]
+extend 'd #[b: 2]
+print d
+
+r: random 2 4
+print 2 =< r
+print r =< 4
+s: sample [1 2 3]
+print in? s [1 2 3]
+print sort shuffle [3 1 2]

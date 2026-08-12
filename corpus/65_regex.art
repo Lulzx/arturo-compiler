@@ -1,0 +1,8 @@
+digits: to :regex "[0-9]+"
+print regex? digits
+print match? "x: 123, y: 456" digits
+print match? "nothing" digits
+print match "x: 123, y: 456" digits
+print match "abc" "[a-z]+"
+print type digits
+print to :string digits

@@ -3,7 +3,7 @@ import ./"../src/cbackend.art"
 
 buildSelfCompiler: function [][
     out: @[]
-    files: ["intrinsics.art" "semantics.art" "front.art" "kernel.art" "ir.art" "backend.art"]
+    files: ["intrinsics.art" "modules.art" "semantics.art" "front.art" "kernel.art" "ir.art" "backend.art"]
     loop files [f][
         src: read ("src/" ++ f)
         loop files [g][ src: replace src ("import ./\"" ++ g ++ "\"\n") "" ]

@@ -1,0 +1,3 @@
+import.only:[answer] relative {../fixtures/modules/settings.art}!
+print answer
+print set? 'mode

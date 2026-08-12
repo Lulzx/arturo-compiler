@@ -1,0 +1,7 @@
+print express "Hello, world"
+print express [1 "two" 3]
+print express #[name: "John" age: 30]
+inspect.muted 3
+elapsed: benchmark.get [sum 1..100]
+print quantity? elapsed
+print units elapsed

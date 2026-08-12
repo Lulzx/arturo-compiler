@@ -1,0 +1,6 @@
+print "main:before"
+import relative {../fixtures/modules/math.art}!
+import relative {../fixtures/modules/nested/api.art}!
+print double 9
+print answerText
+print "main:after"

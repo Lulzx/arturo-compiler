@@ -14,9 +14,9 @@
 
 /* ---- values ---------------------------------------------------------- */
 typedef enum {
-    V_NULL, V_INT, V_FLOAT, V_STR, V_CHAR, V_BOOL,
+    V_NULL, V_INT, V_FLOAT, V_RATIONAL, V_COMPLEX, V_QUANTITY, V_UNIT, V_DATE, V_COLOR, V_BINARY, V_STR, V_CHAR, V_BOOL,
     V_BLOCK, V_DICT, V_FUNC, V_BUILTIN, V_RANGE, V_PATH,
-    V_WORD, V_LABEL, V_LITERAL, V_SYMBOL, V_TYPE, V_INLINE,
+    V_WORD, V_LABEL, V_LITERAL, V_SYMBOL, V_SYMBOLLITERAL, V_TYPE, V_VERSION, V_ERRORKIND, V_INLINE,
     V_PATHLABEL, V_PATHLITERAL, V_REGEX, V_ATTRIBUTE, V_ATTRIBUTELABEL,
     V_ERROR
 } VKind;
@@ -41,14 +41,21 @@ struct Value {
     union {
         long        i;          /* V_INT */
         double      f;          /* V_FLOAT */
+        struct { long num; long den; } rational; /* V_RATIONAL */
+        struct { double real; double imag; } complex; /* V_COMPLEX */
+        struct { double amount; char *unit; int integral; } quantity; /* V_QUANTITY */
+        long long   epoch;      /* V_DATE: Unix timestamp */
+        unsigned int rgba;      /* V_COLOR: 0xRRGGBBAA */
+        struct { unsigned char *data; size_t len; } binary; /* V_BINARY */
+        struct { char *message; char *kind; } error; /* V_ERROR */
         char       *s;          /* V_STR  */
         char        c;          /* V_CHAR */
         int         b;          /* V_BOOL */
-        struct { long lo; long hi; } range;   /* V_RANGE */
+        struct { long lo; long hi; long step; int character; int infinite; } range;   /* V_RANGE */
         struct { char **segs; int nsegs; Value *segv; } path;  /* V_PATH (segv=segment Values for to :block) */
         struct { Block *b; } block;    /* V_BLOCK — shared body, see Block above */
         Dict       *dict;       /* V_DICT */
-        struct { IR *params; IR **body; int nbody; Env *closure; } fn; /* V_FUNC */
+        struct { IR *params; IR **body; int nbody; Env *closure; int constructor; char **exports; int nexports; } fn; /* V_FUNC */
     } u;
 };
 
@@ -64,10 +71,21 @@ struct Dict {
 Value v_null(void);
 Value v_int(long i);
 Value v_float(double f);
+Value v_float_text(const char *text);
+Value v_rational(long numerator, long denominator);
+Value v_complex(double real, double imaginary);
+Value v_quantity(double amount, const char *unit);
+Value v_quantity_int(long amount, const char *unit);
+Value v_unit(const char *unit);
+Value v_date_iso(const char *iso8601);
+Value v_color_hex(const char *hex);
+Value v_binary_text(const char *text);
 Value v_str(const char *s);          /* copies */
 Value v_char(char c);
 Value v_bool(int b);
 Value v_error(const char *message);
+Value v_version(const char *version);
+Value v_errorkind(const char *name);
 Value v_block(Value **items, int n);
 Value v_dict(char **keys, Value *vals, int n);
 Value v_range(long lo, long hi);
@@ -96,7 +114,7 @@ void  env_set(Env *e, const char *name, Value v);
  * constant value, an optional fn + args list. All fields are populated by
  * the builders; runNode reads only what its op needs. */
 struct IR {
-    const char *op;      /* "const","load","define","function","if","do",
+    const char *op;      /* "const","load","define","function","dictionary","if","do",
                             "block","call","return","while","until","loop","range",
                             "passthrough","intrinsic" */
     const char *name;    /* load/define/intrinsic */
@@ -104,6 +122,9 @@ struct IR {
     IR         *fn;      /* call callee */
     IR        **args;    /* construct args */
     int         nargs;
+    const char **attr_names; /* call attributes, in source order */
+    IR         **attr_values;
+    int          nattrs;
 };
 
 IR *ir_const(Value v);
@@ -113,14 +134,18 @@ IR *ir_word(const char *name);   /* bare word in value position: load-if-bound, 
 IR *ir_define(const char *name, IR *expr);
 IR *ir_let(const char *name, IR *expr);
 IR *ir_call(IR *fn, IR **args, int n);
+IR *ir_call_attrs(IR *fn, IR **args, int n, const char **names, IR **values, int nattrs);
+IR *ir_attrs(IR *node, const char **names, IR **values, int nattrs);
 IR *ir_passthrough(Value src);
 IR *ir_block(IR **items, int n);
 IR *ir_fn(IR *params, IR **body, int n);       /* function */
 IR *ir_op(const char *op, IR **args, int n);   /* if/do/return/while/until */
+IR *ir_op_attrs(const char *op, IR **args, int n, const char **names, IR **values, int nattrs);
 IR *ir_seq(IR **items, int n);                 /* internal __seq of statements */
 
 /* ---- evaluation -------------------------------------------------------- */
 void runtime_set_args(int argc, char **argv);
+void runtime_set_source(const char *path);
 Value runSeq(Env *e, IR **seq, int n);
 Value runNode(Env *e, IR *node);
 

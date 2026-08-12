@@ -1,0 +1,7 @@
+text: {a long "string" + with \diffe\rent symbols.}
+print escape text
+print escape.json text
+print escape.regex text
+print escape.shell text
+print escape.xml text
+print wordwrap.at:10 "one two three four five six seven eight nine ten"

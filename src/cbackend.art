@@ -16,6 +16,11 @@ import ./"ir.art"
 ; resulting artifact separately when size is more important than turnaround.
 NATIVE_CFLAGS: "-O1 -fvisibility=hidden"
 NATIVE_LDFLAGS: "-O1 -Wl,-dead_strip -Wl,-x"
+NATIVE_SOURCE_PATH: "<script>"
+; The compiler itself was bootstrapped before the runtime preserved token
+; kinds, so its historical block constants use strings. The finished native
+; compiler enables lossless source-token emission for programs it compiles.
+PRESERVE_TOKEN_KINDS: false
 
 ; escape a string for a C double-quoted literal: backslash first,
 ; then the double-quote. `replace` scans left to right, so escaping
@@ -38,19 +43,60 @@ quoteC: function [s][ "\"" ++ (escapeC s) ++ "\"" ]
 ; constant inline. This is why null is absent from cNode's cases below.
 cNullConst: "ir_const(v_null())"
 
+cComplexValue: function [v][
+    parts: to :block v
+    "v_complex(" ++ (to :string parts\0) ++ ", " ++ (to :string parts\1) ++ ")"
+]
+
+cQuantityValue: function [v][
+    amount: scalar v
+    ctor: "v_quantity"
+    if integer? amount -> ctor: "v_quantity_int"
+    ctor ++ "(" ++ (to :string amount) ++ ", " ++ (quoteC (to :string (units v))) ++ ")"
+]
+
+cWordValue: function [v][
+    if PRESERVE_TOKEN_KINDS -> return "v_token(V_WORD, " ++ (quoteC (to :string v)) ++ ")"
+    "v_str(" ++ (quoteC (to :string v)) ++ ")"
+]
+
+cCharValue: function [v][
+    expressed: express v
+    if expressed = "'+'" [ return "v_char(43)" ]
+    text: to :string v
+    if 0 = size text [ return "v_char(39)" ]
+    "v_char(" ++ (quoteC text) ++ "[0])"
+]
+
 ; render an Arturo constant as a C runtime expression.
 cValue: function [v][
     t: type v
     case t [
         :integer -> "v_int(" ++ (to :string v) ++ ")"
-        :floating -> "v_float(" ++ (to :string v) ++ ")"
+        :floating -> "v_float_text(" ++ (quoteC (to :string v)) ++ ")"
+        :rational -> "v_rational(" ++ (to :string (numerator v)) ++ ", " ++ (to :string (denominator v)) ++ ")"
+        :complex -> cComplexValue v
+        :quantity -> cQuantityValue v
+        :unit -> "v_unit(" ++ (quoteC (to :string v)) ++ ")"
+        :date -> "v_date_iso(" ++ (quoteC (to :string v)) ++ ")"
+        :color -> "v_color_hex(" ++ (quoteC (to :string v)) ++ ")"
+        :regex -> "v_token(V_REGEX, " ++ (quoteC (to :string v)) ++ ")"
+        :version -> "v_version(" ++ (quoteC (to :string v)) ++ ")"
+        :errorkind -> "v_errorkind(" ++ (quoteC (to :string v)) ++ ")"
+        :binary -> "v_binary_text(" ++ (quoteC (to :string v)) ++ ")"
         :logical -> "v_bool(" ++ (to :string (to :integer v)) ++ ")"
-        :char    -> "v_char('" ++ (to :string v) ++ "')"
+        ; Arturo represents the apostrophe character as a char whose textual
+        ; form is empty. Numeric byte values keep generated C valid for every
+        ; quote/backslash/control character.
+        :char    -> cCharValue v
         :string  -> "v_str(" ++ (quoteC v) ++ ")"
-        :word    -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
+        :word    -> cWordValue v
         :label   -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
         :literal -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
         :symbol  -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
+        :symbolliteral -> "v_token(V_SYMBOLLITERAL, " ++ (quoteC (to :string v)) ++ ")"
+        :attribute -> "v_token(V_ATTRIBUTE, " ++ (quoteC (to :string v)) ++ ")"
+        :attributelabel -> "v_token(V_ATTRIBUTELABEL, " ++ (quoteC (to :string v)) ++ ")"
         :pathliteral -> cPath v
         :type    -> "v_str(" ++ (quoteC (":" ++ (to :string v))) ++ ")"
         :null    -> "v_null()"
@@ -59,7 +105,13 @@ cValue: function [v][
 
 ; a path literal `'c\stack` -> a C v_path() carrying its segments as strings.
 cPath: function [v][
-    parts: map (to :block v) [seg][ quoteC (to :string seg) ]
+    rawParts: to :block v
+    parts: @[]
+    loop 0..dec (size rawParts) [i][
+        name: to :string rawParts\[i]
+        if and? (0 = i) [name = "array"] -> name: shadowName name
+        addItem parts (quoteC name)
+    ]
     segc: joinWith parts ", "
     "v_path((char*[]){" ++ segc ++ "}, " ++ (to :string (size (to :block v))) ++ ")"
 ]
@@ -173,15 +225,25 @@ cRefNode: function [a][
 ]
 cCall: function [n][
     args: n\args
+    if :dictionary = type n\fn [
+        if "intrinsic" = n\fn\op [
+            intrinsicName: to :string n\fn\name
+            if unsupportedIntrinsic? intrinsicName [
+                panic "unsupported standalone capability: " ++ intrinsicName
+            ]
+        ]
+    ]
     fnc: cCallee n\fn
     mut?: cMutating? n\fn
+    hasAttributes: false
+    if key? n "attrs" -> if not? empty? n\attrs -> hasAttributes: true
     ; a bare word in VALUE position arrives as a 0-arity call whose callee is an
     ; intrinsic (`env`, `arity`, `node`, `define` are all in the intrinsics table
     ; yet bound as params/functions in the compiler source). Emit `ir_word`, whose
     ; runtime load-if-bound returns the VALUE without applying it — `ir_intrinsic`
     ; here would APPLY the bound function with 0 args (callIntrinsic resolves
     ; bound-first) and crash on `define`'s env-set.
-    if 0 = size args [
+    if and? (0 = size args) [not? hasAttributes] [
         if :dictionary = type n\fn [
             if "intrinsic" = n\fn\op [
                 return "ir_word(" ++ (quoteC (to :string n\fn\name)) ++ ")"
@@ -206,25 +268,52 @@ cCall: function [n][
         argi: argi + 1
     ]
     argc: joinWith parts ", "
+    callAttributes: #[]
+    if key? n "attrs" -> callAttributes: n\attrs
+    if not? empty? callAttributes [
+        attrNames: @[]
+        attrValues: @[]
+        loop callAttributes [attrName attrNode][
+            addItem attrNames (quoteC attrName)
+            addItem attrValues (cNode attrNode)
+        ]
+        return "ir_call_attrs(" ++ fnc ++ ", (IR*[]){" ++ argc ++ "}, " ++
+            (to :string (size args)) ++ ", (const char*[]){" ++
+            (joinWith attrNames ", ") ++ "}, (IR*[]){" ++
+            (joinWith attrValues ", ") ++ "}, " ++ (to :string (size attrNames)) ++ ")"
+    ]
     copen: "ir_call(" ++ fnc ++ ", (IR*[]){"
     cclose: "}, " ++ (to :string (size args)) ++ ")"
     copen ++ argc ++ cclose
 ]
 
 ; a function node: args = [params, bodySeq]
+cFunctionAttrs: function [n code][
+    if not? key? n "attrs" -> return code
+    if empty? n\attrs -> return code
+    names: @[]
+    values: @[]
+    loop n\attrs [name value][
+        addItem names (quoteC name)
+        addItem values (cNode value)
+    ]
+    "ir_attrs(" ++ code ++ ", (const char*[]){" ++ (joinWith names ", ") ++
+        "}, (IR*[]){" ++ (joinWith values ", ") ++ "}, " ++ (to :string (size names)) ++ ")"
+]
+
 cFunction: function [n][
     args: n\args
     params: args\0
     body: args\1
     if 0 = size params [
-        if 0 = size body [ return "ir_fn(ir_block((IR*[]){}, 0), (IR*[]){}, 0)" ]
+        if 0 = size body [ return cFunctionAttrs n "ir_fn(ir_block((IR*[]){}, 0), (IR*[]){}, 0)" ]
         parts: map body [st][
             r: cNullConst
             if not? :null = type st [ r: cNode st ]
             r
         ]
         bodyc: joinWith parts ", "
-        return "ir_fn(ir_block((IR*[]){}, 0), (IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size body)) ++ ")"
+        return cFunctionAttrs n ("ir_fn(ir_block((IR*[]){}, 0), (IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size body)) ++ ")")
     ]
     parts: map params [w][ "ir_load(" ++ (quoteC (to :string w)) ++ ")" ]
     paramc: joinWith parts ", "
@@ -235,7 +324,23 @@ cFunction: function [n][
         r
     ]
     bodyc: joinWith parts ", "
-    "ir_fn(" ++ paramsIR ++ ", (IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size body)) ++ ")"
+    cFunctionAttrs n ("ir_fn(" ++ paramsIR ++ ", (IR*[]){" ++ bodyc ++ "}, " ++ (to :string (size body)) ++ ")")
+]
+
+cDictionary: function [n][
+    bodyc: cSeq n\args\0
+    "ir_op(\"dictionary\", (IR*[]){" ++ bodyc ++ "}, 1)"
+]
+
+cConstructor: function [n][
+    params: cBlock n\args\0
+    "ir_op(\"constructor\", (IR*[]){" ++ params ++ "}, 1)"
+]
+
+cInheritance: function [n][
+    base: cNode n\args\0
+    extra: cNode n\args\1
+    "ir_op(\"is\", (IR*[]){" ++ base ++ ", " ++ extra ++ "}, 2)"
 ]
 
 ; an if node: args = [cond, yesSeq, maybeElseOrNull]
@@ -467,6 +572,10 @@ cNode: function [n][
         "block"        -> cBlock n\items
         "call"         -> cCall n
         "function"     -> cFunction n
+        "method"       -> cFunction n
+        "constructor"  -> cConstructor n
+        "is"           -> cInheritance n
+        "dictionary"   -> cDictionary n
         "do"           -> cDo n
         "if"           -> cIf n
         "unless"       -> cUnless n
@@ -512,13 +621,47 @@ cUntil: function [n][
 ]
 cLoop: function [n][
     coll: cNode n\args\0
-    params: cBlock n\args\1
+    paramItems: n\args\1
+    if :block <> type paramItems [
+        wrappedParams: @[]
+        addItem wrappedParams paramItems
+        paramItems: wrappedParams
+    ]
+    params: cBlock paramItems
     body: cNode n\args\2
-    "ir_op(\"loop\", (IR*[]){" ++ coll ++ ", " ++ params ++ ", " ++ body ++ "}, 3)"
+    loopArgs: coll ++ ", " ++ params ++ ", " ++ body
+    loopAttributes: #[]
+    if key? n "attrs" -> loopAttributes: n\attrs
+    if not? empty? loopAttributes [
+        attrNames: @[]
+        attrValues: @[]
+        loop loopAttributes [attrName attrNode][
+            addItem attrNames (quoteC attrName)
+            addItem attrValues (cNode attrNode)
+        ]
+        return "ir_op_attrs(\"loop\", (IR*[]){" ++ loopArgs ++ "}, 3, (const char*[]){" ++
+            (joinWith attrNames ", ") ++ "}, (IR*[]){" ++ (joinWith attrValues ", ") ++
+            "}, " ++ (to :string (size attrNames)) ++ ")"
+    ]
+    "ir_op(\"loop\", (IR*[]){" ++ loopArgs ++ "}, 3)"
 ]
 cRange: function [n][
     fromc: cNode n\args\0
     toc: cNode n\args\1
+    rangeAttributes: #[]
+    if key? n "attrs" -> rangeAttributes: n\attrs
+    if not? empty? rangeAttributes [
+        attrNames: @[]
+        attrValues: @[]
+        loop rangeAttributes [attrName attrNode][
+            addItem attrNames (quoteC attrName)
+            addItem attrValues (cNode attrNode)
+        ]
+        return "ir_op_attrs(\"range\", (IR*[]){" ++ fromc ++ ", " ++ toc ++
+            "}, 2, (const char*[]){" ++ (joinWith attrNames ", ") ++
+            "}, (IR*[]){" ++ (joinWith attrValues ", ") ++ "}, " ++
+            (to :string (size attrNames)) ++ ")"
+    ]
     "ir_op(\"range\", (IR*[]){" ++ fromc ++ ", " ++ toc ++ "}, 2)"
 ]
 cReturn: function [n][
@@ -583,6 +726,7 @@ nativeExpr: function [n state][
         rawType: type n
         if :integer = rawType [ return nativeResult true "int" (to :string n) ]
         if :floating = rawType [ return nativeResult true "float" (to :string n) ]
+        if :char = rawType [ return nativeFail ]
         if :string = rawType [ return nativeResult true "string" (quoteC n) ]
         if :word = rawType [ return nativeResult true "string" (quoteC (to :string n)) ]
         if :literal = rawType [ return nativeResult true "string" (quoteC (to :string n)) ]
@@ -602,6 +746,7 @@ nativeExpr: function [n state][
         t: type n\value
         if :integer = t [ return nativeResult true "int" (to :string n\value) ]
         if :floating = t [ return nativeResult true "float" (to :string n\value) ]
+        if :char = t [ return nativeFail ]
         if :string = t [ return nativeResult true "string" (quoteC n\value) ]
         if :type = t [ return nativeResult true "string" (quoteC (":" ++ (to :string n\value))) ]
         if :logical = t [
@@ -660,6 +805,9 @@ nativeExpr: function [n state][
         return nativeResult true "function" ident
     ]
     if "range" = op [
+        if key? n "attrs" [
+            if key? n\attrs "step" -> return nativeFail
+        ]
         fromv: nativeExpr n\args\0 state
         tov: nativeExpr n\args\1 state
         if not? fromv\ok [ return nativeFail ]
@@ -694,6 +842,8 @@ nativeExpr: function [n state][
             addItem argValues av
         ]
         if not? good [ return nativeFail ]
+        if and? (key? state\activeFuncs n\fn\name) [true = get state\activeFuncs n\fn\name] [ return nativeFail ]
+        set state\activeFuncs n\fn\name true
         ; Compile a call in its own lexical map. For multi-statement functions,
         ; parameters become local C variables so loops may update them.
         outerVars: state\vars
@@ -708,6 +858,7 @@ nativeExpr: function [n state][
             ]
             result: nativeExpr fnBody\0 state
             state\vars: outerVars
+            set state\activeFuncs n\fn\name false
             return result
         ]
         decls: @[]
@@ -726,7 +877,7 @@ nativeExpr: function [n state][
             ]
             j: j + 1
         ]
-        if empty? fnBody [ state\vars: outerVars return nativeResult true "null" "0" ]
+        if empty? fnBody [ state\vars: outerVars set state\activeFuncs n\fn\name false return nativeResult true "null" "0" ]
         savedReturnKind: state\returnKind
         savedReturnVar: state\returnVar
         savedReturnLabel: state\returnLabel
@@ -794,6 +945,7 @@ nativeExpr: function [n state][
         state\returnVar: savedReturnVar
         state\returnLabel: savedReturnLabel
         state\terminated: savedTerminated
+        set state\activeFuncs n\fn\name false
         if not? good [ return nativeFail ]
         return nativeResult true resultKind code
     ]
@@ -1021,7 +1173,8 @@ nativeExpr: function [n state][
     if "div" = name [
         if "int" <> left\kind [ return nativeFail ]
         if "int" <> right\kind [ return nativeFail ]
-        return nativeResult true "int" ("(" ++ left\code ++ " / " ++ right\code ++ ")")
+        state\checkedArithmetic: true
+        return nativeResult true "int" ("dc_div(" ++ left\code ++ ", " ++ right\code ++ ")")
     ]
     if "fdiv" = name [
         if not? nativeNumeric? left\kind [ return nativeFail ]
@@ -1031,7 +1184,8 @@ nativeExpr: function [n state][
     if "mod" = name [
         if "int" <> left\kind [ return nativeFail ]
         if "int" <> right\kind [ return nativeFail ]
-        return nativeResult true "int" ("(" ++ left\code ++ " % " ++ right\code ++ ")")
+        state\checkedArithmetic: true
+        return nativeResult true "int" ("dc_mod(" ++ left\code ++ ", " ++ right\code ++ ")")
     ]
     if "pow" = name [
         ; Arturo preserves integer type for non-negative integer powers, but a
@@ -1652,6 +1806,7 @@ nativeProgram: function [ir][
     state: #[]
     state\vars: #[]
     state\funcs: #[]
+    state\activeFuncs: #[]
     state\dicts: #[]
     state\dictnext: 0
     state\functionvals: #[]
@@ -1660,6 +1815,7 @@ nativeProgram: function [ir][
     state\next: 0
     state\depth: 0
     state\concat: false
+    state\checkedArithmetic: false
     state\dynamic: false
     state\blocks: false
     state\returnKind: ""
@@ -1672,12 +1828,15 @@ nativeProgram: function [ir][
     if state\concat [
         helpers: "static char *dc_concat(const char *a, const char *b){ size_t na=strlen(a), nb=strlen(b); char *r=(char*)malloc(na+nb+1); memcpy(r,a,na); memcpy(r+na,b,nb+1); return r; }\n\n"
     ]
+    if state\checkedArithmetic [
+        helpers: helpers ++ "static long dc_div(long a,long b){ if(!b) rt_error(\"division by zero\"); return a/b; }\nstatic long dc_mod(long a,long b){ if(!b) rt_error(\"division by zero\"); return a%b; }\n\n"
+    ]
     if state\dynamic [
         helpers: helpers ++ "typedef struct DSeq DSeq;\ntypedef struct { int tag; long i; double f; const char *s; DSeq *b; } DScalar;\nstruct DSeq { DScalar *items; size_t n; };\nstatic DScalar ds_null(void){ return (DScalar){0,0,0,NULL,NULL}; }\nstatic DScalar ds_int(long x){ return (DScalar){1,x,0,NULL,NULL}; }\nstatic DScalar ds_float(double x){ return (DScalar){2,0,x,NULL,NULL}; }\nstatic DScalar ds_string(const char *x){ return (DScalar){3,0,0,x,NULL}; }\nstatic DScalar ds_bool(int x){ return (DScalar){4,x,0,NULL,NULL}; }\nstatic DSeq ds_block(DScalar *x,size_t n){ return (DSeq){x,n}; }\nstatic DScalar ds_seq(DSeq x){ DSeq *p=(DSeq*)malloc(sizeof(DSeq)); *p=x; return (DScalar){5,0,0,NULL,p}; }\nstatic int ds_truth(DScalar x){ return x.tag != 0 && (x.tag != 4 || x.i); }\nstatic void ds_print_inner(DScalar x){ if(x.tag==0) printf(\"null\"); else if(x.tag==1) printf(\"%ld\",x.i); else if(x.tag==2) rt_write_float(x.f); else if(x.tag==3) printf(\"%s\",x.s); else if(x.tag==4) printf(x.i?\"true\":\"false\"); else { printf(\"[\"); for(size_t i=0;i<x.b->n;i++){ if(i)printf(\" \"); ds_print_inner(x.b->items[i]); } printf(\"]\"); } }\nstatic void ds_print(DScalar x){ ds_print_inner(x); putchar('\\n'); }\nstatic void ds_print_seq(DSeq x){ for(size_t i=0;i<x.n;i++){ ds_print_inner(x.items[i]); putchar(' '); } putchar('\\n'); }\n\n"
     ]
     content: body\code
     if not? empty? content [ content: "\t" ++ (replace content "\n" "\n\t") ++ "\n" ]
-    "/* typed native C: no IR interpreter */\n#include \"runtime.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\ntypedef struct { long lo, hi; } DRange;\n\n" ++ helpers ++ "int main(void){\n" ++ content ++ "\treturn 0;\n}\n"
+    "/* typed native C: no IR interpreter */\n#include \"runtime.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n\ntypedef struct { long lo, hi; } DRange;\n\n" ++ helpers ++ "int main(void){\n\truntime_set_source(" ++ (quoteC NATIVE_SOURCE_PATH) ++ ");\n" ++ content ++ "\treturn 0;\n}\n"
 ]
 
 directProgram: function [ir][
@@ -1717,22 +1876,31 @@ directProgram: function [ir][
     body: ""
     if not? empty? lines [ body: "\t" ++ (joinWith lines "\n\t") ++ "\n" ]
     if hasGeneric [
-        return "/* hybrid C: direct statements plus the dynamic fallback */\n#include \"runtime.h\"\n#include <stdio.h>\n\nint main(int argc, char **argv){\n\truntime_set_args(argc, argv);\n\tEnv *e = env_new(NULL);\n" ++ body ++ "\treturn 0;\n}\n"
+        return "/* hybrid C: direct statements plus the dynamic fallback */\n#include \"runtime.h\"\n#include <stdio.h>\n\nint main(int argc, char **argv){\n\truntime_set_args(argc, argv);\n\truntime_set_source(" ++ (quoteC NATIVE_SOURCE_PATH) ++ ");\n\tEnv *e = env_new(NULL);\n" ++ body ++ "\treturn 0;\n}\n"
     ]
-    "/* direct C */\n#include \"runtime.h\"\n#include <stdio.h>\n\nint main(void){\n" ++ body ++ "\treturn 0;\n}\n"
+    "/* direct C */\n#include \"runtime.h\"\n#include <stdio.h>\n\nint main(void){\n\truntime_set_source(" ++ (quoteC NATIVE_SOURCE_PATH) ++ ");\n" ++ body ++ "\treturn 0;\n}\n"
 ]
 
 compileToC: function [src][
     rawIR: compileToIR src
     ir: fold rawIR
     native: ""
+    hasCustomTypes: contains? src ("define " ++ ":")
+    ; The typed emitter is an optimization that inlines user functions. It is
+    ; intentionally skipped when source declares functions: recursive calls
+    ; and higher-order bodies must remain dynamic, and probing them recursively
+    ; used to abort the self-hosted compiler before it could select the complete
+    ; IR fallback.
+    typedSafe: not? contains? src "function"
     ; Typed lowering is an optimization, never the semantic fallback. Large
     ; self-host inputs are far outside its scalar subset and can trip host
     ; value-stack/index defects merely while proving ineligibility. Decline
     ; that probe and let the complete dynamic emitter handle the same IR.
-    if 50000 > (size src) [ native: nativeProgram ir ]
+    if and? typedSafe [and? (not? hasCustomTypes) [50000 > (size src)]] [ native: nativeProgram ir ]
     if not? empty? native [ return native ]
-    direct: directProgram ir
+    direct: ""
+    directSafe: not? contains? src "case"
+    if and? (not? hasCustomTypes) directSafe -> direct: directProgram ir
     if not? empty? direct [ return direct ]
     ; each statement string must be returned BARE from the map (as cSeq/cCall
     ; do) — the deep cNode result is bound to r, and formatting moves into the
@@ -1744,7 +1912,7 @@ compileToC: function [src][
         r
     ]
     bodyc: joinWith stmts ",\n\t\t"
-    header: "/* generated by the compiler's C backend; links runtime.a */\n#include \"runtime.h\"\n\nint main(int argc, char **argv){\n\truntime_set_args(argc, argv);\n\tEnv *e = env_new(NULL);\n\tIR *seq[] = {\n\t\t"
+    header: "/* generated by the compiler's C backend; links runtime.a */\n#include \"runtime.h\"\n\nint main(int argc, char **argv){\n\truntime_set_args(argc, argv);\n\truntime_set_source(" ++ (quoteC NATIVE_SOURCE_PATH) ++ ");\n\tEnv *e = env_new(NULL);\n\tIR *seq[] = {\n\t\t"
     footer: "\n\t};\n\trunSeq(e, seq, " ++ (to :string (size ir)) ++ ");\n\treturn 0;\n}\n"
     header ++ bodyc ++ footer
 ]
@@ -1754,7 +1922,11 @@ compileToNativeC: function [src outName][
     c: compileToC src
     cPath: outName ++ ".c"
     write c cPath
-    execute ("cc " ++ NATIVE_CFLAGS ++ " -c -Iruntime " ++ cPath ++ " -o " ++ outName ++ ".o 2>&1")
-    execute ("cc " ++ NATIVE_LDFLAGS ++ " " ++ outName ++ ".o runtime/runtime.a -lm -o " ++ outName ++ " 2>&1")
+    compileResult: execute.code ("cc " ++ NATIVE_CFLAGS ++ " -c -Iruntime " ++ cPath ++ " -o " ++ outName ++ ".o 2>&1")
+    if 0 <> compileResult\code [ panic compileResult\output ]
+    cryptoLib: "-lcrypto"
+    if "Darwin" = strip execute "uname -s" -> cryptoLib: ""
+    linkResult: execute.code ("cc " ++ NATIVE_LDFLAGS ++ " " ++ outName ++ ".o runtime/runtime.a -lm " ++ cryptoLib ++ " -o " ++ outName ++ " 2>&1")
+    if 0 <> linkResult\code [ panic linkResult\output ]
     outName
 ]

@@ -11,9 +11,10 @@
 ;=======================================================
 
 import ./"backend.art"
+import ./"modules.art"
 
 compileFile: function [inPath outPath][
-    src: read inPath
+    src: resolveImportsFromFile inPath
     art: renderProgram src
     write art outPath
     print outPath
@@ -45,7 +46,7 @@ go: function [][
         compileFile inPath outPath
         if native [
             print "== native binary =="
-            compileToNative (read inPath) (stripArtExt outPath)
+            compileToNative (resolveImportsFromFile inPath) (stripArtExt outPath)
         ]
     ]
     if 1 >= size args\values [

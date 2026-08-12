@@ -1,0 +1,11 @@
+original: @[1 2]
+copyBlock: new original
+append 'copyBlock 3
+print original
+print copyBlock
+
+left: #[name: "left" nested: @[4]]
+right: new left
+right\name: "right"
+print left\name
+print right\name

@@ -25,6 +25,7 @@ import ./"front.art"
 ;-----------------------------------------------
 RET: #[set: false value: null]
 LOOP_SIGNAL: #[break: false continue: false]
+ATTR_STATE: #[current: #[]]
 
 ;-----------------------------------------------
 ; Truthiness: false and null are falsy
@@ -123,6 +124,23 @@ delegate: function [name argVals][
     err: try [r: call (to :literal name) argVals]
     if :error = type err -> return #[nodek: "error" msg: err]
     r
+]
+
+; The donated VM's generic `call` corrupts its value stack for several
+; zero-argument builtins. Invoke those directly at this boundary.
+delegateNullary: function [name][
+    ; The kernel runners receive the target source path as their own argument;
+    ; that is harness plumbing, not an argument of the interpreted program.
+    if "arg" = name -> return []
+    if "args" = name -> return args
+    if "now" = name -> return now
+    if "env" = name -> return env
+    if "path" = name -> return path
+    if "process" = name -> return process
+    if "script" = name -> return script
+    if "sys" = name -> return sys
+    if "clear" = name -> return clear
+    delegate name @[]
 ]
 
 
@@ -260,6 +278,7 @@ loadRule: function [env name][
     if "true" = name -> return true
     if "false" = name -> return false
     if "null" = name -> return null
+    if "runtimeError" = name -> return runtimeError
     ; The host resolves builtin words to the builtin, never
     ; to a user function of the same name (verified: a user
     ; `add` does not shadow the builtin `add`). So builtins
@@ -834,8 +853,526 @@ applyVal: function [env fnVal argVals][
     #[nodek: "error" msg: ["cannot call" fnVal]]
 ]
 
+evalCallAttrs: function [env node mode][
+    out: #[]
+    if key? node "attrs" [
+        loop node\attrs [name valueNode][
+            if :interpret = mode -> out\[name]: evalNode env valueNode :interpret
+            if :interpret <> mode -> out\[name]: runNode env valueNode
+        ]
+    ]
+    out
+]
+
+kernelTruncate: function [text cutoff options][
+    filler: "..."
+    if key? options "with" -> filler: to :string options\with
+    n: size text
+    at: cutoff
+    if 0 > at -> at: 0
+    if key? options "preserve" [
+        if n > at [
+            i: at
+            if i >= n -> i: dec n
+            while [and? (i > 0) [not? whitespace? text\[i]]][ i: i - 1 ]
+            i: i - 1
+            while [and? (i > 0) [whitespace? text\[i]]][ i: i - 1 ]
+            if 0 > i -> return filler
+            return (slice text 0 i) ++ filler
+        ]
+        return text
+    ]
+    if n > (at + size filler) -> return (slice text 0 at) ++ filler
+    text
+]
+
+kernelCombinations: function [values options][
+    width: size values
+    if key? options "by" -> width: to :integer options\by
+    repeated: key? options "repeated"
+    state: #[out: @[]]
+    walk: function [st start depth chosen][
+        if depth = width [ addItem st\out (new chosen) return null ]
+        if start >= size values -> return null
+        i: start
+        while [i < size values][
+            nextChosen: new chosen
+            addItem nextChosen values\[i]
+            nextStart: i + 1
+            if repeated -> nextStart: i
+            walk st nextStart (depth + 1) nextChosen
+            i: i + 1
+        ]
+        null
+    ]
+    if 0 = width -> addItem state\out @[]
+    if width > 0 [
+        if or? repeated [width <= size values] -> walk state 0 0 @[]
+    ]
+    if key? options "count" -> return size state\out
+    state\out
+]
+
+kernelOptionInteger: function [options name][
+    if key? options name -> return to :integer options\[name]
+    0
+]
+
+kernelTwoDigits: function [value][
+    text: to :string value
+    if 1 = size text -> return "0" ++ text
+    text
+]
+
+kernelDaysInMonth: function [year month][
+    days: [31 28 31 30 31 30 31 31 30 31 30 31]
+    result: days\[(month - 1)]
+    leap: or? (and? (0 = year % 4) [0 <> year % 100]) [0 = year % 400]
+    if and? (2 = month) [leap] -> result: 29
+    result
+]
+
+kernelShiftDate: function [date options direction][
+    shifted: date
+    overflowDays: 0
+    monthDelta: direction * ((kernelOptionInteger options "months") + 12 * kernelOptionInteger options "years")
+    if 0 <> monthDelta [
+        totalMonths: (date\year * 12) + (date\month - 1) + monthDelta
+        year: div totalMonths 12
+        monthIndex: totalMonths % 12
+        if 0 > monthIndex [ monthIndex: monthIndex + 12 year: year - 1 ]
+        month: monthIndex + 1
+        monthLimit: kernelDaysInMonth year month
+        day: date\day
+        if date\day > monthLimit [ day: monthLimit overflowDays: date\day - monthLimit ]
+        dateText: to :string date
+        zoneText: slice dateText ((size dateText) - 6) ((size dateText) - 1)
+        iso: (to :string year) ++ "-" ++ (kernelTwoDigits month) ++ "-" ++
+            (kernelTwoDigits day) ++ "T" ++ (kernelTwoDigits date\hour) ++ ":" ++
+            (kernelTwoDigits date\minute) ++ ":" ++ (kernelTwoDigits date\second) ++ zoneText
+        shifted: to :date iso
+    ]
+    secondsPart: kernelOptionInteger options "seconds"
+    minutesPart: 60 * kernelOptionInteger options "minutes"
+    hoursPart: 3600 * kernelOptionInteger options "hours"
+    daysPart: 86400 * ((kernelOptionInteger options "days") + overflowDays)
+    weeksPart: 604800 * kernelOptionInteger options "weeks"
+    seconds: secondsPart + minutesPart + hoursPart + daysPart + weeksPart
+    to :date ((to :integer shifted) + direction * seconds)
+]
+
+kernelCodec: function [value options decoding][
+    if decoding [
+        if key? options "url" -> return decode.url value
+        return decode value
+    ]
+    if key? options "url" [
+        hasSpaces: key? options "spaces"
+        hasSlashes: key? options "slashes"
+        if and? hasSpaces hasSlashes -> return encode.url.spaces.slashes value
+        if hasSpaces -> return encode.url.spaces value
+        if hasSlashes -> return encode.url.slashes value
+        return encode.url value
+    ]
+    encode value
+]
+
+kernelPalette: function [base options][
+    if key? options "triad" -> return palette.triad base
+    if key? options "tetrad" -> return palette.tetrad base
+    if key? options "split" -> return palette.split base
+    if key? options "analogous" [
+        if key? options "size" -> return palette.analogous.size: options\size base
+        return palette.analogous base
+    ]
+    if key? options "monochrome" [
+        if key? options "size" -> return palette.monochrome.size: options\size base
+        return palette.monochrome base
+    ]
+    if key? options "random" [
+        if key? options "size" -> return palette.random.size: options\size base
+        return palette.random base
+    ]
+    palette base
+]
+
+kernelNormalize: function [pathValue options][
+    hasExecutable: key? options "executable"
+    hasTilde: key? options "tilde"
+    if and? hasExecutable hasTilde -> return normalize.executable.tilde pathValue
+    if hasExecutable -> return normalize.executable pathValue
+    if hasTilde -> return normalize.tilde pathValue
+    normalize pathValue
+]
+
+kernelEscape: function [text options][
+    if key? options "json" -> return escape.json text
+    if key? options "regex" -> return escape.regex text
+    if key? options "shell" -> return escape.shell text
+    if key? options "xml" -> return escape.xml text
+    if key? options "html" -> return escape.html text
+    escape text
+]
+
+kernelWordwrap: function [text options][
+    if key? options "at" -> return wordwrap.at: options\at text
+    wordwrap text
+]
+
+kernelExtract: function [value options][
+    if key? options "directory" -> return extract.directory value
+    if key? options "basename" -> return extract.basename value
+    if key? options "filename" -> return extract.filename value
+    if key? options "extension" -> return extract.extension value
+    extract value
+]
+
+kernelRender: function [env text options][
+    result: to :string text
+    rounds: 100
+    if key? options "once" -> rounds: 1
+    i: 0
+    while [i < rounds][
+        before: result
+        frame: env
+        while [not? null? frame][
+            loop frame\bindings [name value][ result: replace result ("|" ++ name ++ "|") (to :string value) ]
+            frame: frame\parent
+        ]
+        if before = result -> break
+        i: i + 1
+    ]
+    result
+]
+
+kernelBenchmark: function [action options][
+    if key? options "get" -> return benchmark.get action
+    benchmark action
+]
+
+kernelAlphabet: function [locale options][
+    hasLower: key? options "lower"
+    hasUpper: key? options "upper"
+    hasAll: key? options "all"
+    if and? hasLower hasUpper [
+        if hasAll -> return alphabet.lower.upper.all locale
+        return alphabet.lower.upper locale
+    ]
+    if hasUpper [ if hasAll -> return alphabet.upper.all locale return alphabet.upper locale ]
+    if hasAll -> return alphabet.all locale
+    alphabet locale
+]
+
+kernelDigest: function [value options][
+    if key? options "sha" -> return digest.sha value
+    digest value
+]
+
+kernelHash: function [value options][
+    if key? options "string" -> return hash.string value
+    hash value
+]
+
+kernelCollect: function [collection params condition options][
+    if key? options "after" -> return collect.after collection params condition
+    collect collection params condition
+]
+
+kernelWithValue: function [env value][
+    if :block = type value [
+        result: @[]
+        loop value [item][ addItem result (kernelWithValue env item) ]
+        return result
+    ]
+    if or? (:word = type value) [:literal = type value] [
+        name: to :string value
+        if bound? env name -> return lookup env name
+    ]
+    value
+]
+
+kernelWith: function [env embed body][
+    capture: newEnv env
+    if :dictionary = type embed -> loop embed [name value][ define capture name value ]
+    if :block = type embed -> loop embed [name][ if bound? env (to :string name) -> define capture (to :string name) (lookup env (to :string name)) ]
+    if and? (:dictionary <> type embed) [:block <> type embed] [
+        name: to :string embed
+        if bound? env name -> define capture name (lookup env name)
+    ]
+    kernelWithValue capture body
+]
+
+kernelSpecify: function [name value options][
+    if key? options "property" -> return specify.property name value
+    if key? options "symbol" [
+        if key? options "describes" -> return specify.symbol: options\symbol .describes: options\describes name value
+        return specify.symbol: options\symbol name value
+    ]
+    if key? options "describes" -> return specify.describes: options\describes name value
+    specify name value
+]
+
+kernelSortableBody: function [field][
+    to :block ("compare this\\" ++ (to :string field) ++ " that\\" ++ (to :string field))
+]
+
+kernelSortableIR: function [field][
+    keyIR: #[op: "passthrough" src: to :literal to :string field]
+    pathFn: #[op: "intrinsic" name: "pathGet"]
+    thisLoad: #[op: "load" name: "this"]
+    thatLoad: #[op: "load" name: "that"]
+    leftArgs: @[]
+    addItem leftArgs thisLoad
+    addItem leftArgs keyIR
+    leftIR: #[op: "call" fn: pathFn args: leftArgs]
+    rightArgs: @[]
+    addItem rightArgs thatLoad
+    addItem rightArgs keyIR
+    rightIR: #[op: "call" fn: pathFn args: rightArgs]
+    compareFn: #[op: "intrinsic" name: "compare"]
+    compareArgs: @[]
+    addItem compareArgs leftIR
+    addItem compareArgs rightIR
+    compareIR: #[op: "call" fn: compareFn args: compareArgs]
+    result: @[]
+    addItem result compareIR
+    result
+]
+
+kernelObjectOrder: function [env mode left right][
+    order: applyVal env left\compare @[right]
+    if "compare" = mode -> return order
+    if "less?" = mode -> return order < 0
+    if "greater?" = mode -> return order > 0
+    if "lessOrEqual?" = mode -> return order <= 0
+    if "greaterOrEqual?" = mode -> return order >= 0
+    order
+]
+
+kernelArity: function [env][
+    result: new arity
+    frame: env
+    while [not? null? frame][
+        loop frame\bindings [name value][
+            if and? (isNode value) ["closure" = value\nodek] [
+                count: 1
+                if :block = type value\params -> count: size value\params
+                result\[name]: count
+            ]
+        ]
+        frame: frame\parent
+    ]
+    result
+]
+
+kernelSymbols: function [env][
+    result: #[]
+    frame: env
+    while [not? null? frame][
+        loop frame\bindings [name value][ if not? key? result name -> result\[name]: value ]
+        frame: frame\parent
+    ]
+    result
+]
+
+kernelUnset: function [env name][
+    frame: env
+    while [not? null? frame][
+        if key? frame\bindings name [
+            kept: #[]
+            loop frame\bindings [key value][ if key <> name -> kept\[key]: value ]
+            frame\bindings: kept
+            return null
+        ]
+        frame: frame\parent
+    ]
+    null
+]
+
+kernelPopAttr: function [name][
+    if not? key? ATTR_STATE\current name -> return null
+    found: ATTR_STATE\current\[name]
+    kept: #[]
+    loop ATTR_STATE\current [key value][ if key <> name -> kept\[key]: value ]
+    ATTR_STATE\current: kept
+    found
+]
+
+applyAttributed: function [env fnVal argVals callAttributes][
+    if empty? callAttributes -> return applyVal env fnVal argVals
+    previousAttributes: ATTR_STATE\current
+    ATTR_STATE\current: callAttributes
+    result: applyVal env fnVal argVals
+    ATTR_STATE\current: previousAttributes
+    result
+]
+
 evalCall: function [env node][
     fnNode: node\fn
+
+    memberMode: calleeName fnNode
+    ; Unlike structural nullaries (`break`, `continue`, `attrs`, `now`), raw
+    ; CLI arguments have no rule of their own. Resolve this completed call
+    ; before callee evaluation would invoke it and then call its result.
+    if "arg" = memberMode -> return delegateNullary "arg"
+    if "arity" = memberMode -> return kernelArity env
+    if "symbols" = memberMode -> return kernelSymbols env
+    if "var" = memberMode [
+        variableName: evalNode env node\args\0 :interpret
+        return lookup env (to :string variableName)
+    ]
+    if "unset" = memberMode [
+        variableName: evalNode env node\args\0 :interpret
+        return kernelUnset env (to :string variableName)
+    ]
+    if "export" = memberMode [
+        exported: evalNode env node\args\0 :interpret
+        loop exported [name value][ define env name value ]
+        return null
+    ]
+    if "attr" = memberMode [
+        attrName: evalNode env node\args\0 :interpret
+        return kernelPopAttr (to :string attrName)
+    ]
+    if "attrs" = memberMode [
+        foundAttrs: new ATTR_STATE\current
+        ATTR_STATE\current: #[]
+        return foundAttrs
+    ]
+    if "attr?" = memberMode [
+        attrName: evalNode env node\args\0 :interpret
+        return key? ATTR_STATE\current (to :string attrName)
+    ]
+    if "truncate" = memberMode [
+        text: evalNode env node\args\0 :interpret
+        cutoff: evalNode env node\args\1 :interpret
+        evaluatedAttrs: evalCallAttrs env node :interpret
+        return kernelTruncate (to :string text) cutoff evaluatedAttrs
+    ]
+    if "combine" = memberMode [
+        values: evalNode env node\args\0 :interpret
+        evaluatedAttrs: evalCallAttrs env node :interpret
+        return kernelCombinations values evaluatedAttrs
+    ]
+    if or? ("after" = memberMode) ["before" = memberMode] [
+        date: evalNode env node\args\0 :interpret
+        evaluatedAttrs: evalCallAttrs env node :interpret
+        direction: 1
+        if "before" = memberMode -> direction: 0 - 1
+        return kernelShiftDate date evaluatedAttrs direction
+    ]
+    if or? ("encode" = memberMode) ["decode" = memberMode] [
+        codecValue: evalNode env node\args\0 :interpret
+        codecAttrs: evalCallAttrs env node :interpret
+        return kernelCodec codecValue codecAttrs ("decode" = memberMode)
+    ]
+    if "palette" = memberMode [
+        paletteBase: evalNode env node\args\0 :interpret
+        paletteAttrs: evalCallAttrs env node :interpret
+        return kernelPalette paletteBase paletteAttrs
+    ]
+    if "normalize" = memberMode [
+        normalizedPathValue: evalNode env node\args\0 :interpret
+        normalizeAttrs: evalCallAttrs env node :interpret
+        if and? (isPathRef normalizedPathValue) [empty? normalizeAttrs] [
+            return delegateThroughRef env "normalize" @[normalizedPathValue]
+        ]
+        return kernelNormalize normalizedPathValue normalizeAttrs
+    ]
+    if "escape" = memberMode [
+        escapedText: evalNode env node\args\0 :interpret
+        escapeAttrs: evalCallAttrs env node :interpret
+        return kernelEscape escapedText escapeAttrs
+    ]
+    if "wordwrap" = memberMode [
+        wrappedText: evalNode env node\args\0 :interpret
+        wrapAttrs: evalCallAttrs env node :interpret
+        return kernelWordwrap wrappedText wrapAttrs
+    ]
+    if "extract" = memberMode [
+        extractedValue: evalNode env node\args\0 :interpret
+        extractAttrs: evalCallAttrs env node :interpret
+        return kernelExtract extractedValue extractAttrs
+    ]
+    if "render" = memberMode [
+        templateText: evalNode env node\args\0 :interpret
+        renderAttrs: evalCallAttrs env node :interpret
+        return kernelRender env templateText renderAttrs
+    ]
+    if "benchmark" = memberMode [
+        benchmarkAction: evalNode env node\args\0 :interpret
+        benchmarkAttrs: evalCallAttrs env node :interpret
+        return kernelBenchmark benchmarkAction benchmarkAttrs
+    ]
+    if "alphabet" = memberMode [
+        alphabetLocale: evalNode env node\args\0 :interpret
+        alphabetAttrs: evalCallAttrs env node :interpret
+        return kernelAlphabet alphabetLocale alphabetAttrs
+    ]
+    if "digest" = memberMode [
+        digestValue: evalNode env node\args\0 :interpret
+        digestAttrs: evalCallAttrs env node :interpret
+        return kernelDigest digestValue digestAttrs
+    ]
+    if "hash" = memberMode [
+        hashedValue: evalNode env node\args\0 :interpret
+        hashAttrs: evalCallAttrs env node :interpret
+        return kernelHash hashedValue hashAttrs
+    ]
+    if "collect" = memberMode [
+        collectionValue: evalNode env node\args\0 :interpret
+        collectionParams: evalNode env node\args\1 :interpret
+        collectionCondition: evalNode env node\args\2 :interpret
+        collectAttrs: evalCallAttrs env node :interpret
+        return kernelCollect collectionValue collectionParams collectionCondition collectAttrs
+    ]
+    if "with" = memberMode [
+        embeddedNames: evalNode env node\args\0 :interpret
+        embeddedBody: evalNode env node\args\1 :interpret
+        return kernelWith env embeddedNames embeddedBody
+    ]
+    if "specify" = memberMode [
+        unitName: evalNode env node\args\0 :interpret
+        unitValue: evalNode env node\args\1 :interpret
+        specifyAttrs: evalCallAttrs env node :interpret
+        return kernelSpecify unitName unitValue specifyAttrs
+    ]
+    ; Avoid nesting two host `call r\eval ...` frames for `print to ...`.
+    ; The donated VM corrupts its value stack when the inner rule invokes an
+    ; object method. Print is simple enough to dispatch directly here.
+    if "print" = memberMode [
+        value: evalNode env node\args\0 :interpret
+        if kernelObject? value [
+            hasString: key? value "string"
+            if key? value "string" [
+                stringMethod: value\string
+                value: applyVal env stringMethod @[]
+            ]
+            if not? hasString -> value: kernelVisibleObject value
+        ]
+        return delegate "print" @[value]
+    ]
+    if or? ("keys" = memberMode) ["values" = memberMode] [
+        if 1 = size node\args [
+            memberOwner: evalNode env node\args\0 :interpret
+            if kernelObject? memberOwner -> return kernelObjectMembers memberOwner memberMode
+        ]
+    ]
+    if or? ("compare" = memberMode) [or? ("less?" = memberMode) [or? ("greater?" = memberMode) [or? ("lessOrEqual?" = memberMode) ["greaterOrEqual?" = memberMode]]]] [
+        orderedLeft: evalNode env node\args\0 :interpret
+        if and? (kernelObject? orderedLeft) [key? orderedLeft "compare"] [
+            orderedRight: evalNode env node\args\1 :interpret
+            return kernelObjectOrder env memberMode orderedLeft orderedRight
+        ]
+    ]
+    if "throw" = memberMode [
+        throwAttrs: evalCallAttrs env node :interpret
+        if key? throwAttrs "as" [
+            thrownValue: evalNode env node\args\0 :interpret
+            caughtThrow: try [throw.as: throwAttrs\as thrownValue]
+            return #[nodek: "error" msg: caughtThrow]
+        ]
+    ]
 
     ; one row per construct, one lookup, one of its three
     ; behaviours picked by which dispatcher is asking
@@ -850,7 +1387,8 @@ evalCall: function [env node][
     fnVal: evalNode env fnNode :interpret
     argVals: @[]
     loop node\args [a][ addItem argVals (evalNode env a :interpret) ]
-    applyVal env fnVal argVals
+    callAttributes: evalCallAttrs env node :interpret
+    applyAttributed env fnVal argVals callAttributes
 ]
 
 ;=======================================================
@@ -899,12 +1437,18 @@ emitCall: function [env node][
         rowArgs: @[]
         addItem rowArgs env
         addItem rowArgs node\args
-        return call r\emit rowArgs
+        emitted: call r\emit rowArgs
+        attrsIR: #[]
+        if key? node "attrs" -> loop node\attrs [name value][ attrsIR\[name]: emitNode env value ]
+        if not? empty? attrsIR -> emitted\attrs: attrsIR
+        return emitted
     ]
     fnIR: emitNode env fnNode
     argsIR: @[]
     loop node\args [a][ addItem argsIR (emitNode env a) ]
-    #[op: "call" fn: fnIR args: argsIR]
+    attrsIR: #[]
+    if key? node "attrs" -> loop node\attrs [name value][ attrsIR\[name]: emitNode env value ]
+    #[op: "call" fn: fnIR args: argsIR attrs: attrsIR]
 ]
 
 ;=======================================================
@@ -923,6 +1467,9 @@ evalInterpret: function [env node][
         if "true" = node\name -> return true
         if "false" = node\name -> return false
         if "null" = node\name -> return null
+        if "arity" = node\name -> return kernelArity env
+        if "symbols" = node\name -> return kernelSymbols env
+        if 0 = BUILTIN_ARITY\[node\name] -> return delegateNullary node\name
         return #[nodek: "hostword" name: node\name]
     ]
     if and? (isNode node) ["define" = node\nodek] -> return evalDefine env node
@@ -977,6 +1524,9 @@ runNode: function [env node][
         if "true" = node\name -> return true
         if "false" = node\name -> return false
         if "null" = node\name -> return null
+        if "arity" = node\name -> return kernelArity env
+        if "symbols" = node\name -> return kernelSymbols env
+        if 0 = BUILTIN_ARITY\[node\name] -> return delegateNullary node\name
         return #[nodek: "hostword" name: node\name]
     ]
     if "break" = op [ LOOP_SIGNAL\break: true  return null ]
@@ -1003,6 +1553,14 @@ runNode: function [env node][
     ; host `call` builtin frame one level up from runSeq corrupts
     ; the value stack and a deeper runCall loses its `argVals`.
     if "function" = op -> return runFunction env node\args
+    if "method" = op -> return runFunction env node\args
+    if "constructor" = op -> return #[nodek: "constructor" params: node\args\0]
+    if "is" = op [
+        baseValue: runNode env node\args\0
+        extra: runNode env node\args\1
+        return kernelInherit env (to :string baseValue) extra
+    ]
+    if "dictionary" = op -> return runDictionary env node\args\0
     if "if" = op -> return runIf env node\args
     if "unless" = op -> return runUnless env node\args
     if "switch" = op -> return runSwitch env node\args
@@ -1022,6 +1580,163 @@ runNode: function [env node][
 
 runCall: function [env node][
     fnNode: node\fn
+    memberMode: irCalleeName fnNode
+    if "arg" = memberMode -> return delegateNullary "arg"
+    if "arity" = memberMode -> return kernelArity env
+    if "symbols" = memberMode -> return kernelSymbols env
+    if "var" = memberMode [
+        variableName: runNode env node\args\0
+        return lookup env (to :string variableName)
+    ]
+    if "unset" = memberMode [
+        variableName: runNode env node\args\0
+        return kernelUnset env (to :string variableName)
+    ]
+    if "export" = memberMode [
+        exported: runNode env node\args\0
+        loop exported [name value][ define env name value ]
+        return null
+    ]
+    if "attr" = memberMode [
+        attrName: runNode env node\args\0
+        return kernelPopAttr (to :string attrName)
+    ]
+    if "attrs" = memberMode [
+        foundAttrs: new ATTR_STATE\current
+        ATTR_STATE\current: #[]
+        return foundAttrs
+    ]
+    if "attr?" = memberMode [
+        attrName: runNode env node\args\0
+        return key? ATTR_STATE\current (to :string attrName)
+    ]
+    if "truncate" = memberMode [
+        text: runNode env node\args\0
+        cutoff: runNode env node\args\1
+        evaluatedAttrs: evalCallAttrs env node :run
+        return kernelTruncate (to :string text) cutoff evaluatedAttrs
+    ]
+    if "combine" = memberMode [
+        values: runNode env node\args\0
+        evaluatedAttrs: evalCallAttrs env node :run
+        return kernelCombinations values evaluatedAttrs
+    ]
+    if or? ("after" = memberMode) ["before" = memberMode] [
+        date: runNode env node\args\0
+        evaluatedAttrs: evalCallAttrs env node :run
+        direction: 1
+        if "before" = memberMode -> direction: 0 - 1
+        return kernelShiftDate date evaluatedAttrs direction
+    ]
+    if or? ("encode" = memberMode) ["decode" = memberMode] [
+        codecValue: runNode env node\args\0
+        codecAttrs: evalCallAttrs env node :run
+        return kernelCodec codecValue codecAttrs ("decode" = memberMode)
+    ]
+    if "palette" = memberMode [
+        paletteBase: runNode env node\args\0
+        paletteAttrs: evalCallAttrs env node :run
+        return kernelPalette paletteBase paletteAttrs
+    ]
+    if "normalize" = memberMode [
+        normalizedPathValue: runNode env node\args\0
+        normalizeAttrs: evalCallAttrs env node :run
+        if and? (isPathRef normalizedPathValue) [empty? normalizeAttrs] [
+            return delegateThroughRef env "normalize" @[normalizedPathValue]
+        ]
+        return kernelNormalize normalizedPathValue normalizeAttrs
+    ]
+    if "escape" = memberMode [
+        escapedText: runNode env node\args\0
+        escapeAttrs: evalCallAttrs env node :run
+        return kernelEscape escapedText escapeAttrs
+    ]
+    if "wordwrap" = memberMode [
+        wrappedText: runNode env node\args\0
+        wrapAttrs: evalCallAttrs env node :run
+        return kernelWordwrap wrappedText wrapAttrs
+    ]
+    if "extract" = memberMode [
+        extractedValue: runNode env node\args\0
+        extractAttrs: evalCallAttrs env node :run
+        return kernelExtract extractedValue extractAttrs
+    ]
+    if "render" = memberMode [
+        templateText: runNode env node\args\0
+        renderAttrs: evalCallAttrs env node :run
+        return kernelRender env templateText renderAttrs
+    ]
+    if "benchmark" = memberMode [
+        benchmarkAction: runNode env node\args\0
+        benchmarkAttrs: evalCallAttrs env node :run
+        return kernelBenchmark benchmarkAction benchmarkAttrs
+    ]
+    if "alphabet" = memberMode [
+        alphabetLocale: runNode env node\args\0
+        alphabetAttrs: evalCallAttrs env node :run
+        return kernelAlphabet alphabetLocale alphabetAttrs
+    ]
+    if "digest" = memberMode [
+        digestValue: runNode env node\args\0
+        digestAttrs: evalCallAttrs env node :run
+        return kernelDigest digestValue digestAttrs
+    ]
+    if "hash" = memberMode [
+        hashedValue: runNode env node\args\0
+        hashAttrs: evalCallAttrs env node :run
+        return kernelHash hashedValue hashAttrs
+    ]
+    if "collect" = memberMode [
+        collectionValue: runNode env node\args\0
+        collectionParams: runNode env node\args\1
+        collectionCondition: runNode env node\args\2
+        collectAttrs: evalCallAttrs env node :run
+        return kernelCollect collectionValue collectionParams collectionCondition collectAttrs
+    ]
+    if "with" = memberMode [
+        embeddedNames: runNode env node\args\0
+        embeddedBody: runNode env node\args\1
+        return kernelWith env embeddedNames embeddedBody
+    ]
+    if "specify" = memberMode [
+        unitName: runNode env node\args\0
+        unitValue: runNode env node\args\1
+        specifyAttrs: evalCallAttrs env node :run
+        return kernelSpecify unitName unitValue specifyAttrs
+    ]
+    if "print" = memberMode [
+        value: runNode env node\args\0
+        if kernelObject? value [
+            hasString: key? value "string"
+            if key? value "string" [
+                stringMethod: value\string
+                value: applyVal env stringMethod @[]
+            ]
+            if not? hasString -> value: kernelVisibleObject value
+        ]
+        return delegate "print" @[value]
+    ]
+    if or? ("keys" = memberMode) ["values" = memberMode] [
+        if 1 = size node\args [
+            memberOwner: runNode env node\args\0
+            if kernelObject? memberOwner -> return kernelObjectMembers memberOwner memberMode
+        ]
+    ]
+    if or? ("compare" = memberMode) [or? ("less?" = memberMode) [or? ("greater?" = memberMode) [or? ("lessOrEqual?" = memberMode) ["greaterOrEqual?" = memberMode]]]] [
+        orderedLeft: runNode env node\args\0
+        if and? (kernelObject? orderedLeft) [key? orderedLeft "compare"] [
+            orderedRight: runNode env node\args\1
+            return kernelObjectOrder env memberMode orderedLeft orderedRight
+        ]
+    ]
+    if "throw" = memberMode [
+        throwAttrs: evalCallAttrs env node :run
+        if key? throwAttrs "as" [
+            thrownValue: runNode env node\args\0
+            caughtThrow: try [throw.as: throwAttrs\as thrownValue]
+            return #[nodek: "error" msg: caughtThrow]
+        ]
+    ]
     r: ruleFor (irCalleeName fnNode)
     if not? null? r [
         rowArgs: @[]
@@ -1033,7 +1748,131 @@ runCall: function [env node][
     fnVal: runNode env fnNode
     argVals: @[]
     loop node\args [a][ addItem argVals (runNode env a) ]
-    applyVal env fnVal argVals
+    callAttributes: evalCallAttrs env node :run
+    applyAttributed env fnVal argVals callAttributes
+]
+
+; A dictionary block is executable namespace construction, not a literal list
+; of alternating keys and values. Evaluate it in a child frame, preserve outer
+; reads, and return only bindings created by the block.
+evalDictionary: function [env body][
+    child: newEnv env
+    evalSeq child (lowerBlock body)
+    child\bindings
+]
+
+runDictionary: function [env bodyIR][
+    child: newEnv env
+    runSeq child bodyIR
+    child\bindings
+]
+
+kernelObject?: function [v][
+    if :dictionary <> type v -> return false
+    if not? key? v "__object" -> return false
+    true = v\__object
+]
+
+kernelMethod?: function [v][
+    if not? isNode v -> return false
+    if not? key? v "nodek" -> return false
+    "closure" = v\nodek
+]
+
+kernelConstructor?: function [v][
+    if not? isNode v -> return false
+    if not? key? v "nodek" -> return false
+    "constructor" = v\nodek
+]
+
+bindKernelMethod: function [method instance][
+    receiver: newEnv method\env
+    define receiver "this" instance
+    #[nodek: "closure" params: method\params body: method\body ir: method\ir env: receiver]
+]
+
+kernelClassName: function [typeName][ "__class_" ++ slice typeName 1 ((size typeName) - 1) ]
+
+kernelInherit: function [env baseName extra][
+    base: lookup env (kernelClassName baseName)
+    if :dictionary <> type base -> return #[nodek: "error" msg: ["undefined parent type" baseName]]
+    merged: #[]
+    loop base [name member][ merged\[name]: member ]
+    loop extra [name member][
+        if and? (key? merged name) [kernelMethod? member] [
+            if kernelMethod? merged\[name] -> merged\["__super_" ++ name]: merged\[name]
+        ]
+        merged\[name]: member
+    ]
+    merged\__parent: baseName
+    merged
+]
+
+kernelConstruct: function [env typeName values][
+    proto: lookup env (kernelClassName typeName)
+    if :dictionary <> type proto -> return #[nodek: "error" msg: ["undefined object type" typeName]]
+    instance: #[__object: true __type: typeName]
+    loop proto [name member][
+        if kernelMethod? member -> instance\[name]: bindKernelMethod member instance
+        if not? kernelMethod? member -> instance\[name]: new member
+    ]
+    loop instance [name member][
+        if and? (kernelMethod? member) [not? prefix? name "__"] [
+            superName: "__super_" ++ name
+            if key? instance superName -> define member\env "super" instance\[superName]
+        ]
+    ]
+    if key? instance "init" [
+        if kernelConstructor? instance\init [
+            at: 0
+            loop instance\init\params [p][
+                if :word = type p [
+                    name: to :string p
+                    if and? (:block = type values) [at < size values] [ instance\[name]: values\[at] at: at + 1 ]
+                    if and? (:dictionary = type values) [key? values name] -> instance\[name]: values\[name]
+                ]
+            ]
+        ]
+        if not? kernelConstructor? instance\init [
+            initArgs: @[]
+            if :block = type values -> loop values [v][ addItem initArgs v ]
+            if :dictionary = type values [
+                params: instance\init\params
+                loop params [p][ if key? values (to :string p) -> addItem initArgs values\[(to :string p)] ]
+            ]
+            applyVal env instance\init initArgs
+        ]
+    ]
+    instance
+]
+
+kernelVisibleObject: function [obj][
+    visible: #[]
+    loop obj [name value][
+        hidden: prefix? name "__"
+        if "init" = name -> hidden: true
+        if kernelMethod? value -> hidden: true
+        if not? hidden -> visible\[name]: value
+    ]
+    visible
+]
+
+kernelObjectMembers: function [obj mode][
+    out: @[]
+    loop obj [name value][
+        hidden: prefix? name "__"
+        callable: kernelMethod? value
+        if kernelConstructor? value -> callable: true
+        include: false
+        if "methods" = mode -> if and? (not? hidden) [callable] -> include: true
+        if "keys" = mode -> if and? (not? hidden) [not? callable] -> include: true
+        if "values" = mode -> if and? (not? hidden) [not? callable] -> include: true
+        if include [
+            if "values" = mode -> addItem out value
+            if "values" <> mode -> addItem out name
+        ]
+    ]
+    out
 ]
 
 ;=======================================================
@@ -1049,12 +1888,12 @@ resetRET: function [][
 ; interpret a source string with the kernel (interpret mode)
 interpret: function [src][
     resetRET
-    evalSeq (newEnv null) (lowerBlock (to :block src))
+    evalSeq (newEnv null) (lowerBlock (to :block prepareSource src))
 ]
 
 ; compile a source string to IR (emit mode, top level)
 compileToIR: function [src][
-    emitSeq (newEnv null) (lowerBlock (to :block src))
+    emitSeq (newEnv null) (lowerBlock (to :block prepareSource src))
 ]
 
 ; run an IR artifact (v0 backend)
@@ -1119,6 +1958,276 @@ defRule "function" #[
         #[op: "function" args: @[argv\0 bodyIR]]
     ]
     run:  function [env argv][ runFunction env argv ]
+]
+
+defRule "method" #[
+    eval: function [env argv][ makeClosure env argv\0 argv\1 ]
+    emit: function [env argv][
+        bodyIR: emitSeq env (lowerBlock argv\1)
+        #[op: "method" args: @[argv\0 bodyIR]]
+    ]
+    run: function [env argv][ runFunction env argv ]
+]
+
+defRule "sortable" #[
+    eval: function [env argv][ #[nodek: "closure" params: [that] body: kernelSortableIR argv\0 ir: true env: env] ]
+    emit: function [env argv][
+        bodyIR: kernelSortableIR argv\0
+        #[op: "method" args: @[[that] bodyIR]]
+    ]
+    run: function [env argv][ #[nodek: "closure" params: [that] body: kernelSortableIR argv\0 ir: true env: env] ]
+]
+
+defRule "constructor" #[
+    eval: function [env argv][ #[nodek: "constructor" params: argv\0] ]
+    emit: function [env argv][ #[op: "constructor" args: @[argv\0]] ]
+    run: function [env argv][ #[nodek: "constructor" params: argv\0] ]
+]
+
+defRule "is" #[
+    eval: function [env argv][
+        baseValue: evalNode env argv\0 :interpret
+        baseName: to :string baseValue
+        extra: evalDictionary env argv\1
+        kernelInherit env baseName extra
+    ]
+    emit: function [env argv][
+        baseIR: emitNode env argv\0
+        bodyIR: emitSeq env (lowerBlock argv\1)
+        extraIR: #[op: "dictionary" args: @[bodyIR]]
+        #[op: "is" args: @[baseIR extraIR]]
+    ]
+    run: function [env argv][
+        baseValue: runNode env argv\0
+        baseName: to :string baseValue
+        extra: runNode env argv\1
+        kernelInherit env baseName extra
+    ]
+]
+
+defRule "define" #[
+    eval: function [env argv][
+        typeName: to :string argv\0
+        proto: null
+        if :block = type argv\1 -> proto: evalDictionary env argv\1
+        if :block <> type argv\1 -> proto: evalNode env argv\1 :interpret
+        define env (kernelClassName typeName) proto
+        proto
+    ]
+    emit: function [env argv][
+        typeName: to :string argv\0
+        if :block = type argv\1 [
+            bodyIR: emitSeq env (lowerBlock argv\1)
+            return #[op: "define" name: kernelClassName typeName expr: #[op: "dictionary" args: @[bodyIR]]]
+        ]
+        #[op: "define" name: kernelClassName typeName expr: emitNode env argv\1]
+    ]
+    run: function [env argv][ null ]
+]
+
+defRule "to" #[
+    eval: function [env argv][
+        target: evalNode env argv\0 :interpret
+        value: evalNode env argv\1 :interpret
+        targetName: to :string target
+        if and? (prefix? targetName ":") [bound? env (kernelClassName targetName)] -> return kernelConstruct env targetName value
+        if and? (":string" = targetName) [kernelObject? value] [
+            if key? value "string" [
+                stringMethod: value\string
+                return applyVal env stringMethod @[]
+            ]
+        ]
+        delegate "to" @[target value]
+    ]
+    emit: function [env argv][
+        targetIR: emitNode env argv\0
+        valueIR: emitNode env argv\1
+        #[op: "call" fn: #[op: "intrinsic" name: "to"] args: @[targetIR valueIR]]
+    ]
+    run: function [env argv][
+        target: runNode env argv\0
+        value: runNode env argv\1
+        targetName: to :string target
+        if and? (prefix? targetName ":") [bound? env (kernelClassName targetName)] -> return kernelConstruct env targetName value
+        if and? (":string" = targetName) [kernelObject? value] [
+            if key? value "string" [
+                stringMethod: value\string
+                return applyVal env stringMethod @[]
+            ]
+        ]
+        delegate "to" @[target value]
+    ]
+]
+
+defRule "type" #[
+    eval: function [env argv][
+        value: evalNode env argv\0 :interpret
+        if kernelObject? value -> return value\__type
+        delegate "type" @[value]
+    ]
+    emit: function [env argv][
+        valueIR: emitNode env argv\0
+        #[op: "call" fn: #[op: "intrinsic" name: "type"] args: @[valueIR]]
+    ]
+    run: function [env argv][
+        value: runNode env argv\0
+        if kernelObject? value -> return value\__type
+        delegate "type" @[value]
+    ]
+]
+
+defRule "print" #[
+    eval: function [env argv][
+        value: evalNode env argv\0 :interpret
+        if kernelObject? value [
+            if key? value "string" [
+                stringMethod: value\string
+                rendered: applyVal env stringMethod @[]
+                return delegate "print" @[rendered]
+            ]
+            return delegate "print" @[kernelVisibleObject value]
+        ]
+        delegate "print" @[value]
+    ]
+    emit: function [env argv][
+        valueIR: emitNode env argv\0
+        #[op: "call" fn: #[op: "intrinsic" name: "print"] args: @[valueIR]]
+    ]
+    run: function [env argv][
+        value: runNode env argv\0
+        if kernelObject? value [
+            if key? value "string" [
+                stringMethod: value\string
+                rendered: applyVal env stringMethod @[]
+                return delegate "print" @[rendered]
+            ]
+            return delegate "print" @[kernelVisibleObject value]
+        ]
+        delegate "print" @[value]
+    ]
+]
+
+defRule "object?" #[
+    eval: function [env argv][ value: evalNode env argv\0 :interpret kernelObject? value ]
+    emit: function [env argv][ valueIR: emitNode env argv\0 #[op: "call" fn: #[op: "intrinsic" name: "object?"] args: @[valueIR]] ]
+    run: function [env argv][ value: runNode env argv\0 kernelObject? value ]
+]
+
+defRule "method?" #[
+    eval: function [env argv][ value: evalNode env argv\0 :interpret kernelMethod? value ]
+    emit: function [env argv][ valueIR: emitNode env argv\0 #[op: "call" fn: #[op: "intrinsic" name: "method?"] args: @[valueIR]] ]
+    run: function [env argv][ value: runNode env argv\0 kernelMethod? value ]
+]
+
+defRule "methods" #[
+    eval: function [env argv][ value: evalNode env argv\0 :interpret kernelObjectMembers value "methods" ]
+    emit: function [env argv][ valueIR: emitNode env argv\0 #[op: "call" fn: #[op: "intrinsic" name: "methods"] args: @[valueIR]] ]
+    run: function [env argv][ value: runNode env argv\0 kernelObjectMembers value "methods" ]
+]
+
+defRule "is?" #[
+    eval: function [env argv][
+        expected: evalNode env argv\0 :interpret
+        value: evalNode env argv\1 :interpret
+        if kernelObject? value -> return (to :string expected) = value\__type
+        delegate "is?" @[expected value]
+    ]
+    emit: function [env argv][
+        expectedIR: emitNode env argv\0
+        valueIR: emitNode env argv\1
+        #[op: "call" fn: #[op: "intrinsic" name: "is?"] args: @[expectedIR valueIR]]
+    ]
+    run: function [env argv][
+        expected: runNode env argv\0
+        value: runNode env argv\1
+        if kernelObject? value -> return (to :string expected) = value\__type
+        delegate "is?" @[expected value]
+    ]
+]
+
+defRule "get" #[
+    eval: function [env argv][
+        owner: evalNode env argv\0 :interpret
+        key: evalNode env argv\1 :interpret
+        if kernelObject? owner -> return owner\[(to :string key)]
+        delegate "get" @[owner key]
+    ]
+    emit: function [env argv][
+        ownerIR: emitNode env argv\0
+        keyIR: emitNode env argv\1
+        #[op: "call" fn: #[op: "intrinsic" name: "get"] args: @[ownerIR keyIR]]
+    ]
+    run: function [env argv][
+        owner: runNode env argv\0
+        key: runNode env argv\1
+        if kernelObject? owner -> return owner\[(to :string key)]
+        delegate "get" @[owner key]
+    ]
+]
+
+defRule "pathGet" #[
+    eval: function [env argv][
+        owner: evalNode env argv\0 :interpret
+        key: evalNode env argv\1 :interpret
+        value: null
+        if :dictionary = type owner -> value: get owner key
+        if :dictionary <> type owner -> value: delegate "get" @[owner key]
+        if kernelMethod? value [ if empty? value\params -> return applyVal env value @[] ]
+        value
+    ]
+    emit: function [env argv][
+        ownerIR: emitNode env argv\0
+        keyIR: emitNode env argv\1
+        #[op: "call" fn: #[op: "intrinsic" name: "pathGet"] args: @[ownerIR keyIR]]
+    ]
+    run: function [env argv][
+        owner: runNode env argv\0
+        key: runNode env argv\1
+        value: null
+        if :dictionary = type owner -> value: get owner key
+        if :dictionary <> type owner -> value: delegate "get" @[owner key]
+        if kernelMethod? value [ if empty? value\params -> return applyVal env value @[] ]
+        value
+    ]
+]
+
+defRule "dictionary" #[
+    eval: function [env argv][ evalDictionary env argv\0 ]
+    emit: function [env argv][
+        bodyIR: emitSeq env (lowerBlock argv\0)
+        #[op: "dictionary" args: @[bodyIR]]
+    ]
+    run: function [env argv][ runDictionary env argv\0 ]
+]
+
+defRule "module" #[
+    eval: function [env argv][
+        if :dictionary = type argv\0 -> return argv\0
+        evalDictionary env argv\0
+    ]
+    emit: function [env argv][
+        if :dictionary = type argv\0 -> return emitNode env argv\0
+        bodyIR: emitSeq env (lowerBlock argv\0)
+        #[op: "dictionary" args: @[bodyIR]]
+    ]
+    run: function [env argv][ runDictionary env argv\0 ]
+]
+
+defRule "set?" #[
+    eval: function [env argv][ bound? env (to :string argv\0) ]
+    emit: function [env argv][
+        #[op: "call" fn: #[op: "intrinsic" name: "set?"] args: @[argv\0]]
+    ]
+    run: function [env argv][
+        nameValue: runNode env argv\0
+        bound? env (to :string nameValue)
+    ]
+]
+
+defRule "now" #[
+    eval: function [env argv][ now ]
+    emit: function [env argv][ #[op: "call" fn: #[op: "intrinsic" name: "now"] args: @[]] ]
+    run: function [env argv][ now ]
 ]
 
 defRule "let" #[

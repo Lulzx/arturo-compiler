@@ -11,19 +11,22 @@ check` proves behavior only for the checked-in corpus and compatibility cases.
 | --- | --- | --- |
 | Literals, grouping, calls, closures, paths, dictionaries | Corpus-proven | Keep host/kernel/IR/native differential tests green |
 | `if`, `do`, `return`, `while`, `until`, `loop`, ranges | Corpus-proven | Add nested control-flow and failure cases |
-| Common arithmetic, collections, strings, predicates | Partial | Every declared runtime builtin needs positive, edge, and error parity tests |
-| Modules/imports | Unsupported by standalone target | Resolve/import dependencies at compile time and test multi-file packages |
-| Objects/classes/methods | Unsupported | Add value/runtime representation, dispatch, mutation, and inheritance tests |
-| Exceptions | Partial (`try`, `throw`, `throws?`, `error?`, `ensure`, `panic`) | Stack traces, handler forms beyond `try`, uncaught-error parity, and stable nonzero exits |
-| Remaining Arturo value kinds | Partial | Represent and test quantities, dates, colors, regexes, binaries, stores, etc. |
-| I/O, networking, databases, GUI | Mostly unsupported | Either link the authoritative Arturo runtime or implement capability modules |
-| Diagnostics/tooling | Not production-grade | Source spans, filenames, actionable errors, stable exit codes, debug metadata |
+| Common arithmetic, collections, strings, predicates | Corpus-proven portable surface | Keep edge and negative parity coverage growing |
+| Modules/imports | Corpus-proven | Keep recursive, selective, lean, local-package, and package-entry resolution tests green |
+| Objects/classes/methods | Corpus-proven | Constructors, bound methods, inheritance, `super`, reflection, string rendering, and generated ordering methods are covered |
+| Exceptions | Partial (`try`, `throw`, `throws?`, `error?`, `ensure`, `panic`) | Arturo-level stack frames and exact upstream diagnostic formatting remain |
+| Required portable Arturo value kinds | Corpus-proven | Rational, complex, quantity/unit, date, color, regex, binary, version, error-kind, and symbol-literal values are native; external handles such as stores remain explicitly unavailable |
+| I/O, networking, databases, GUI | Filesystem/process basics supported; 43 declarations intentionally unavailable | Keep compile-time rejection policy machine-checked; only add capabilities with portable implementations and effect tests |
+| Diagnostics/tooling | Partial | Native failures have filenames, stable stderr, and nonzero exits; source lines and Arturo-level stack frames remain |
 
 ## Route to the whole language
 
 1. **Make scope executable.** Keep `src/intrinsics.art` generated from the
    pinned Arturo revision and make `make coverage` trend to 100%. Maintain an
    explicit allowlist for intentionally unavailable platform capabilities.
+   The current boundary is classified declaration-by-declaration in
+   `config/intrinsic-policy.tsv`; `make coverage` fails if that policy and the
+   generated declaration/runtime tables drift apart.
 2. **Prefer runtime donation over reimplementation.** For full compatibility,
    link/embed Arturo's authoritative VM/runtime and lower this compiler's IR to
    that ABI. The hand-written C runtime is useful for a compact core target,
@@ -39,6 +42,19 @@ check` proves behavior only for the checked-in corpus and compatibility cases.
    leak checks for the C runtime, deterministic/reproducible builds, CI across
    supported operating systems and architectures, versioned artifacts, and a
    documented compatibility policy.
+
+The current mechanical boundary is 352/395 declarations: no required
+declarations remain and 43 platform/runtime-internal declarations are intentionally
+unavailable. The local corpus has 106 four-way differential and self-hosted
+native cases, plus thirty-one unmodified tests from the pinned upstream suite. `make unsupported`
+proves unavailable capabilities fail during compilation without producing an
+executable.
+
+`make sanitize` is the current ASan/UBSan gate across all 106 local and thirty-one
+vendored-upstream native cases. Leak
+checking remains separate because runtime values still use process-lifetime
+allocation; making ownership explicit is required before LeakSanitizer can be
+enabled without suppressing real leaks.
 
 The release gate for a “full Arturo compiler” is: the pinned upstream suite and
 the local suite pass against the host for every supported target, no

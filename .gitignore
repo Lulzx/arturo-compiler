@@ -1,5 +1,6 @@
 runtime/*.o
 runtime/*.a
+runtime/intrinsic_arity.inc
 tmp/
 *.bcode
 native_compiler

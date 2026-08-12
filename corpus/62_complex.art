@@ -1,0 +1,9 @@
+z: to :complex [1 2]
+w: to :complex [2 1]
+print z
+print complex? z
+print to :block z
+print z + 3
+print z * w
+print conj z
+print type z

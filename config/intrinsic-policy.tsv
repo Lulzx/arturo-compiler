@@ -1,0 +1,50 @@
+# Intrinsic compatibility policy for the pinned Arturo declaration set.
+#
+# Columns: intrinsic<TAB>category<TAB>disposition
+# Categories are the four release-planning buckets.  A disposition of
+# `required` means the standalone compiler must implement compatible behavior;
+# `unsupported` means compilation must reject the feature with a stable,
+# actionable diagnostic rather than failing later as an unknown function.
+__VerbosePackager	unavailable	unsupported
+accept	unavailable	unsupported
+browse	unavailable	unsupported
+bytecode?	unavailable	unsupported
+cancel	unavailable	unsupported
+channel	unavailable	unsupported
+config	unavailable	unsupported
+connect	unavailable	unsupported
+cursor	unavailable	unsupported
+database?	unavailable	unsupported
+download	unavailable	unsupported
+emit	unavailable	unsupported
+eval	unavailable	unsupported
+event	unavailable	unsupported
+failed?	unavailable	unsupported
+finished?	unavailable	unsupported
+future?	unavailable	unsupported
+goto	unavailable	unsupported
+info	unavailable	unsupported
+listen	unavailable	unsupported
+mail	unavailable	unsupported
+off	unavailable	unsupported
+on	unavailable	unsupported
+permissions	unavailable	unsupported
+receive	unavailable	unsupported
+request	unavailable	unsupported
+send	unavailable	unsupported
+send?	unavailable	unsupported
+serve	unavailable	unsupported
+socket?	unavailable	unsupported
+spin	unavailable	unsupported
+stack	unavailable	unsupported
+standalone?	unavailable	unsupported
+store	unavailable	unsupported
+store?	unavailable	unsupported
+superuser?	unavailable	unsupported
+terminal	unavailable	unsupported
+terminate	unavailable	unsupported
+unplug	unavailable	unsupported
+unstack	unavailable	unsupported
+unzip	unavailable	unsupported
+volume	unavailable	unsupported
+zip	unavailable	unsupported

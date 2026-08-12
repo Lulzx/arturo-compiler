@@ -1,0 +1,10 @@
+half: to :rational [1 2]
+third: to :rational [1 3]
+print half
+print rational? half
+print numerator half
+print denominator half
+print half + third
+print half * 3
+print type half
+print to :block half

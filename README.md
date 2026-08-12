@@ -44,10 +44,9 @@ standalone native CLI. It compiles corpus programs to native binaries whose
 output is byte-identical to the host interpreter. `make verify` proves it
 every time it runs.
 
-Three things "byte-identical" does not claim. It means the printed output
-(stdout and stderr) of the native binary matches the host interpreter's
-character for character. It does not compare state that never prints. And it
-is proven on the corpus subset and on the compiler's own source, not on the
+The native parity harness compares stdout, stderr, process exit status, and
+filesystem effects in isolated working directories. It is proven on 106 local
+cases, thirty-one unmodified pinned-upstream programs, and the compiler's own source—not on the
 whole language; constructs the compiler does not yet own (see the backlog in
 `SPEC.md`) are outside the proof until a corpus program pins them. Finally,
 documented host defects may be corrected rather than reproduced; those cases
@@ -71,8 +70,12 @@ the parity corpus, because its expected result differs from the pinned host.
     ./out                   # run it
     make test               # 4-way differential, every corpus program
     make verify             # native == host, byte for byte
+    make upstream           # vendored upstream stdout/stderr/status/effect parity
+    make diagnostics        # stable stderr and nonzero-exit failure contract
     make compat             # expected output for documented host fixes
+    make unsupported        # reject intentionally unavailable capabilities
     make coverage           # declared vs implemented native intrinsics
+    make sanitize           # ASan + UBSan over every generated native program
 
 Or by hand:
 
@@ -97,6 +100,8 @@ Or by hand:
     CONTRIBUTING.md               how to add a construct
 
 Built against Arturo 0.10.0, pinned to the revision in `corpus/m1/RESULTS.md`.
+CI builds that exact upstream revision (`d8079c6bd4ed170bfd8c5b786a38fd52a9527e97`)
+on Linux and macOS before running parity, compatibility, ASan, and UBSan checks.
 Read `SPEC.md` for the precise proof boundary and design, and
 `LANGUAGE_SUPPORT.md` for the production-readiness gate and the route to full
 language coverage.

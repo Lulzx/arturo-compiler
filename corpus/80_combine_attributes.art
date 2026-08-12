@@ -1,0 +1,6 @@
+print combine [A B C]
+print combine.repeated [A B C]
+print combine.by:2 [A B C]
+print combine.repeated.by:2 [A B C]
+print combine.count [A B C]
+print combine.count.repeated.by:2 [A B C]

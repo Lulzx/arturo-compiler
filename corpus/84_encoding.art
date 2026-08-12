@@ -1,0 +1,7 @@
+print crc "The quick brown fox jumps over the lazy dog"
+encoded: encode "Numquam fugiens respexeris"
+print encoded
+print decode encoded
+url: encode.url.slashes "http://foo bar/"
+print url
+print decode.url url

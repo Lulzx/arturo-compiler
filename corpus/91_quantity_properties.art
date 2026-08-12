@@ -1,0 +1,9 @@
+meter: 3`m
+centimeter: 4`cm
+second: 5`s
+power: 6`W
+print property meter
+print property power
+print conforms? meter centimeter
+print conforms? meter second
+print conforms? power 3`J/s

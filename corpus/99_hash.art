@@ -1,0 +1,11 @@
+print hash null
+print hash false
+print hash true
+print hash 0
+print hash 1
+print hash 123
+print hash 1.5
+print hash ""
+print hash "hello"
+print hash [1 2 3]
+print hash.string "hello"

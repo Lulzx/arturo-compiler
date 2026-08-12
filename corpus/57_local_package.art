@@ -1,0 +1,2 @@
+import relative {../fixtures/package}!
+print packageValue

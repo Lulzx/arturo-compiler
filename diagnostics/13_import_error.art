@@ -1,0 +1,2 @@
+import relative {../fixtures/modules/boom.art}!
+print "after"

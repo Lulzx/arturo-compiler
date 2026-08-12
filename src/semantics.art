@@ -29,6 +29,24 @@ NOT_MUTATING: #[
     "info": true      ; resolves the path to describe what is there
 ]
 
+; Capabilities deliberately outside the standalone compiler/runtime product.
+; The C backend rejects direct calls during compilation with a stable error;
+; they must never degrade into an unknown-function crash in generated code.
+UNSUPPORTED_INTRINSICS: #[
+    "__VerbosePackager": true "accept": true "browse": true
+    "bytecode?": true "cancel": true "channel": true "config": true
+    "connect": true "cursor": true "database?": true "download": true
+    "emit": true "eval": true "event": true "failed?": true "finished?": true "future?": true "goto": true "info": true
+    "listen": true "mail": true "off": true "on": true
+    "permissions": true "receive": true "request": true "send": true
+    "send?": true "serve": true "socket?": true "spin": true
+    "stack": true "standalone?": true "store": true "store?": true "superuser?": true
+    "terminal": true "terminate": true "unplug": true "unstack": true "unzip": true
+    "volume": true "zip": true
+]
+
+unsupportedIntrinsic?: function [name][ key? UNSUPPORTED_INTRINSICS name ]
+
 ;-----------------------------------------------
 ; Intrinsics the folder may run at compile time.
 ;
@@ -55,7 +73,9 @@ PURE_INTRINSICS: #[
     "lessOrEqual?": true  "greaterOrEqual?": true
     "and?": true  "or?": true
     "not?": true  "null?": true  "true?": true  "false?": true
-    "size": true  "first": true  "last": true  "inc": true  "dec": true
+    ; Attribute-sensitive collection slices (`first.n`, `last.n`) are not
+    ; context-free calls, so keep them out of compile-time delegation.
+    "size": true  "inc": true  "dec": true
     "type": true  "to": true
     "append": true  "not": true  "and": true  "or": true
     "round": true  "sqrt": true  "ln": true  "log": true

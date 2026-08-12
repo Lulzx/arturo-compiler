@@ -1,0 +1,8 @@
+a: "one/../two/../../three"
+b: #[value: new a]
+
+normalize 'a
+normalize 'b\value
+
+print a
+print b\value

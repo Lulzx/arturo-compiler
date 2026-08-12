@@ -1,0 +1,6 @@
+specify 'nauMile 1.1508`mi
+distance: 3`nauMile
+print property distance
+converted: convert distance `km
+print units converted
+print scalar converted

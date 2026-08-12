@@ -1,0 +1,22 @@
+multiply: function [x][
+    if attr? "with" [return x * attr "with"]
+    x * 2
+]
+
+flagged: function [][
+    print attr? "later"
+    print attr "later"
+    print attr? "later"
+]
+
+probe: function [ignored][
+    print attr? "later"
+    print key? attrs "later"
+    print attr "later"
+    print attr? "later"
+]
+
+print multiply 5
+print multiply.with:6 5
+probe.later 0
+flagged.later

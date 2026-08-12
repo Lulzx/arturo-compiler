@@ -31,7 +31,7 @@ CORPUS_LIST: "sort select list.relative \"corpus\" 'f -> contains? f \".art\""
 
 buildSelfCompiler: function [][
     out: @[]
-    files: ["src/intrinsics.art" "src/semantics.art" "src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
+    files: ["src/intrinsics.art" "src/modules.art" "src/semantics.art" "src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
     loop files [f][
         src: read f
         src: replace src "import ./\"" ++ f ++ "\"\n" ""
@@ -84,7 +84,7 @@ go: function [][
 
     print "step 3: the compiler emits its own source files to IR"
     totalIR: 0
-    files: ["src/intrinsics.art" "src/semantics.art" "src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
+    files: ["src/intrinsics.art" "src/modules.art" "src/semantics.art" "src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
     loop files [f][
         ir: compileToIR (read f)
         print f

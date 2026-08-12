@@ -9,12 +9,13 @@
 ; load of the unbound `_shadow_args` and crash. Capture the command line in a
 ; helper that is compiled FIRST, before the shadowing fires.
 import ./"../src/cbackend.art"
+import ./"../src/modules.art"
 
 PRE: "cliArgs: function [][ args\\values ]\n"
 
 buildSelfCompiler: function [][
     out: @[PRE]
-    files: ["intrinsics.art" "semantics.art" "front.art" "kernel.art" "ir.art" "backend.art" "cbackend.art"]
+    files: ["intrinsics.art" "modules.art" "semantics.art" "front.art" "kernel.art" "ir.art" "backend.art" "cbackend.art"]
     loop files [f][
         src: read ("src/" ++ f)
         loop files [g][ src: replace src ("import ./\"" ++ g ++ "\"\n") "" ]
@@ -22,7 +23,7 @@ buildSelfCompiler: function [][
     ]
     joinWith out "\n"
 ]
-NMAIN: "\nvals: cliArgs\nif 1 < size vals [\n    inPath: vals\\0\n    outPath: vals\\1\n    src: read inPath\n    compileToNativeC src outPath\n    print \"compiled: \" ++ outPath\n]\n"
+NMAIN: "\nvals: cliArgs\nif 1 < size vals [\n    inPath: vals\\0\n    outPath: vals\\1\n    NATIVE_SOURCE_PATH: inPath\n    PRESERVE_TOKEN_KINDS: true\n    src: resolveImportsFromFile inPath\n    compileToNativeC src outPath\n    print \"compiled: \" ++ outPath\n]\n"
 doit: function [src outName][ compileToNativeC src outName ]
 src: buildSelfCompiler ++ NMAIN
 write src "tmp/ncomp_src.art"

@@ -67,6 +67,21 @@ renderValue: function [v][
         if 0.0 > v -> return "neg " ++ (to :string (0 - v))
         return to :string v
     ]
+    if :rational = t [
+        return "to :rational [" ++ (to :string (numerator v)) ++ " " ++ (to :string (denominator v)) ++ "]"
+    ]
+    if :complex = t [
+        parts: to :block v
+        return "to :complex [" ++ (to :string parts\0) ++ " " ++ (to :string parts\1) ++ "]"
+    ]
+    if :quantity = t -> return (to :string (scalar v)) ++ "`" ++ (to :string (units v))
+    if :unit = t -> return "`" ++ (to :string v)
+    if :date = t -> return "to :date \"" ++ (escapeString (to :string v)) ++ "\""
+    if :color = t -> return "to :color \"" ++ (to :string v) ++ "\""
+    if :regex = t -> return "to :regex \"" ++ (escapeString (to :string v)) ++ "\""
+    if :binary = t -> return "to :binary \"" ++ (escapeString (to :string v)) ++ "\""
+    if :version = t -> return "to :version \"" ++ (escapeString (to :string v)) ++ "\""
+    if :errorkind = t -> return "to :errorKind \"" ++ (escapeString (to :string v)) ++ "\""
     if :type = t -> return ":" ++ (to :string v)
     if :string = t -> return "\"" ++ (escapeString v) ++ "\""
     if :char = t -> return "'" ++ (to :string v) ++ "'"
@@ -81,6 +96,9 @@ renderValue: function [v][
         return "'" ++ n
     ]
     if :symbol = t -> return to :string v
+    if :symbolliteral = t -> return "'" ++ (to :string v)
+    if :attribute = t -> return "." ++ (to :string v)
+    if :attributelabel = t -> return "." ++ (to :string v) ++ ":"
     if :pathliteral = t [
         ; `'c\stack` — a reference, not a value: it must survive
         ; to the output verbatim, because the builtins that take
@@ -193,6 +211,21 @@ ir2art: function [node][
     ; the word still reaches the primitive in the emitted text.
     if "intrinsic" = op -> return node\name
     if "define" = op [
+        if prefix? node\name "__class_" [
+            typeName: slice node\name 8 ((size node\name) - 1)
+            if "dictionary" = node\expr\op [
+                body: ir2artSeq node\expr\args\0
+                return "define " ++ ":" ++ typeName ++ " [" ++ body ++ "]"
+            ]
+            if "is" = node\expr\op [
+                parentNode: node\expr\args\0
+                parentName: ir2art parentNode
+                if and? (isConstNode parentNode) [:string = type parentNode\value] -> parentName: parentNode\value
+                extra: node\expr\args\1
+                body: ir2artSeq extra\args\0
+                return "define " ++ ":" ++ typeName ++ " is " ++ parentName ++ " [" ++ body ++ "]"
+            ]
+        ]
         ex: ir2art node\expr
         return node\name ++ ": " ++ ex
     ]
@@ -206,6 +239,22 @@ ir2art: function [node][
         pr: renderValue node\args\0
         bd: ir2artSeq node\args\1
         return "function " ++ pr ++ " [" ++ bd ++ "]"
+    ]
+    if "method" = op [
+        pr: renderValue node\args\0
+        bd: ir2artSeq node\args\1
+        return "method " ++ pr ++ " [" ++ bd ++ "]"
+    ]
+    if "constructor" = op -> return "constructor " ++ renderValue node\args\0
+    if "is" = op [
+        parent: ir2art node\args\0
+        extra: node\args\1
+        body: ir2artSeq extra\args\0
+        return "is " ++ parent ++ " [" ++ body ++ "]"
+    ]
+    if "dictionary" = op [
+        bd: ir2artSeq node\args\0
+        return "dictionary [" ++ bd ++ "]"
     ]
     if "if" = op [
         cd: ir2art node\args\0
@@ -428,6 +477,7 @@ ir2artRefCall: function [node idx][
     replacement: false
     if "difference" = name -> replacement: true
     if "intersection" = name -> replacement: true
+    if "powerset" = name -> replacement: true
     if "union" = name -> replacement: true
     if replacement [
         return "do [" ++ tmp ++ ": " ++ place ++ " " ++ invocation ++ " " ++ place ++ ": " ++ tmp ++ "]"
@@ -435,8 +485,29 @@ ir2artRefCall: function [node idx][
     "do [" ++ tmp ++ ": " ++ place ++ " " ++ invocation ++ "]"
 ]
 
+ir2artPathKey: function [keyNode][
+    if and? (isIR keyNode) ["passthrough" = keyNode\op] -> return to :string keyNode\src
+    "[" ++ (ir2art keyNode) ++ "]"
+]
+
+; Reassemble a lowered get-chain as one path. Parenthesizing a prefix `get`
+; does not produce a path base in Arturo, while leaving it bare makes the
+; final segment bind to the literal argument (`get d 'inner\v`).
+ir2artPath: function [node][
+    if isIR node [
+        if "call" = node\op [
+            callee: irCalleeName node\fn
+            if or? ("get" = callee) ["pathGet" = callee] [
+                return (ir2artPath node\args\0) ++ "\\" ++ (ir2artPathKey node\args\1)
+            ]
+        ]
+    ]
+    ir2art node
+]
+
 ir2artCall: function [node][
     if "makeDict" = irCalleeName node\fn -> return ir2artDict node\args
+    if "pathGet" = irCalleeName node\fn -> return ir2artPath node
     ; the shim is only for calls that actually write back. Before
     ; the intrinsic database there was no way to ask, so any call
     ; carrying a path argument got wrapped — `call 'handlers\ok x`
@@ -446,8 +517,30 @@ ir2artCall: function [node][
     if writesThroughRef? node\fn -> refIdx: pathRefArg node\args
     if refIdx >= 0 -> return ir2artRefCall node refIdx
     fnText: ir2art node\fn
+    if key? node "attrs" [
+        loop node\attrs [attrName attrNode][
+            flag: false
+            if isConstNode attrNode [
+                if :logical = type attrNode\value -> if attrNode\value -> flag: true
+            ]
+            if flag -> fnText: fnText ++ "." ++ attrName
+            if not? flag -> fnText: fnText ++ "." ++ attrName ++ ":" ++ (ir2art attrNode)
+        ]
+    ]
     argsText: @[]
-    loop node\args [a][ addItem argsText (ir2art a) ]
+    customTypeArg: "to" = irCalleeName node\fn
+    if "is?" = irCalleeName node\fn -> customTypeArg: true
+    j: 0
+    loop node\args [a][
+        rendered: ir2art a
+        if and? customTypeArg [0 = j] [
+            if and? (isConstNode a) [:string = type a\value] [
+                if prefix? a\value ":" -> rendered: a\value
+            ]
+        ]
+        addItem argsText rendered
+        j: j + 1
+    ]
     if empty? argsText -> return fnText
     jt: joinWith argsText " "
     fnText ++ " " ++ jt
@@ -474,6 +567,15 @@ foldArg: function [a][
     foldNode a
 ]
 
+; Keep definition metadata in a distinct function frame while foldNode
+; recursively descends. The donated host reuses foldNode's own parameter/local
+; slots during recursion, so a local saved beside that recursive call is not
+; sufficient for a nullary dynamic call such as `super`.
+foldBinding: function [opName bindingName expr][
+    foldedExpr: foldNode expr
+    #[op: opName name: bindingName expr: foldedExpr]
+]
+
 foldNode: function [node][
     if not? isIR node -> return node
     op: node\op
@@ -483,17 +585,17 @@ foldNode: function [node][
     if "passthrough" = op -> return node
     if "block" = op -> return node
     if "define" = op [
-        fe: foldNode node\expr
-        return #[op: "define" name: node\name expr: fe]
+        return foldBinding "define" node\name node\expr
     ]
     if "let" = op [
-        fe: foldNode node\expr
-        return #[op: "let" name: node\name expr: fe]
+        return foldBinding "let" node\name node\expr
     ]
     if "call" = op [
         ff: foldNode node\fn
         fa: @[]
         loop node\args [a][ addItem fa (foldNode a) ]
+        foldedAttrs: #[]
+        if key? node "attrs" -> loop node\attrs [name value][ foldedAttrs\[name]: foldNode value ]
         ; fold pure calls over const args by running the kernel
         ; only an intrinsic folds. A call through a name — even a
         ; name spelled `mul` — is whatever that name is bound to at
@@ -503,6 +605,15 @@ foldNode: function [node][
             if pureIntrinsic? ff\name [
                 allConst: true
                 loop fa [a][ if not? isConstNode a -> allConst: false ]
+                ; A preserved custom type is a string such as `":person"`.
+                ; Its conversion depends on the class binding established by
+                ; an earlier statement, so it is never a context-free fold.
+                if and? ("to" = ff\name) [not? empty? fa] [
+                    firstArg: fa\0
+                    if and? (isConstNode firstArg) [:string = type firstArg\value] [
+                        if prefix? firstArg\value ":" -> allConst: false
+                    ]
+                ]
                 if allConst [
                     ; evaluate the pure call by handing it straight to
                     ; the host. Not through runIR: the kernel's
@@ -517,12 +628,12 @@ foldNode: function [node][
                     ; make the compiled program print an error node
                     ; and carry on. Leave the call unfolded so the
                     ; runtime raises the same error the host does.
-                    if isErrorNode res -> return #[op: "call" fn: ff args: fa]
+                    if isErrorNode res -> return #[op: "call" fn: ff args: fa attrs: foldedAttrs]
                     return #[op: "const" value: res]
                 ]
             ]
         ]
-        return #[op: "call" fn: ff args: fa]
+        return #[op: "call" fn: ff args: fa attrs: foldedAttrs]
     ]
     ; every construct op folds by folding its arguments — the shape
     ; of an op is whatever its row's `emit` column declared, so one
@@ -531,7 +642,11 @@ foldNode: function [node][
     if not? null? r [
         fa: @[]
         loop node\args [a][ addItem fa (foldArg a) ]
-        return #[op: op args: fa]
+        folded: #[op: op args: fa]
+        foldedAttrs: #[]
+        if key? node "attrs" -> loop node\attrs [name value][ foldedAttrs\[name]: foldNode value ]
+        if not? empty? foldedAttrs -> folded\attrs: foldedAttrs
+        return folded
     ]
     node
 ]

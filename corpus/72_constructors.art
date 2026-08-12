@@ -1,0 +1,14 @@
+define :car [
+    init: constructor [brand model year]
+]
+
+a: to :car #[brand: "Ford" model: "Mustang" year: 1967]
+b: to :car ["Nissan" "Sunny" 1991]
+print a\brand
+print a\model
+print a\year
+print b\brand
+print b\model
+print b\year
+print type a
+print object? b

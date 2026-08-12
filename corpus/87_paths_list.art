@@ -1,0 +1,9 @@
+print normalize "one/../two/../../three"
+print normalize.executable "myscript"
+write "a" "list-a.txt"
+write "b" "list-b.txt"
+found: select list "." [item][suffix? item ".txt"]
+sort found
+print found
+delete "list-a.txt"
+delete "list-b.txt"

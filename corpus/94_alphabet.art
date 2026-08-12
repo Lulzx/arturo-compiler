@@ -1,0 +1,7 @@
+letters: alphabet 'en
+print size letters
+print first letters
+print last letters
+caps: alphabet.upper 'en
+print first caps
+print last caps

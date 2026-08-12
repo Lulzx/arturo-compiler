@@ -1,0 +1,15 @@
+print type runtimeError
+print runtimeError\label
+
+custom: to :errorKind "Custom"
+defect: $[] -> throw.as: custom "boom"
+err: try -> defect
+
+print type err
+print type err\kind
+print err\kind\label
+print err\message
+print custom = err\kind
+
+ok: try -> null
+print null = ok

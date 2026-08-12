@@ -20,7 +20,7 @@ import ./"backend.art"
 ; bootstrap.art builds — keep in sync with that list
 buildSelfCompiler: function [][
     out: @[]
-    files: ["src/intrinsics.art" "src/semantics.art" "src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
+    files: ["src/intrinsics.art" "src/modules.art" "src/semantics.art" "src/front.art" "src/kernel.art" "src/ir.art" "src/backend.art"]
     loop files [f][
         src: read f
         src: replace src "import ./\"" ++ f ++ "\"\n" ""

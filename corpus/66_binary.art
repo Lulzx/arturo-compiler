@@ -1,0 +1,7 @@
+b: to :binary "ABC"
+print b
+print binary? b
+print type b
+print size b
+print to :string b
+print b = to :binary "ABC"

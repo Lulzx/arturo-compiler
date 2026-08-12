@@ -11,10 +11,10 @@ CFLAGS  ?= -O1 -fvisibility=hidden
 NCCOMP   = tmp/ncomp
 RUNTIME_O = runtime/runtime.o
 RUNTIME_A = runtime/runtime.a
-SOURCES  = src/intrinsics.art src/semantics.art src/front.art src/kernel.art \
+SOURCES  = src/intrinsics.art src/modules.art src/semantics.art src/front.art src/kernel.art \
            src/ir.art src/backend.art src/cbackend.art runtime/runtime.c
 
-.PHONY: ncomp test verify compat coverage check clean
+.PHONY: ncomp test verify upstream compat diagnostics unsupported coverage sanitize check clean
 
 # The native compiler: emitted by its own C backend, linked against runtime.c.
 ncomp: $(NCCOMP)
@@ -22,7 +22,10 @@ ncomp: $(NCCOMP)
 $(NCCOMP): tools/cbnative.art $(SOURCES) $(RUNTIME_A)
 	$(ARTURO) tools/cbnative.art
 
-$(RUNTIME_O): runtime/runtime.c runtime/runtime.h Makefile
+runtime/intrinsic_arity.inc: src/intrinsics.art tools/gen_intrinsic_arity.sh
+	sh tools/gen_intrinsic_arity.sh
+
+$(RUNTIME_O): runtime/runtime.c runtime/runtime.h runtime/intrinsic_arity.inc Makefile
 	$(CC) $(CFLAGS) -c -Iruntime runtime/runtime.c -o $(RUNTIME_O)
 
 $(RUNTIME_A): $(RUNTIME_O)
@@ -36,18 +39,33 @@ test:
 verify: ncomp
 	bash tools/selfhost_test.sh
 
+# Unmodified programs imported from the pinned Arturo upstream suite.
+upstream: ncomp
+	bash tools/upstream_test.sh
+
+diagnostics: ncomp
+	bash tools/diagnostic_test.sh
+
 # Deliberate improvements over pinned host defects have their own expected
 # outputs; they do not belong in the host-parity corpus above.
 compat: ncomp
 	bash tools/compat_test.sh
+
+# Intentionally unavailable capabilities must be rejected by the compiler,
+# before any output executable is produced.
+unsupported: ncomp
+	bash tools/unsupported_test.sh
 
 # Report the native runtime's declared-intrinsic coverage. This is a scope
 # metric, not a correctness metric; `test`/`verify` prove implemented behavior.
 coverage:
 	bash tools/language_coverage.sh
 
-check: test verify compat
+sanitize: ncomp
+	bash tools/sanitize_test.sh
+
+check: coverage test verify upstream compat diagnostics unsupported
 
 clean:
 	rm -f $(NCCOMP) tmp/ncomp_src.art native_compiler
-	rm -f src/*.bcode runtime/*.o runtime/*.a
+	rm -f src/*.bcode runtime/*.o runtime/*.a runtime/intrinsic_arity.inc

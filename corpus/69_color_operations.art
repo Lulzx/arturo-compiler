@@ -1,0 +1,9 @@
+red: to :color "#FF0000"
+gray: to :color "#CCCCCC"
+print blend red gray
+print darken red 0.2
+print darken to :color "#9944CC" 0.3
+print lighten to :color "#9944CC" 0.3
+print grayscale red
+print saturate to :color "#ADD8E6" 0.2
+print desaturate red 0.2

@@ -1,0 +1,247 @@
+;=======================================================
+
+MODULE_IMPORT_STATE: #[next: 0]
+; modules.art — compile-time local dependency resolution
+;
+; Arturo's ordinary local `import` executes a file unscoped at the import
+; position.  For the standalone target that is exactly source inclusion, but
+; dependency lookup must happen while compiling: the produced executable must
+; not need the source tree at run time.
+;
+; Namespace-producing forms (`import.lean`, `import.only`) are deliberately
+; not flattened here.  They require the module/object value representation and
+; are rejected with an actionable compiler diagnostic until that lowering is
+; available.
+;=======================================================
+
+modulePathDir: function [p][
+    lastSlash: neg 1
+    i: 0
+    loop p [ch][
+        if "/" = to :string ch -> lastSlash: i
+        i: i + 1
+    ]
+    if 0 > lastSlash -> return "."
+    if 0 = lastSlash -> return "/"
+    slice p 0 (lastSlash - 1)
+]
+
+modulePathJoin: function [base child][
+    if prefix? child "/" -> return child
+    rel: child
+    if prefix? rel "./" [ rel: slice rel 2 ((size rel) - 1) ]
+    if "/" = base -> return "/" ++ rel
+    base ++ "/" ++ rel
+]
+
+moduleSplitOn: function [text mark][
+    parts: @[]
+    part: ""
+    loop text [ch][
+        piece: to :string ch
+        if mark = piece [
+            parts: parts ++ @[part]
+            part: ""
+        ]
+        if mark <> piece -> part: part ++ piece
+    ]
+    parts ++ @[part]
+]
+
+moduleQuotedPath: function [line][
+    quoteMark: to :string '"'
+    parts: moduleSplitOn line quoteMark
+    if 2 < size parts -> return parts\1
+    null
+]
+
+moduleBracedPath: function [line][
+    left: moduleSplitOn line "{"
+    if 1 >= size left -> return null
+    right: moduleSplitOn left\1 "}"
+    if 0 >= size right -> return null
+    right\0
+]
+
+moduleWords: function [text][
+    words: @[]
+    word: ""
+    loop text [ch][
+        piece: to :string ch
+        if whitespace? piece [
+            if not? empty? word [ words: words ++ @[word] word: "" ]
+        ]
+        if not? whitespace? piece -> word: word ++ piece
+    ]
+    if not? empty? word -> words: words ++ @[word]
+    words
+]
+
+moduleOnlyNames: function [line][
+    if not? contains? line "import.only" -> return @[]
+    left: moduleSplitOn line "["
+    if 1 >= size left -> return @[]
+    right: moduleSplitOn left\1 "]"
+    if 0 >= size right -> return @[]
+    moduleWords right\0
+]
+
+modulePackageEntry: function [infoSource][
+    lines: moduleSplitOn infoSource "\n"
+    loop lines [line][
+        clean: line
+        strip 'clean
+        if prefix? clean "entry:" [
+            if contains? clean "\"" [
+                entry: moduleQuotedPath clean
+                if not? suffix? entry ".art" -> entry: entry ++ ".art"
+                return entry
+            ]
+            if contains? clean "{" [
+                entry: moduleBracedPath clean
+                if not? suffix? entry ".art" -> entry: entry ++ ".art"
+                return entry
+            ]
+            pieces: moduleSplitOn clean ":"
+            if 1 < size pieces [
+                entry: pieces\1
+                strip 'entry
+                if prefix? entry "'" [ entry: slice entry 1 ((size entry) - 1) ]
+                if not? suffix? entry ".art" -> entry: entry ++ ".art"
+                return entry
+            ]
+        ]
+    ]
+    "main.art"
+]
+
+; Return the local path named by a complete import statement, or null when the
+; line is not an import.  Both spellings emitted/accepted by Arturo are owned:
+; `import ./"x.art"` and `import ./{x.art}!`.  A plain quoted filename is also
+; local according to getEntryForPackage and is resolved relative to the file.
+moduleImportPath: function [line][
+    clean: line
+    strip 'clean
+
+    if contains? clean "import.only" [
+        if contains? clean "\"" -> return moduleQuotedPath clean
+        if contains? clean "{" -> return moduleBracedPath clean
+    ]
+    if contains? clean "import.lean" [
+        if contains? clean "\"" -> return moduleQuotedPath clean
+        if contains? clean "{" -> return moduleBracedPath clean
+    ]
+    if prefix? clean "import ./\"" -> return moduleQuotedPath clean
+    if prefix? clean "import ./{" -> return moduleBracedPath clean
+    if prefix? clean "import relative \"" -> return moduleQuotedPath clean
+    if prefix? clean "import relative {" -> return moduleBracedPath clean
+    if prefix? clean "import \"" -> return moduleQuotedPath clean
+    null
+]
+
+moduleJoinLines: function [lines][
+    out: ""
+    firstLine: true
+    loop lines [line][
+        if not? firstLine -> out: out ++ "\n"
+        out: out ++ line
+        firstLine: false
+    ]
+    out
+]
+
+resolveImports: function [src base active][
+    lines: moduleSplitOn src "\n"
+    out: @[]
+    loop lines [line][
+        imported: moduleImportPath line
+        if null? imported [ out: out ++ @[line] ]
+        if not? null? imported [
+            leanImport: contains? line "import.lean"
+            onlyImport: contains? line "import.only"
+            if and? leanImport onlyImport [
+                panic "compile-time import: combined import.lean.only is not yet supported"
+            ]
+            fullPath: modulePathJoin base imported
+            if contains? active fullPath [
+                panic "compile-time import cycle: " ++ fullPath
+            ]
+            if directory? fullPath [
+                packageDir: fullPath
+                entryName: "main.art"
+                infoPath: modulePathJoin packageDir "info.art"
+                infoSource: read infoPath
+                if not? empty? infoSource [ entryName: modulePackageEntry infoSource ]
+                fullPath: modulePathJoin packageDir entryName
+            ]
+            importedSource: read fullPath
+            ; Arturo treats a directory containing main.art as a local package.
+            ; Resolve that conventional entry point without leaving a runtime
+            ; dependency on the package directory.
+            if empty? importedSource [
+                packageMain: modulePathJoin fullPath "main.art"
+                packageSource: read packageMain
+                if not? empty? packageSource [
+                    fullPath: packageMain
+                    importedSource: packageSource
+                ]
+            ]
+            if empty? importedSource [
+                panic "compile-time import not found or empty: " ++ fullPath
+            ]
+            nextActive: active ++ @[fullPath]
+            expanded: resolveImports importedSource (modulePathDir fullPath) nextActive
+            if and? (not? leanImport) (not? onlyImport) -> out: out ++ @[expanded]
+            if leanImport [
+                clean: line
+                strip 'clean
+                replacement: @[]
+                if contains? clean ":" [
+                    beforeColon: moduleSplitOn clean ":"
+                    bindingName: beforeColon\0
+                    bindingLabel: bindingName ++ ":"
+                    replacement: replacement ++ @[bindingLabel]
+                ]
+                replacement: replacement ++ @["dictionary [" expanded "]"]
+                replacementText: moduleJoinLines replacement
+                out: out ++ @[replacementText]
+            ]
+            if onlyImport [
+                MODULE_IMPORT_STATE\next: MODULE_IMPORT_STATE\next + 1
+                seqText: to :string MODULE_IMPORT_STATE\next
+                tempName: "__module_import_" ++ seqText
+                tempLabel: tempName ++ ":"
+                replacement: @[tempLabel "dictionary [" expanded "]"]
+                selected: moduleOnlyNames line
+                loop selected [selectedName][
+                    cleanName: selectedName
+                    if prefix? cleanName "'" [
+                        cleanName: slice cleanName 1 ((size cleanName) - 1)
+                    ]
+                    selectedLabel: cleanName ++ ":"
+                    selectedPath: tempName ++ "\\" ++ cleanName
+                    replacement: replacement ++ @[selectedLabel selectedPath]
+                ]
+                replacementText: moduleJoinLines replacement
+                out: out ++ @[replacementText]
+            ]
+        ]
+    ]
+    moduleJoinLines out
+]
+
+resolveImportsFromFile: function [path][
+    MODULE_IMPORT_STATE\next: 0
+    fullPath: path
+    ; Imported Arturo functions remember their definition file, so a relative
+    ; `read path` here would be resolved next to modules.art on the host.  CLI
+    ; input paths are relative to the invoking working directory instead.
+    if not? prefix? fullPath "/" [
+        cwd: execute "pwd"
+        strip 'cwd
+        fullPath: modulePathJoin cwd fullPath
+    ]
+    src: read fullPath
+    if empty? src [ panic "compile input not found or empty: " ++ fullPath ]
+    resolveImports src (modulePathDir fullPath) @[fullPath]
+]

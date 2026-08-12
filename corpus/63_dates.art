@@ -1,0 +1,10 @@
+d: to :date "2020-05-17T00:00:00+00:00"
+print d
+print type d
+print date? d
+print past? d
+print sunday? d
+print monday? d
+current: now
+print date? current
+print today? current

@@ -1,0 +1,2 @@
+print unescape "a\\nb\\tc"
+print unescape.html "a &amp; b &lt; c &#65;"

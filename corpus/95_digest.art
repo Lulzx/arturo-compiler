@@ -1,0 +1,2 @@
+print digest "Hello world"
+print digest.sha "Hello world"

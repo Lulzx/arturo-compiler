@@ -1,0 +1,12 @@
+q: to :quantity [3 "m"]
+print q
+print type q
+print quantity? q
+print unit? units q
+print to :string q
+print to :floating q
+print scalar q
+print q --> "cm"
+print q + to :quantity [200 "cm"]
+print q * 2
+print (to :quantity [1 "h"]) --> "min"

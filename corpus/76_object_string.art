@@ -1,0 +1,7 @@
+define :person [
+    init: constructor [name]
+    string: method []["person:" ++ this\name]
+]
+
+a: to :person ["Ada"]
+print a
