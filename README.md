@@ -46,11 +46,14 @@ every time it runs.
 
 The native parity harness compares stdout, stderr, process exit status, and
 filesystem effects in isolated working directories. It is proven on 110 local
-cases, thirty-two unmodified pinned-upstream programs, and the compiler's own source—not on the
-whole language; constructs the compiler does not yet own (see the backlog in
-`SPEC.md`) are outside the proof until a corpus program pins them. Finally,
-documented host defects may be corrected rather than reproduced; those cases
-are compatibility exceptions and are not part of the byte-identical claim.
+cases, thirty-two unmodified pinned-upstream programs, and the compiler's own
+source—not on the whole language; constructs the compiler does not yet own (see
+the backlog in `SPEC.md`) are outside the proof until a corpus program pins
+them. Finally, documented host defects may be corrected rather than reproduced;
+those cases are compatibility exceptions and are not part of the byte-identical
+claim. Beyond the harness, the compiler also builds a real pinned ecosystem
+program end to end: `demo/getbuiltins.art` compiles natively and runs without
+the VM (see `demo/README.md`).
 
 ### Known host compatibility exception
 
@@ -85,19 +88,27 @@ Or by hand:
 ## Files
 
     src/intrinsics.art   GENERATED: builtin arities, read off Arturo's source
+    src/modules.art      compile-time import resolution
+    src/semantics.art    non-generated judgements the compiler must make
     src/front.art        lex + lower
     src/kernel.art       the rule table, its dispatchers, runIR
     src/ir.art           IR + constant folding
     src/backend.art      runIR; shells out to -c / -x
     src/cbackend.art     C emitter
     src/compiler.art     entry point
-    tools/extract_intrinsics.art  the generator
-    tools/cbnative.art            build the native compiler
-    tools/selfhost_test.sh        the self-hosting proof
-    corpus/                       one program per rule
-    compat/                       deliberate host-defect fixes
-    SPEC.md                       the full design
-    CONTRIBUTING.md               how to add a construct
+    runtime/runtime.c    the native runtime linked into every compiled binary
+    runtime/runtime.h    its value model and IR-builder API
+    config/intrinsic-policy.tsv  per-intrinsic compatibility dispositions
+    fixtures/            modules/package/unsupported fixtures for the tests
+    tools/extract_intrinsics.art      the generator
+    tools/gen_intrinsic_arity.sh      emit the C runtime arity table
+    tools/cbnative.art               build the native compiler
+    tools/selfhost_test.sh            the self-hosting proof
+    corpus/                          one program per rule
+    compat/                          deliberate host-defect fixes
+    demo/                            a real ecosystem program, compiled natively
+    SPEC.md                          the full design
+    CONTRIBUTING.md                  how to add a construct
 
 Built against Arturo 0.10.0, pinned to the revision in `corpus/m1/RESULTS.md`.
 CI downloads the prebuilt `v0.10.0` release binary on Linux and macOS before
