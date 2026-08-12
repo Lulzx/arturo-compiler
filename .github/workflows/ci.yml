@@ -23,7 +23,7 @@ jobs:
         uses: arturo-lang/setup-arturo@v2
         with:
           do: compile
-          src: d8079c6bd4ed170bfd8c5b786a38fd52a9527e97
+          src: v0.10.0
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Differential, native, and compatibility checks
         run: make check
