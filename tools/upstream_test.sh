@@ -3,7 +3,7 @@
 # upstream revision.  Each engine gets an isolated working directory and all
 # externally visible effects are compared.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 root=$PWD
 work=$(mktemp -d /tmp/arturo-upstream.XXXXXX)
 trap 'rm -rf "$work"' EXIT
@@ -58,4 +58,4 @@ for source in upstream/*/*.art; do
 done
 
 echo "== upstream parity: pass=$pass fail=$fail buildfail=$buildfail =="
-test "$fail" -eq 0 -a "$buildfail" -eq 0
+test "$fail" -eq 0 && test "$buildfail" -eq 0

@@ -4,7 +4,7 @@
 # effects all match; keeping stderr merged into stdout used to hide ordering and
 # status mismatches.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 root=$PWD
 work=$(mktemp -d /tmp/arturo-selfhost.XXXXXX)
 trap 'rm -rf "$work"' EXIT
@@ -60,4 +60,4 @@ for f in corpus/*.art; do
     fi
 done
 echo "== selfnative==host: pass=$pass fail=$fail buildfail=$buildfail =="
-test "$fail" -eq 0 -a "$buildfail" -eq 0
+test "$fail" -eq 0 && test "$buildfail" -eq 0

@@ -3,7 +3,7 @@
 # remains on stdout, and every uncaught failure exits nonzero. Paths are
 # normalized only so checked-in expectations are independent of checkout root.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 root=$PWD
 work=$(mktemp -d /tmp/arturo-diagnostics.XXXXXX)
 trap 'rm -rf "$work"' EXIT

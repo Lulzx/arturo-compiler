@@ -45,7 +45,7 @@ output is byte-identical to the host interpreter. `make verify` proves it
 every time it runs.
 
 The native parity harness compares stdout, stderr, process exit status, and
-filesystem effects in isolated working directories. It is proven on 110 local
+filesystem effects in isolated working directories. It is proven on 111 local
 cases, thirty-two unmodified pinned-upstream programs, and the compiler's own
 source—not on the whole language; constructs the compiler does not yet own (see
 the backlog in `SPEC.md`) are outside the proof until a corpus program pins
