@@ -66,6 +66,18 @@ INFIX_SYMBOLS: #[]
 PREFIX_SYMBOLS: #[]
 MUTATES: #[]
 
+; Host stdlib words (sum, first, last, max, min, ...) are NOT compiled
+; opcodes: the host dispatches them through the symbol table, so a user
+; function of the same name shadows them. Compiled builtins (add, size,
+; print, ...) always win. Empirically classified against the host.
+SHADOWABLE: #[
+    sum: true first: true last: true max: true min: true
+    upper: true lower: true sort: true filter: true fold: true until: true
+    abs: true floor: true ceil: true round: true sqrt: true trim: true strip: true
+    repeat: true contains?: true key?: true values: true keys: true push: true pop: true
+    remove: true insert: true type: true empty: true index: true
+]
+
 loop INTRINSICS [nm spec][
     BUILTIN_ARITY\[nm]: spec\arity
     if spec\infix? [

@@ -65,14 +65,36 @@ cCharValue: function [v][
     if expressed = "'+'" [ return "v_char(43)" ]
     text: to :string v
     if 0 = size text [ return "v_char(39)" ]
-    "v_char(" ++ (quoteC text) ++ "[0])"
+    "v_char_text(" ++ (quoteC text) ++ ")"
 ]
 
 ; render an Arturo constant as a C runtime expression.
+intFitsI64: function [text][
+    neg: false
+    body: text
+    if 0 < size text [
+        if "-" = get text 0 [
+            neg: true
+            body: slice text 1 dec (size text)
+        ]
+    ]
+    if 19 < size body [ return false ]
+    if 19 = size body [
+        limit: "9223372036854775807"
+        if neg [ limit: "9223372036854775808" ]
+        if limit < body [ return false ]
+    ]
+    true
+]
+cIntValue: function [v][
+    text: to :string v
+    if intFitsI64 text [ return "v_int(" ++ text ++ ")" ]
+    "v_bigint_text(" ++ (quoteC text) ++ ")"
+]
 cValue: function [v][
     t: type v
     case t [
-        :integer -> "v_int(" ++ (to :string v) ++ ")"
+        :integer -> cIntValue v
         :floating -> "v_float_text(" ++ (quoteC (to :string v)) ++ ")"
         :rational -> "v_rational(" ++ (to :string (numerator v)) ++ ", " ++ (to :string (denominator v)) ++ ")"
         :complex -> cComplexValue v
@@ -92,13 +114,13 @@ cValue: function [v][
         :string  -> "v_str(" ++ (quoteC v) ++ ")"
         :word    -> cWordValue v
         :label   -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
-        :literal -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
-        :symbol  -> "v_str(" ++ (quoteC (to :string v)) ++ ")"
+        :literal -> "v_token(V_LITERAL, " ++ (quoteC (to :string v)) ++ ")"
+        :symbol  -> "v_token(V_SYMBOL, " ++ (quoteC (to :string v)) ++ ")"
         :symbolliteral -> "v_token(V_SYMBOLLITERAL, " ++ (quoteC (to :string v)) ++ ")"
         :attribute -> "v_token(V_ATTRIBUTE, " ++ (quoteC (to :string v)) ++ ")"
         :attributelabel -> "v_token(V_ATTRIBUTELABEL, " ++ (quoteC (to :string v)) ++ ")"
         :pathliteral -> cPath v
-        :type    -> "v_str(" ++ (quoteC (":" ++ (to :string v))) ++ ")"
+        :type    -> "v_token(V_TYPE, " ++ (quoteC (":" ++ (to :string v))) ++ ")"
         :null    -> "v_null()"
     ]
 ]
@@ -724,14 +746,17 @@ nativeExpr: function [n state][
     if :dictionary <> type n [
         if :null = type n [ return nativeResult true "null" "0" ]
         rawType: type n
-        if :integer = rawType [ return nativeResult true "int" (to :string n) ]
-        if :floating = rawType [ return nativeResult true "float" (to :string n) ]
+        if :integer = rawType [
+            if intFitsI64 (to :string n) [ return nativeResult true "int" (to :string n) ]
+            return nativeFail
+        ]
+        if :floating = rawType [ return nativeFail ]
         if :char = rawType [ return nativeFail ]
         if :string = rawType [ return nativeResult true "string" (quoteC n) ]
         if :word = rawType [ return nativeResult true "string" (quoteC (to :string n)) ]
-        if :literal = rawType [ return nativeResult true "string" (quoteC (to :string n)) ]
-        if :symbol = rawType [ return nativeResult true "string" (quoteC (to :string n)) ]
-        if :type = rawType [ return nativeResult true "string" (quoteC (":" ++ (to :string n))) ]
+        if :literal = rawType [ return nativeFail ]
+        if :symbol = rawType [ return nativeFail ]
+        if :type = rawType [ return nativeFail ]
         if :logical = rawType [
             if n [ return nativeResult true "bool" "1" ]
             return nativeResult true "bool" "0"
@@ -744,11 +769,14 @@ nativeExpr: function [n state][
     if "const" = op [
         if :null = type n\value [ return nativeResult true "null" "0" ]
         t: type n\value
-        if :integer = t [ return nativeResult true "int" (to :string n\value) ]
-        if :floating = t [ return nativeResult true "float" (to :string n\value) ]
+        if :integer = t [
+            if intFitsI64 (to :string n\value) [ return nativeResult true "int" (to :string n\value) ]
+            return nativeFail
+        ]
+        if :floating = t [ return nativeFail ]
         if :char = t [ return nativeFail ]
         if :string = t [ return nativeResult true "string" (quoteC n\value) ]
-        if :type = t [ return nativeResult true "string" (quoteC (":" ++ (to :string n\value))) ]
+        if :type = t [ return nativeFail ]
         if :logical = t [
             if n\value [ return nativeResult true "bool" "1" ]
             return nativeResult true "bool" "0"

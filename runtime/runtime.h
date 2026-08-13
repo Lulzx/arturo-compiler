@@ -18,7 +18,8 @@ typedef enum {
     V_BLOCK, V_DICT, V_FUNC, V_BUILTIN, V_RANGE, V_PATH,
     V_WORD, V_LABEL, V_LITERAL, V_SYMBOL, V_SYMBOLLITERAL, V_TYPE, V_VERSION, V_ERRORKIND, V_INLINE,
     V_PATHLABEL, V_PATHLITERAL, V_REGEX, V_ATTRIBUTE, V_ATTRIBUTELABEL,
-    V_ERROR
+    V_ERROR,
+    V_BIGINT
 } VKind;
 
 typedef struct Value Value;
@@ -49,7 +50,7 @@ struct Value {
         struct { unsigned char *data; size_t len; } binary; /* V_BINARY */
         struct { char *message; char *kind; } error; /* V_ERROR */
         char       *s;          /* V_STR  */
-        char        c;          /* V_CHAR */
+        char        c[5];       /* V_CHAR — UTF-8 (up to 4 bytes + NUL) */
         int         b;          /* V_BOOL */
         struct { long lo; long hi; long step; int character; int infinite; } range;   /* V_RANGE */
         struct { char **segs; int nsegs; Value *segv; } path;  /* V_PATH (segv=segment Values for to :block) */
@@ -70,6 +71,8 @@ struct Dict {
 /* value constructors */
 Value v_null(void);
 Value v_int(long i);
+Value v_bigint_text(const char *text);  /* arbitrary-precision integer (V_BIGINT) */
+Value v_bigint_i128(__int128 i);        /* from a value that overflows int64 */
 Value v_float(double f);
 Value v_float_text(const char *text);
 Value v_rational(long numerator, long denominator);
@@ -82,6 +85,7 @@ Value v_color_hex(const char *hex);
 Value v_binary_text(const char *text);
 Value v_str(const char *s);          /* copies */
 Value v_char(char c);
+Value v_char_text(const char *s);  /* UTF-8 char (up to 4 bytes) */
 Value v_bool(int b);
 Value v_error(const char *message);
 Value v_version(const char *version);

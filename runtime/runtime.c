@@ -142,6 +142,16 @@ static size_t checked_mul_size(size_t left,size_t right,const char *operation){
     return left*right;
 }
 static char *seg_text(Value v);
+static Value runNode0(Env *e, IR *node);
+static Value apply_tail_two(Env *e, Value second, Value last);
+static int node_is_stmt(IR *node);
+static int is_shadowable(const char *name);
+static int utf8_codepoint(const char *s);
+static int utf8_rune_len(const char *s);
+static int rune_count(const char *s);
+static const char *rune_offset(const char *s, int i);
+static void rune_at(const char *s, char out[5]);
+static const char *last_rune(const char *s);
 static Value v_block_cpy(Value **items, int n);
 static char *fstr(double f, char *out, size_t cap);
 static char *val_str(Value v);
@@ -586,13 +596,14 @@ static uint64_t hash_farm(const unsigned char*s,size_t n){
     return hash_len16(hash_len16(v0,w0,m)+hash_shiftmix(y)*k0+z,hash_len16(v1,w1,m)+x,m);
 }
 static int art_kind(Value v){switch(v.k){
-    case V_NULL:return 0;case V_BOOL:return 1;case V_INT:return 2;case V_FLOAT:return 3;case V_COMPLEX:return 4;case V_RATIONAL:return 5;case V_VERSION:return 6;case V_TYPE:return 7;case V_CHAR:return 8;case V_STR:return 9;case V_WORD:return 10;case V_LITERAL:return 11;case V_LABEL:return 12;case V_ATTRIBUTE:return 13;case V_ATTRIBUTELABEL:return 14;case V_PATH:return 15;case V_PATHLABEL:return 16;case V_PATHLITERAL:return 17;case V_SYMBOL:return 18;case V_SYMBOLLITERAL:return 19;case V_UNIT:return 20;case V_QUANTITY:return 21;case V_ERROR:return 22;case V_ERRORKIND:return 23;case V_REGEX:return 24;case V_COLOR:return 25;case V_DATE:return 26;case V_BINARY:return 27;case V_DICT:return 28;case V_FUNC:case V_BUILTIN:return 31;case V_INLINE:return 33;case V_BLOCK:return 34;case V_RANGE:return 36;default:return 44;}}
+    case V_NULL:return 0;case V_BOOL:return 1;case V_INT:return 2;case V_BIGINT:return 45;case V_FLOAT:return 3;case V_COMPLEX:return 4;case V_RATIONAL:return 5;case V_VERSION:return 6;case V_TYPE:return 7;case V_CHAR:return 8;case V_STR:return 9;case V_WORD:return 10;case V_LITERAL:return 11;case V_LABEL:return 12;case V_ATTRIBUTE:return 13;case V_ATTRIBUTELABEL:return 14;case V_PATH:return 15;case V_PATHLABEL:return 16;case V_PATHLITERAL:return 17;case V_SYMBOL:return 18;case V_SYMBOLLITERAL:return 19;case V_UNIT:return 20;case V_QUANTITY:return 21;case V_ERROR:return 22;case V_ERRORKIND:return 23;case V_REGEX:return 24;case V_COLOR:return 25;case V_DATE:return 26;case V_BINARY:return 27;case V_DICT:return 28;case V_FUNC:case V_BUILTIN:return 31;case V_INLINE:return 33;case V_BLOCK:return 34;case V_RANGE:return 36;default:return 44;}}
 static uint64_t art_hash(Value v){
     uint64_t h=hash_wang((uint64_t)art_kind(v));
     switch(v.k){
         case V_NULL:break;case V_BOOL:h=hash_mix(h,v.u.b?UINT64_C(4):UINT64_C(8));break;case V_INT:h=hash_mix(h,(uint64_t)v.u.i);break;
+        case V_BIGINT:h=hash_mix(h,hash_farm((const unsigned char*)v.u.s,strlen(v.u.s)));break;
         case V_FLOAT:{uint64_t bits;memcpy(&bits,&v.u.f,8);h=hash_mix(h,bits);break;}
-        case V_CHAR:h=hash_mix(h,(unsigned char)v.u.c);break;
+        case V_CHAR:h=hash_mix(h,(uint64_t)utf8_codepoint(v.u.c));break;
         case V_STR:case V_WORD:case V_LITERAL:case V_LABEL:case V_ATTRIBUTE:case V_ATTRIBUTELABEL:case V_TYPE:case V_VERSION:case V_ERRORKIND:case V_REGEX:h=hash_mix(h,hash_farm((const unsigned char*)v.u.s,strlen(v.u.s)));break;
         case V_ERROR:h=hash_mix(h,hash_farm((const unsigned char*)v.u.error.message,strlen(v.u.error.message)));break;
         case V_RATIONAL:h=hash_mix(h,(uint64_t)v.u.rational.num);h=hash_mix(h,(uint64_t)v.u.rational.den);break;
@@ -634,7 +645,8 @@ static const char *object_type_name(Value v){
     return marked?name:NULL;
 }
 Value v_bool(int b) { Value v; memset(&v,0,sizeof v); v.k=V_BOOL;  v.u.b=b; return v; }
-Value v_char(char c){ Value v; memset(&v,0,sizeof v); v.k=V_CHAR;  v.u.c=c; return v; }
+Value v_char(char c){ Value v; memset(&v,0,sizeof v); v.k=V_CHAR; v.u.c[0]=c; v.u.c[1]=0; return v; }
+Value v_char_text(const char *s){ Value v; memset(&v,0,sizeof v); v.k=V_CHAR; size_t n=strlen(s); if(n>4)n=4; memcpy(v.u.c,s,n); v.u.c[n]=0; return v; }
 Value v_str(const char *s) {
     Value v; memset(&v,0,sizeof v); v.k=V_STR;
     v.u.s = (char*)xmalloc(strlen(s)+1); strcpy(v.u.s, s);
@@ -711,6 +723,57 @@ static Value clone_value(Value v){
     }
 }
 /* the string form of a path segment value (for runtime path ops). */
+/* decode the first UTF-8 code point at s (validated on the fly); returns the
+ * code point, or the raw byte when not valid multi-byte UTF-8. */
+static int utf8_codepoint(const char *s){
+    unsigned char c = (unsigned char)*s;
+    if (c < 0x80) return c;
+    if ((c & 0xE0) == 0xC0 && (unsigned char)s[1] >= 0x80 && (unsigned char)s[1] < 0xC0)
+        return ((c & 0x1F) << 6) | ((unsigned char)s[1] & 0x3F);
+    if ((c & 0xF0) == 0xE0 && (unsigned char)s[1] >= 0x80 && (unsigned char)s[1] < 0xC0 &&
+        (unsigned char)s[2] >= 0x80 && (unsigned char)s[2] < 0xC0)
+        return ((c & 0x0F) << 12) | (((unsigned char)s[1] & 0x3F) << 6) | ((unsigned char)s[2] & 0x3F);
+    if ((c & 0xF8) == 0xF0 && (unsigned char)s[1] >= 0x80 && (unsigned char)s[1] < 0xC0 &&
+        (unsigned char)s[2] >= 0x80 && (unsigned char)s[2] < 0xC0 &&
+        (unsigned char)s[3] >= 0x80 && (unsigned char)s[3] < 0xC0)
+        return ((c & 0x07) << 18) | (((unsigned char)s[1] & 0x3F) << 12) |
+               (((unsigned char)s[2] & 0x3F) << 6) | ((unsigned char)s[3] & 0x3F);
+    return c;
+}
+/* number of bytes of the first UTF-8 rune at s */
+static int utf8_rune_len(const char *s){
+    unsigned char c = (unsigned char)*s;
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+/* number of runes in a UTF-8 string */
+static int rune_count(const char *s){
+    int n = 0;
+    while (*s){ n++; s += utf8_rune_len(s); }
+    return n;
+}
+/* pointer to the start of rune index i in s */
+static const char *rune_offset(const char *s, int i){
+    const char *p = s;
+    while (i-- > 0 && *p) p += utf8_rune_len(p);
+    return p;
+}
+/* the rune at byte position p of s, as a NUL-terminated UTF-8 buffer */
+static void rune_at(const char *s, char out[5]){
+    int len = utf8_rune_len(s);
+    memcpy(out, s, (size_t)len);
+    out[len] = 0;
+}
+/* pointer to the start of the last rune in s */
+static const char *last_rune(const char *s){
+    const char *p = s, *q = s;
+    while (*p){ q = p; p += utf8_rune_len(p); }
+    return q;
+}
+
 static char *seg_text(Value v){
     if(v.k==V_INT){ char b[64]; snprintf(b,sizeof b,"%ld",v.u.i); return strdup(b); }
     if(v.k==V_FLOAT){ char b[64]; snprintf(b,sizeof b,"%g",v.u.f); return strdup(b); }
@@ -722,7 +785,29 @@ static char *seg_text(Value v){
 int v_truthy(Value v) {
     if (v.k==V_NULL) return 0;
     if (v.k==V_BOOL) return v.u.b;
+    if (v.k==V_BIGINT) return strcmp(v.u.s,"0")!=0;
     return 1;
+}
+
+/* host range rendering: `` `a`..`z` `` for char ranges, `1..3` numeric, a
+ * trailing ` (step)` only when |step| != 1 (matches vrange.nim). */
+static void range_text(Value v, char *buf, size_t cap){
+    if (v.u.range.character){
+        snprintf(buf, cap, "`%c`..", (char)v.u.range.lo);
+        size_t l = strlen(buf);
+        if (v.u.range.infinite) snprintf(buf + l, cap - l, "∞");
+        else snprintf(buf + l, cap - l, "`%c`", (char)v.u.range.hi);
+    } else {
+        snprintf(buf, cap, "%ld..", v.u.range.lo);
+        size_t l = strlen(buf);
+        if (v.u.range.infinite) snprintf(buf + l, cap - l, "∞");
+        else snprintf(buf + l, cap - l, "%ld", v.u.range.hi);
+    }
+    if (v.u.range.step != 1 && v.u.range.step != -1){
+        long s = v.u.range.step < 0 ? -v.u.range.step : v.u.range.step;
+        size_t l = strlen(buf);
+        snprintf(buf + l, cap - l, " (%ld)", s);
+    }
 }
 
 /* Arturo print: print the value, then a newline. Strings print raw. A block
@@ -753,7 +838,8 @@ static void print_scalar(Value v) {
             fwrite(v.u.s,1,strlen(v.u.s),stdout); break;
         case V_ERROR: printf("%s: %s",v.u.error.kind?v.u.error.kind:"Runtime Error",v.u.error.message?v.u.error.message:""); break;
         case V_VERSION: case V_ERRORKIND: fputs(v.u.s?v.u.s:"",stdout); break;
-        case V_CHAR:  putchar(v.u.c); break;
+        case V_CHAR:  fputs(v.u.c, stdout); break;
+        case V_BIGINT: fputs(v.u.s?v.u.s:"0", stdout); break;
         case V_BOOL:  printf(v.u.b ? "true" : "false"); break;
         case V_DICT: {
             const char *objectType=object_type_name(v);
@@ -773,7 +859,7 @@ static void print_scalar(Value v) {
             break;
         case V_FUNC: printf("function"); break;
         case V_BUILTIN: printf("<function:builtin>"); break;
-        case V_RANGE: printf("%ld..%ld", v.u.range.lo, v.u.range.hi); break;
+        case V_RANGE: { char rb[64]; range_text(v, rb, sizeof rb); printf("%s", rb); break; }
         case V_PATH:
             for (int i=0;i<v.u.path.nsegs;i++){ if(i)printf("\\"); printf("%s",v.u.path.segs[i]); }
             break;
@@ -921,26 +1007,273 @@ static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
         }
     }
     rt_ret_set=0;
-    Value r = runSeq(child, fn.u.fn.body, fn.u.fn.nbody);
+    Value r = v_null(), second = v_null();
+    for (int i=0;i<fn.u.fn.nbody;i++){
+        second = r;
+        r = runNode0(child, fn.u.fn.body[i]);
+        if (rt_ret_set || rt_brk_set || rt_cont_set) break;
+    }
     for(int i=0;i<fn.u.fn.nexports;i++)if(env_find(child,fn.u.fn.exports[i])>=0)env_set(child->parent,fn.u.fn.exports[i],env_get(child,fn.u.fn.exports[i]));
     if (rt_ret_set) { rt_ret_set=0; return rt_ret_val; }
+    if (fn.u.fn.nbody == 2 && !node_is_stmt(fn.u.fn.body[0]) && !node_is_stmt(fn.u.fn.body[1])) return apply_tail_two(child, second, r);
     return r;
 }
 
 /* ---- builtins ------------------------------------------------------------- */
 
 /* numeric/string/char coercion helpers */
+/* host `add`/`sub`/`mul`/`div`/`mod`/`pow` accept only numeric-like operands:
+ * integer, floating, rational, complex, quantity, color. Char and logical
+ * operands are rejected (`'a' + 1`, `5 + true` error), matching the host. */
+static int is_numeric_kind(Value v){
+    return v.k==V_INT||v.k==V_FLOAT||v.k==V_RATIONAL||v.k==V_COMPLEX||v.k==V_QUANTITY||v.k==V_COLOR||v.k==V_BIGINT;
+}
+
+/* ---- arbitrary-precision integers (V_BIGINT) -------------------------------
+ * The host promotes int64 overflow to big integers (`2 ^ 63`,
+ * `9223372036854775807 + 1`). The native runtime keeps normal values as int64
+ * and uses decimal-string bigints only when the magnitude overflows. */
+Value v_bigint_text(const char *text){ Value v; memset(&v,0,sizeof v); v.k=V_BIGINT; v.u.s=strdup(text); return v; }
+Value v_bigint_i128(__int128 i){
+    int negative = i < 0;
+    unsigned __int128 x = negative ? (unsigned __int128)(-(i+1)) + 1u : (unsigned __int128)i;
+    char buf[64]; char *p = buf + sizeof buf - 1; *p = 0;
+    do { *--p = (char)('0' + (int)(x % 10)); x /= 10; } while (x);
+    if (negative) *--p = '-';
+    return v_bigint_text(p);
+}
+static int big_neg(const char *s){ return s && s[0] == '-'; }
+static const char *big_abs(const char *s){ return big_neg(s) ? s + 1 : s; }
+/* strip leading zeros (keeps one digit) */
+static const char *big_norm(const char *s){
+    const char *p = s;
+    while (p[0] == '0' && p[1]) p++;
+    return p;
+}
+/* compare |a| vs |b| digit strings; returns <0,0,>0 */
+static int big_cmp_abs(const char *a, const char *b){
+    a = big_norm(a); b = big_norm(b);
+    size_t la = strlen(a), lb = strlen(b);
+    if (la != lb) return la < lb ? -1 : 1;
+    return strcmp(a, b);
+}
+static int big_cmp(const char *a, const char *b){
+    int an = big_neg(a), bn = big_neg(b);
+    if (an != bn) return an ? -1 : 1;
+    int c = big_cmp_abs(a, b);
+    return an ? -c : c;
+}
+/* |a| + |b| -> new string (no sign) */
+static char *big_add_abs(const char *a, const char *b){
+    size_t la = strlen(a), lb = strlen(b);
+    size_t cap = (la > lb ? la : lb) + 2;
+    char *out = xmalloc(cap); size_t at = 0;
+    int carry = 0;
+    for (size_t i = 0; i < cap - 1; i++){
+        int da = i < la ? a[la-1-i] - '0' : 0;
+        int db = i < lb ? b[lb-1-i] - '0' : 0;
+        int sum = da + db + carry;
+        out[at++] = (char)('0' + sum % 10);
+        carry = sum / 10;
+        if (i + 1 >= la && i + 1 >= lb && !carry) break;
+    }
+    if (carry) out[at++] = (char)('0' + carry);
+    out[at] = 0;
+    for (size_t i = 0, j = at - 1; i < j; i++, j--){ char t = out[i]; out[i] = out[j]; out[j] = t; }
+    return out;
+}
+/* |a| - |b| (requires |a| >= |b|) -> new string (no sign) */
+static char *big_sub_abs(const char *a, const char *b){
+    size_t la = strlen(a), lb = strlen(b);
+    size_t cap = la + 1;
+    char *out = xmalloc(cap); size_t at = 0;
+    int borrow = 0;
+    for (size_t i = 0; i < la; i++){
+        int da = a[la-1-i] - '0';
+        int db = i < lb ? b[lb-1-i] - '0' : 0;
+        int d = da - db - borrow;
+        if (d < 0){ d += 10; borrow = 1; } else borrow = 0;
+        out[at++] = (char)('0' + d);
+    }
+    while (at > 1 && out[at-1] == '0') at--;
+    out[at] = 0;
+    for (size_t i = 0, j = at - 1; i < j; i++, j--){ char t = out[i]; out[i] = out[j]; out[j] = t; }
+    return out;
+}
+static char *big_add(const char *a, const char *b){
+    int an = big_neg(a), bn = big_neg(b);
+    if (an == bn){
+        char *r = big_add_abs(big_abs(a), big_abs(b));
+        if (an){ char *s = xmalloc(strlen(r) + 2); s[0] = '-'; strcpy(s + 1, r); free(r); return s; }
+        return r;
+    }
+    int c = big_cmp_abs(a, b);
+    if (c == 0) return strdup("0");
+    const char *bigger = c > 0 ? a : b, *smaller = c > 0 ? b : a;
+    char *r = big_sub_abs(big_abs(bigger), big_abs(smaller));
+    if (big_neg(bigger) && strcmp(r, "0")){ char *s = xmalloc(strlen(r) + 2); s[0] = '-'; strcpy(s + 1, r); free(r); return s; }
+    return r;
+}
+static char *big_sub(const char *a, const char *b){
+    int bn = big_neg(b);
+    char *nb = xmalloc(strlen(b) + 2);
+    if (bn){ strcpy(nb, b + 1); } else { nb[0] = '-'; strcpy(nb + 1, b); }
+    char *r = big_add(a, nb);
+    free(nb);
+    return r;
+}
+static char *big_mul(const char *a, const char *b){
+    int negative = big_neg(a) != big_neg(b);
+    const char *A = big_abs(a), *B = big_abs(b);
+    size_t la = strlen(A), lb = strlen(B);
+    if (strcmp(A,"0")==0 || strcmp(B,"0")==0) return strdup("0");
+    size_t cap = la + lb + 2;
+    char *res = xmalloc(cap); memset(res, '0', cap - 1); res[cap-1] = 0;
+    for (size_t i = 0; i < la; i++){
+        int da = A[la-1-i] - '0';
+        if (!da) continue;
+        int carry = 0;
+        for (size_t j = 0; j < lb; j++){
+            int db = B[lb-1-j] - '0';
+            size_t pos = cap - 2 - (i + j);
+            int cur = (res[pos] - '0') + da * db + carry;
+            res[pos] = (char)('0' + cur % 10);
+            carry = cur / 10;
+        }
+        size_t pos = cap - 2 - (i + lb);
+        while (carry){ int cur = (res[pos] - '0') + carry % 10; res[pos] = (char)('0' + cur % 10); carry = cur / 10; if (pos) pos--; else break; }
+    }
+    const char *norm = big_norm(res);
+    char *out;
+    if (negative){
+        out = xmalloc(strlen(norm) + 2); out[0] = '-'; strcpy(out + 1, norm);
+    } else {
+        out = strdup(norm);
+    }
+    free(res);
+    return out;
+}
+static char *big_negate(const char *s){
+    if (!strcmp(s, "0")) return strdup("0");
+    char *out = xmalloc(strlen(s) + 2);
+    if (big_neg(s)) strcpy(out, s + 1);
+    else { out[0] = '-'; strcpy(out + 1, s); }
+    return out;
+}
+static char *big_pow(const char *base, long exp){
+    char *result = strdup("1");
+    char *b = strdup(base);
+    while (exp){
+        if (exp & 1){ char *t = big_mul(result, b); free(result); result = t; }
+        exp >>= 1;
+        if (exp){ char *t = big_mul(b, b); free(b); b = t; }
+    }
+    free(b);
+    return result;
+}
+/* long division: q and r as new strings */
+static void big_divmod(const char *a, const char *b, char **q, char **r){
+    int negative = big_neg(a) != big_neg(b);
+    const char *A = big_abs(a), *B = big_abs(b);
+    char *rem = strdup("");
+    size_t la = strlen(A);
+    char *qb = xmalloc(la + 2); size_t qat = 0;
+    for (size_t i = 0; i < la; i++){
+        size_t rl = strlen(rem);
+        char *nr = xmalloc(rl + 2);
+        if (rl == 0 || (rl == 1 && rem[0] == '0')){ nr[0] = A[i]; nr[1] = 0; }
+        else { memcpy(nr, rem, rl); nr[rl] = A[i]; nr[rl+1] = 0; }
+        free(rem); rem = nr;
+        long qd = 0;
+        while (big_cmp_abs(rem, B) >= 0){
+            char *t = big_sub_abs(rem, B); free(rem); rem = t; qd++;
+        }
+        qb[qat++] = (char)('0' + qd);
+    }
+    qb[qat] = 0;
+    const char *qn = big_norm(qb);
+    char *qout;
+    if (negative && strcmp(qn, "0")){ qout = xmalloc(strlen(qn) + 2); qout[0] = '-'; strcpy(qout + 1, qn); }
+    else qout = strdup(qn);
+    free(qb);
+    *q = qout;
+    *r = rem;
+}
+static int big_fits_i64(const char *s){
+    const char *p = big_abs(s);
+    if (strlen(p) > 19) return 0;
+    if (strlen(p) == 19){
+        const char *lim = big_neg(s) ? "9223372036854775808" : "9223372036854775807";
+        if (strcmp(p, lim) > 0) return 0;
+    }
+    return 1;
+}
+static int is_bigint(Value v){ return v.k == V_BIGINT; }
+
+/* parse a decimal string into an int64 value, promoting to V_BIGINT on
+ * overflow (matches the host's big-integer literals and `to :integer`) */
+static Value v_int_from_text(const char *s){
+    if (big_fits_i64(s)) return v_int(atoll(s));
+    return v_bigint_text(s);
+}
+
+/* int64 arithmetic with promotion to V_BIGINT on overflow (host parity) */
+static Value int_add(long a, long b){
+    __int128 r = (__int128)a + (__int128)b;
+    if (r > INT64_MAX || r < INT64_MIN) return v_bigint_i128(r);
+    return v_int((long)r);
+}
+static Value int_sub(long a, long b){
+    __int128 r = (__int128)a - (__int128)b;
+    if (r > INT64_MAX || r < INT64_MIN) return v_bigint_i128(r);
+    return v_int((long)r);
+}
+static Value int_mul(long a, long b){
+    __int128 r = (__int128)a * (__int128)b;
+    if (r > INT64_MAX || r < INT64_MIN) return v_bigint_i128(r);
+    return v_int((long)r);
+}
+static Value int_pow(long base, long exp){
+    char bb[32]; snprintf(bb, sizeof bb, "%ld", base);
+    char *r = big_pow(bb, exp);
+    if (big_fits_i64(r)){ long v = atoll(r); free(r); return v_int(v); }
+    Value out = v_bigint_text(r); free(r); return out;
+}
+/* arbitrary int arithmetic where either side may be a bigint: returns a new
+ * value (never dies on magnitude). operands are known numeric. */
+static Value int_op(const char *op, Value a, Value b){
+    if (a.k != V_INT && a.k != V_BIGINT){ die("expected number"); return v_null(); }
+    if (b.k != V_INT && b.k != V_BIGINT){ die("expected number"); return v_null(); }
+    if (a.k == V_INT && b.k == V_INT){
+        if (!strcmp(op, "add")) return int_add(a.u.i, b.u.i);
+        if (!strcmp(op, "sub")) return int_sub(a.u.i, b.u.i);
+        if (!strcmp(op, "mul")) return int_mul(a.u.i, b.u.i);
+    }
+    char *x = val_str(a), *y = val_str(b);
+    char *r;
+    if (!strcmp(op, "add")) r = big_add(x, y);
+    else if (!strcmp(op, "sub")) r = big_sub(x, y);
+    else r = big_mul(x, y);
+    free(x); free(y);
+    Value out = v_bigint_text(r); free(r); return out;
+}
+
 static long as_int(Value v) {
     if (v.k==V_INT) return v.u.i;
+    if (v.k==V_BIGINT){
+        if (big_fits_i64(v.u.s)) return atoll(v.u.s);
+        die("integer overflow"); return 0;
+    }
     if (v.k==V_FLOAT) return (long)v.u.f;
     if (v.k==V_RATIONAL) return v.u.rational.num/v.u.rational.den;
     if (v.k==V_BOOL) return v.u.b?1:0;
-    if (v.k==V_CHAR) return (unsigned char)v.u.c;
+    if (v.k==V_CHAR) return utf8_codepoint(v.u.c);
     die("expected number"); return 0;
 }
 static double as_float(Value v) {
     if (v.k==V_FLOAT) return v.u.f;
     if (v.k==V_INT) return (double)v.u.i;
+    if (v.k==V_BIGINT) return strtod(v.u.s, NULL);
     if (v.k==V_RATIONAL) return (double)v.u.rational.num/(double)v.u.rational.den;
     if (v.k==V_BOOL) return v.u.b?1.0:0.0;
     die("expected number"); return 0;
@@ -1082,7 +1415,8 @@ static Value b_add(Env*e,Value*a,int n){
     if(a[0].k==V_COMPLEX||a[1].k==V_COMPLEX){double ar,ai,br,bi;complex_parts(a[0],&ar,&ai);complex_parts(a[1],&br,&bi);return v_complex(ar+br,ai+bi);}
     if(a[0].k==V_FLOAT||a[1].k==V_FLOAT)return numf(as_float(a[0])+as_float(a[1]));
     if(a[0].k==V_RATIONAL||a[1].k==V_RATIONAL){long an,ad,bn,bd;rational_parts(a[0],&an,&ad);rational_parts(a[1],&bn,&bd);return v_rational(an*bd+bn*ad,ad*bd);}
-    return num2(as_int(a[0])+as_int(a[1]));
+    if(!is_numeric_kind(a[0])||!is_numeric_kind(a[1])){die("add: expected number");return v_null();}
+    return int_op("add", a[0], a[1]);
 }
 static Value b_sub(Env*e,Value*a,int n){
     if(a[0].k==V_COLOR&&a[1].k==V_COLOR)return color_rgba(fmax(0,color_chan(a[0],24)-color_chan(a[1],24)),fmax(0,color_chan(a[0],16)-color_chan(a[1],16)),fmax(0,color_chan(a[0],8)-color_chan(a[1],8)),fmax(0,color_chan(a[0],0)-color_chan(a[1],0)));
@@ -1092,7 +1426,8 @@ static Value b_sub(Env*e,Value*a,int n){
     if(a[0].k==V_COMPLEX||a[1].k==V_COMPLEX){double ar,ai,br,bi;complex_parts(a[0],&ar,&ai);complex_parts(a[1],&br,&bi);return v_complex(ar-br,ai-bi);}
     if(a[0].k==V_RATIONAL||a[1].k==V_RATIONAL){long an,ad,bn,bd;rational_parts(a[0],&an,&ad);rational_parts(a[1],&bn,&bd);return v_rational(an*bd-bn*ad,ad*bd);}
     if(a[0].k==V_FLOAT||a[1].k==V_FLOAT)return numf(as_float(a[0])-as_float(a[1]));
-    return num2(as_int(a[0])-as_int(a[1]));
+    if(!is_numeric_kind(a[0])||!is_numeric_kind(a[1])){die("sub: expected number");return v_null();}
+    return int_op("sub", a[0], a[1]);
 }
 static void simple_unit_power(const char *unit,char *base,size_t cap,int *power){
     size_t z=strlen(unit);*power=1;
@@ -1133,7 +1468,8 @@ static Value b_mul(Env*e,Value*a,int n){
     if(a[0].k==V_COMPLEX||a[1].k==V_COMPLEX){double ar,ai,br,bi;complex_parts(a[0],&ar,&ai);complex_parts(a[1],&br,&bi);return v_complex(ar*br-ai*bi,ar*bi+ai*br);}
     if(a[0].k==V_FLOAT||a[1].k==V_FLOAT)return numf(as_float(a[0])*as_float(a[1]));
     if(a[0].k==V_RATIONAL||a[1].k==V_RATIONAL){long an,ad,bn,bd;rational_parts(a[0],&an,&ad);rational_parts(a[1],&bn,&bd);return v_rational(an*bn,ad*bd);}
-    return num2(as_int(a[0])*as_int(a[1]));
+    if(!is_numeric_kind(a[0])||!is_numeric_kind(a[1])){die("mul: expected number");return v_null();}
+    return int_op("mul", a[0], a[1]);
 }
 static Value b_div(Env*e,Value*a,int n){
     if(a[0].k==V_QUANTITY&&(a[1].k==V_INT||a[1].k==V_FLOAT||a[1].k==V_RATIONAL)){double denominator=as_float(a[1]);if(denominator==0.0)die("division by zero");return v_quantity(a[0].u.quantity.amount/denominator,a[0].u.quantity.unit);}
@@ -1146,6 +1482,12 @@ static Value b_div(Env*e,Value*a,int n){
     if(a[0].k==V_COMPLEX||a[1].k==V_COMPLEX){double ar,ai,br,bi;complex_parts(a[0],&ar,&ai);complex_parts(a[1],&br,&bi);double d=br*br+bi*bi;if(d==0.0)die("division by zero");return v_complex((ar*br+ai*bi)/d,(ai*br-ar*bi)/d);}
     if(a[0].k==V_FLOAT||a[1].k==V_FLOAT){double denominator=as_float(a[1]);if(denominator==0.0)die("division by zero");return v_float(as_float(a[0])/denominator);}
     if(a[0].k==V_RATIONAL||a[1].k==V_RATIONAL){long an,ad,bn,bd;rational_parts(a[0],&an,&ad);rational_parts(a[1],&bn,&bd);if(bn==0)die("division by zero");return v_rational(an*bd,ad*bn);}
+    if(!is_numeric_kind(a[0])||!is_numeric_kind(a[1])){die("div: expected number");return v_null();}
+    if(a[0].k==V_BIGINT||a[1].k==V_BIGINT){
+        char *x=val_str(a[0]),*y=val_str(a[1]);
+        char *q,*r; big_divmod(x,y,&q,&r); free(x); free(y); free(r);
+        Value out = v_bigint_text(q); free(q); return out;
+    }
     long denominator=as_int(a[1]);
     if(denominator==0)die("division by zero");
     return num2(as_int(a[0])/denominator);
@@ -1158,12 +1500,21 @@ static Value b_fdiv(Env*e,Value*a,int n){
     }
     double denominator=as_float(a[1]);
     if(denominator==0.0)die("division by zero");
+    if(!is_numeric_kind(a[0])||!is_numeric_kind(a[1])){die("fdiv: expected number");return v_null();}
     return numf(as_float(a[0])/denominator);
 }
 static Value b_mod(Env*e,Value*a,int n){
     int mutate=a[0].k==V_PATH;Value left=a[0];if(mutate&&a[0].u.path.nsegs==1)left=env_get(e,a[0].u.path.segs[0]);if(left.k==V_COMPLEX||a[1].k==V_COMPLEX){die("mod: complex unsupported");return v_null();}Value result;
     if(left.k==V_FLOAT||a[1].k==V_FLOAT||left.k==V_RATIONAL||a[1].k==V_RATIONAL){double denominator=as_float(a[1]);if(denominator==0.0)die("division by zero");result=v_float(fmod(as_float(left),denominator));}
-    else {long denominator=as_int(a[1]);if(denominator==0)die("division by zero");result=v_int(as_int(left)%denominator);}
+    else if(left.k==V_BIGINT||a[1].k==V_BIGINT){
+        char *x=val_str(left),*y=val_str(a[1]);
+        char *q,*r; big_divmod(x,y,&q,&r); free(x); free(y); free(q);
+        result = v_bigint_text(r); free(r);
+    }
+    else {
+        if(!is_numeric_kind(left)||!is_numeric_kind(a[1])){die("mod: expected number");return v_null();}
+        long denominator=as_int(a[1]);if(denominator==0)die("division by zero");result=v_int(as_int(left)%denominator);
+    }
     if(mutate&&a[0].u.path.nsegs==1){env_set(e,a[0].u.path.segs[0],result);return v_null();}return result;
 }
 static long integer_gcd(long a,long b){
@@ -1201,10 +1552,12 @@ static Value b_pow(Env*e,Value*a,int n){
         long exponent=a[1].u.i;char base[128];int existing;simple_unit_power(a[0].u.quantity.unit,base,sizeof base,&existing);size_t z=strlen(base)+24;char *unit=xmalloc(z);long power=existing*exponent;if(power==1)snprintf(unit,z,"%s",base);else snprintf(unit,z,"%s%ld",base,power);double x=pow(a[0].u.quantity.amount,(double)exponent);Value result=a[0].u.quantity.integral?v_quantity_int((long)x,unit):v_quantity(x,unit);free(unit);return result;
     }
     if(a[0].k==V_INT && a[1].k==V_INT && a[1].u.i>=0){
-        long base=a[0].u.i, exp=a[1].u.i, result=1;
-        while(exp){ if(exp&1) result*=base; exp>>=1; if(exp) base*=base; }
-        return v_int(result);
+        return int_pow(a[0].u.i, a[1].u.i);
     }
+    if(a[0].k==V_BIGINT && a[1].k==V_INT && a[1].u.i>=0){
+        return v_bigint_text(big_pow(a[0].u.s, a[1].u.i));
+    }
+    if(!is_numeric_kind(a[0])||!is_numeric_kind(a[1])){die("pow: expected number");return v_null();}
     return numf(pow(as_float(a[0]),as_float(a[1])));
 }
 static Value b_neg(Env*e,Value*a,int n);
@@ -1315,9 +1668,14 @@ static Value b_equal(Env*e,Value*a,int n){
     if(a[0].k==V_BINARY&&a[1].k==V_BINARY)return v_bool(a[0].u.binary.len==a[1].u.binary.len&&!memcmp(a[0].u.binary.data,a[1].u.binary.data,a[0].u.binary.len));
     if(a[0].k==V_COLOR&&a[1].k==V_COLOR)return v_bool(a[0].u.rgba==a[1].u.rgba);
     if(a[0].k==V_DATE&&a[1].k==V_DATE)return v_bool(a[0].u.epoch==a[1].u.epoch);
-    if(a[0].k==V_CHAR&&a[1].k==V_CHAR)return v_bool(a[0].u.c==a[1].u.c);
+    if(a[0].k==V_CHAR&&a[1].k==V_CHAR)return v_bool(!strcmp(a[0].u.c,a[1].u.c));
     if(a[0].k==V_RANGE&&a[1].k==V_RANGE)return v_bool(a[0].u.range.lo==a[1].u.range.lo&&a[0].u.range.hi==a[1].u.range.hi&&a[0].u.range.step==a[1].u.range.step&&a[0].u.range.character==a[1].u.range.character&&a[0].u.range.infinite==a[1].u.range.infinite);
     if(a[0].k==V_COMPLEX||a[1].k==V_COMPLEX){double ar,ai,br,bi;complex_parts(a[0],&ar,&ai);complex_parts(a[1],&br,&bi);return v_bool(ar==br&&ai==bi);}
+    if(a[0].k==V_BIGINT||a[1].k==V_BIGINT){
+        if(a[0].k==V_BIGINT&&a[1].k==V_BIGINT)return v_bool(!strcmp(a[0].u.s,a[1].u.s));
+        if(is_numeric_kind(a[0])&&is_numeric_kind(a[1])){char *x=val_str(a[0]),*y=val_str(a[1]);int c=big_cmp(x,y);free(x);free(y);return v_bool(c==0);}
+        return v_bool(0);
+    }
     if (a[0].k==V_INT && a[1].k==V_INT) return v_bool(a[0].u.i==a[1].u.i);
     if (a[0].k==V_BOOL && a[1].k==V_BOOL) return v_bool(a[0].u.b==a[1].u.b);
     if ((a[0].k==V_FLOAT||a[0].k==V_RATIONAL) && (a[1].k==V_FLOAT||a[1].k==V_INT||a[1].k==V_RATIONAL)) return v_bool(as_float(a[0])==as_float(a[1]));
@@ -1337,6 +1695,7 @@ static Value b_notEqual(Env*e,Value*a,int n){
     if(a[0].k==V_COLOR&&a[1].k==V_COLOR)return v_bool(a[0].u.rgba!=a[1].u.rgba);
     if(a[0].k==V_DATE&&a[1].k==V_DATE)return v_bool(a[0].u.epoch!=a[1].u.epoch);
     if(a[0].k==V_COMPLEX||a[1].k==V_COMPLEX){Value r=b_equal(e,a,n);return v_bool(!r.u.b);}
+    if(a[0].k==V_BIGINT||a[1].k==V_BIGINT){Value r=b_equal(e,a,n);return v_bool(!r.u.b);}
     if (a[0].k==V_INT && a[1].k==V_INT) return v_bool(a[0].u.i!=a[1].u.i);
     if (a[0].k==V_BOOL && a[1].k==V_BOOL) return v_bool(a[0].u.b!=a[1].u.b);
     if ((a[0].k==V_INT||a[0].k==V_FLOAT||a[0].k==V_RATIONAL) && (a[1].k==V_INT||a[1].k==V_FLOAT||a[1].k==V_RATIONAL)) return v_bool(as_float(a[0])!=as_float(a[1]));
@@ -1347,7 +1706,7 @@ static Value b_notEqual(Env*e,Value*a,int n){
 }
 static const char *type_name(Value v){
     switch(v.k){
-        case V_NULL: return "null"; case V_INT: return "integer"; case V_FLOAT: return "floating"; case V_RATIONAL: return "rational"; case V_COMPLEX: return "complex"; case V_QUANTITY: return "quantity"; case V_UNIT: return "unit"; case V_DATE: return "date"; case V_COLOR: return "color"; case V_BINARY: return "binary";
+        case V_NULL: return "null"; case V_INT: return "integer"; case V_BIGINT: return "integer"; case V_FLOAT: return "floating"; case V_RATIONAL: return "rational"; case V_COMPLEX: return "complex"; case V_QUANTITY: return "quantity"; case V_UNIT: return "unit"; case V_DATE: return "date"; case V_COLOR: return "color"; case V_BINARY: return "binary";
         case V_STR: return "string"; case V_CHAR: return "char"; case V_BOOL: return "logical";
         case V_BLOCK: return "block"; case V_DICT: return "dictionary"; case V_FUNC: return "function";
         case V_BUILTIN: return "function"; case V_RANGE: return "range"; case V_PATH: return "path";
@@ -1371,6 +1730,9 @@ static int order_values(Value left,Value right){
     if(left.k==V_QUANTITY&&(right.k==V_INT||right.k==V_FLOAT||right.k==V_RATIONAL)){double x=left.u.quantity.amount,y=as_float(right);return (x>y)-(x<y);}
     if(right.k==V_QUANTITY&&(left.k==V_INT||left.k==V_FLOAT||left.k==V_RATIONAL)){double x=as_float(left),y=right.u.quantity.amount;return (x>y)-(x<y);}
     if((left.k==V_INT||left.k==V_FLOAT||left.k==V_RATIONAL||left.k==V_BOOL)&&(right.k==V_INT||right.k==V_FLOAT||right.k==V_RATIONAL||right.k==V_BOOL)){double x=as_float(left),y=as_float(right);return (x>y)-(x<y);}
+    if((left.k==V_BIGINT||right.k==V_BIGINT)&&is_numeric_kind(left)&&is_numeric_kind(right)){
+        char *x=val_str(left),*y=val_str(right);int c=big_cmp(x,y);free(x);free(y);return (c>0)-(c<0);
+    }
     char *x=val_str(left),*y=val_str(right);int cmp=strcmp(x,y);free(x);free(y);return (cmp>0)-(cmp<0);
 }
 static Value b_greater(Env*e,Value*a,int n){if(object_member_index(a[0],"compare")>=0){Value r=object_magic(e,a[0],"compare",&a[1],1);return v_bool(as_int(r)>0);}return v_bool(order_values(a[0],a[1])>0);}
@@ -1523,12 +1885,12 @@ static Value b_first(Env*e,Value*a,int n){
     if(rt_has_attr("n")){
         /* Arturo keeps the scalar result for range .n values of zero or one. */
         if(v.k==V_RANGE&&count<=1)return v.u.range.character?v_char((char)v.u.range.lo):v_int(v.u.range.lo);
-        if(v.k==V_STR){long length=(long)strlen(v.u.s);if(count>length)count=length;char*out=xmalloc((size_t)count+1);memcpy(out,v.u.s,(size_t)count);out[count]=0;Value result=v_str(out);free(out);return result;}
+        if(v.k==V_STR){int total=rune_count(v.u.s);if(count>total)count=total;int len=0;const char*p=v.u.s;for(int k=0;k<count;k++){len+=utf8_rune_len(p);p+=utf8_rune_len(p);}char*out=xmalloc((size_t)len+1);memcpy(out,v.u.s,(size_t)len);out[len]=0;Value result=v_str(out);free(out);return result;}
         if(v.k==V_BLOCK){if(count>v.u.block.b->n)count=v.u.block.b->n;Value **items=xmalloc((size_t)(count+1)*sizeof(Value*));for(int i=0;i<count;i++)items[i]=v.u.block.b->items[i];return v_block(items,(int)count);}
         if(v.k==V_RANGE){long available=labs((v.u.range.hi-v.u.range.lo)/v.u.range.step)+1;if(count>available)count=available;Value out=v_range(v.u.range.lo,v.u.range.lo+(count-1)*v.u.range.step);out.u.range.step=v.u.range.step;out.u.range.character=v.u.range.character;return out;}
     }
     if (v.k==V_BLOCK) return v.u.block.b->n? *v.u.block.b->items[0] : v_null();
-    if (v.k==V_STR) return v_char(v.u.s[0]);
+    if (v.k==V_STR) { char rb[5]; rune_at(v.u.s, rb); return v_char_text(rb); }
     if (v.k==V_RANGE) return v.u.range.character?v_char((char)v.u.range.lo):v_int(v.u.range.lo);
     die("first: unsupported"); return v_null();
 }
@@ -1538,12 +1900,12 @@ static Value b_last(Env*e,Value*a,int n){
     if(rt_has_attr("n")){
         if(v.k==V_RANGE&&v.u.range.infinite)return v_float(INFINITY);
         if(v.k==V_RANGE&&count<=1)return v.u.range.character?v_char((char)v.u.range.hi):v_int(v.u.range.hi);
-        if(v.k==V_STR){long length=(long)strlen(v.u.s);if(count>length)count=length;Value result=v_str(v.u.s+length-count);return result;}
+        if(v.k==V_STR){int total=rune_count(v.u.s);if(count>total)count=total;const char*p=v.u.s;for(int k=0;k<total-count;k++)p+=utf8_rune_len(p);Value result=v_str(p);return result;}
         if(v.k==V_BLOCK){if(count>v.u.block.b->n)count=v.u.block.b->n;Value **items=xmalloc((size_t)(count?count:1)*sizeof(Value*));for(int i=0;i<count;i++){items[i]=xmalloc(sizeof(Value));*items[i]=*v.u.block.b->items[v.u.block.b->n-(int)count+i];}return v_block(items,(int)count);}
         if(v.k==V_RANGE){long available=labs((v.u.range.hi-v.u.range.lo)/v.u.range.step)+1;if(count>available)count=available;Value out=v_range(v.u.range.hi-(count-1)*v.u.range.step,v.u.range.hi);out.u.range.step=v.u.range.step;out.u.range.character=v.u.range.character;return out;}
     }
     if (v.k==V_BLOCK) return v.u.block.b->n? *v.u.block.b->items[v.u.block.b->n-1] : v_null();
-    if (v.k==V_STR){size_t length=strlen(v.u.s);return length?v_char(v.u.s[length-1]):v_null();}
+    if (v.k==V_STR){size_t length=strlen(v.u.s);if(length){char rb[5];rune_at(last_rune(v.u.s),rb);return v_char_text(rb);}return v_null();}
     if (v.k==V_RANGE){if(v.u.range.infinite)return v_float(INFINITY);return v.u.range.character?v_char((char)v.u.range.hi):v_int(v.u.range.hi);}
     die("last: unsupported"); return v_null();
 }
@@ -1568,13 +1930,18 @@ static int  value_eq(Value a, Value b);
 static int path_target(Env *e, Value p, Value *cont, int *idx) {
     Value d = env_get(e, p.u.path.segs[0]);
     for (int i=1; i<p.u.path.nsegs-1; i++) {
-        int j = dict_find(d, p.u.path.segs[i]);
-        if (j < 0) return -1;
-        d = d.u.dict->vals[j];
+        Value next = index_at(d, p.u.path.segs[i], e);
+        if (next.k==V_NULL) return -1;
+        d = next;
     }
-    *idx = dict_find(d, p.u.path.segs[p.u.path.nsegs-1]);
-    *cont = d;
-    return *idx;
+    if (d.k==V_DICT){ *idx = dict_find(d, p.u.path.segs[p.u.path.nsegs-1]); *cont = d; return *idx; }
+    if (d.k==V_BLOCK){ long i2=atol(p.u.path.segs[p.u.path.nsegs-1]); if(i2<0||i2>=d.u.block.b->n)return -1; *cont=d; *idx=(int)i2; return 0; }
+    return -1;
+}
+/* write a mutated value back into the container a path_target resolved */
+static void path_store(Value cont, int idx, Value val){
+    if (cont.k==V_DICT) cont.u.dict->vals[idx]=val;
+    else if (cont.k==V_BLOCK && idx>=0 && idx<cont.u.block.b->n) *cont.u.block.b->items[idx]=val;
 }
 static Value block_append(Value v, Value el){
     /* mutate the shared body in place so all copies see the append */
@@ -1589,7 +1956,7 @@ static Value b_append(Env*e,Value*a,int n){
         Value current=env_get(e,a[0].u.s),t[2]={current,a[1]};Value r=b_append(e,t,2);env_set(e,a[0].u.s,r);return r;
     }
     /* a path reference writes back through the resolved container */
-    if (a[0].k==V_PATH){
+    if (a[0].k==V_PATH || a[0].k==V_PATHLITERAL || a[0].k==V_PATHLABEL){
         if(a[0].u.path.nsegs==1){
             const char *name=a[0].u.path.segs[0];
             Value current=env_get(e,name);
@@ -1598,12 +1965,12 @@ static Value b_append(Env*e,Value*a,int n){
             env_set(e,name,r);
             return r;
         }
-        Value cont; int idx=path_target(e,a[0],&cont,&idx);
-        if (idx<0) die("append: path not found");
-        Value v=cont.u.dict->vals[idx];
+        Value cont; int idx; int pathrc=path_target(e,a[0],&cont,&idx);
+        if (pathrc<0) die("append: path not found");
+        Value v=cont.k==V_DICT?cont.u.dict->vals[idx]:*cont.u.block.b->items[idx];
         Value t[2]={v,a[1]};          /* recurse on the resolved value, not the path */
         Value r = b_append(e, t, 2);
-        cont.u.dict->vals[idx]=r;
+        path_store(cont,idx,r);
         return r;
     }
     Value v=a[0];
@@ -1632,7 +1999,7 @@ static Value b_append(Env*e,Value*a,int n){
         if (x.k==V_STR) app=x.u.s;
         else if (x.k==V_INT){ snprintf(buf,sizeof buf,"%ld",x.u.i); app=buf; }
         else if (x.k==V_BOOL){ app=x.u.b?"true":"false"; }
-        else if (x.k==V_CHAR){ buf[0]=x.u.c; buf[1]=0; app=buf; }
+        else if (x.k==V_CHAR){ app=x.u.c; }
         else die("append: unsupported");
         char *out=(char*)xmalloc(strlen(s)+strlen(app)+1);
         strcpy(out,s); strcat(out,app);
@@ -1655,12 +2022,12 @@ static Value b_insert(Env*e,Value*a,int n){
         return r;
     }
     if (a[0].k==V_PATH){
-        Value cont; int idx=path_target(e,a[0],&cont,&idx);
-        if (idx<0) die("insert: path not found");
-        Value v=cont.u.dict->vals[idx];
+        Value cont; int idx; int pathrc=path_target(e,a[0],&cont,&idx);
+        if (pathrc<0) die("insert: path not found");
+        Value v=cont.k==V_DICT?cont.u.dict->vals[idx]:*cont.u.block.b->items[idx];
         Value t[3]={v,a[1],a[2]};
         Value r = b_insert(e, t, 3);
-        cont.u.dict->vals[idx]=r;
+        path_store(cont,idx,r);
         return r;
     }
     if(a[0].k==V_DICT){Value args[3]={a[0],a[1],a[2]};return b_set(e,args,3);}
@@ -1678,12 +2045,12 @@ static Value b_insert(Env*e,Value*a,int n){
 }
 static Value b_pop(Env*e,Value*a,int n){
     long count=rt_has_attr("n")?as_int(rt_attr_value("n",v_int(1))):1;if(count<0)die("pop.n: expected nonnegative count");Value v=a[0],container=v_null();int index=-1;const char *variable=NULL;
-    if(a[0].k==V_PATH){if(a[0].u.path.nsegs==1){variable=a[0].u.path.segs[0];v=env_get(e,variable);}else{if(path_target(e,a[0],&container,&index)<0)die("pop: path not found");v=container.u.dict->vals[index];}}
+    if(a[0].k==V_PATH){if(a[0].u.path.nsegs==1){variable=a[0].u.path.segs[0];v=env_get(e,variable);}else{if(path_target(e,a[0],&container,&index)<0)die("pop: path not found");v=container.k==V_DICT?container.u.dict->vals[index]:*container.u.block.b->items[index];}}
     Value removed=v_null(),updated=v;
     if(v.k==V_BLOCK){Block*b=v.u.block.b;if(count>b->n)count=b->n;if(!rt_has_attr("n")){if(!count)die("pop: empty block");removed=*b->items[b->n-1];b->n--;}else{Value **items=xmalloc((size_t)(count?count:1)*sizeof(Value*));for(int i=0;i<count;i++){items[i]=xmalloc(sizeof(Value));*items[i]=*b->items[b->n-(int)count+i];}b->n-=(int)count;removed=v_block(items,(int)count);}}
-    else if(v.k==V_STR){size_t length=strlen(v.u.s);if(count>(long)length)count=(long)length;size_t start=length-(size_t)count;removed=rt_has_attr("n")?v_str(v.u.s+start):(count?v_char(v.u.s[length-1]):v_null());char *text=xmalloc(start+1);memcpy(text,v.u.s,start);text[start]=0;updated=v_str(text);free(text);}
+    else if(v.k==V_STR){int total=rune_count(v.u.s);if(count>total)count=total;const char*cut=v.u.s;for(int k=0;k<total-(int)count;k++)cut+=utf8_rune_len(cut);if(rt_has_attr("n"))removed=v_str(cut);else if(count){char rb[5];rune_at(last_rune(v.u.s),rb);removed=v_char_text(rb);}else removed=v_null();char *text=xmalloc((size_t)(cut-v.u.s)+1);memcpy(text,v.u.s,(size_t)(cut-v.u.s));text[cut-v.u.s]=0;updated=v_str(text);free(text);}
     else die("pop: unsupported value");
-    if(variable)env_set(e,variable,updated);else if(index>=0)container.u.dict->vals[index]=updated;return removed;
+    if(variable)env_set(e,variable,updated);else if(index>=0)path_store(container,index,updated);return removed;
 }
 /* `++` concat: strings concatenate; blocks append */
 static Value b_concat(Env*e,Value*a,int n){
@@ -1704,13 +2071,13 @@ static Value b_key(Env*e,Value*a,int n){
     return v_bool(dict_find(a[0], key_text(a[1]))>=0); }
 static int iterator_count(Value coll){
     if(coll.k==V_BLOCK)return coll.u.block.b->n;
-    if(coll.k==V_STR)return (int)strlen(coll.u.s);
+    if(coll.k==V_STR)return rune_count(coll.u.s);
     if(coll.k==V_RANGE)return (int)(labs((coll.u.range.hi-coll.u.range.lo)/coll.u.range.step)+1);
     die("iterator: unsupported collection");return 0;
 }
 static Value iterator_item(Value coll,int i){
     if(coll.k==V_BLOCK)return *coll.u.block.b->items[i];
-    if(coll.k==V_STR)return v_char(coll.u.s[i]);
+    if(coll.k==V_STR){const char*p=rune_offset(coll.u.s,i);char rb[5];rune_at(p,rb);return v_char_text(rb);}
     long value=coll.u.range.lo+coll.u.range.step*i;return coll.u.range.character?v_char((char)value):v_int(value);
 }
 static int order_value(Value left,Value right){
@@ -2024,7 +2391,7 @@ static Value b_get(Env*e,Value*a,int n){
         long i=a[1].u.i,count=iterator_count(a[0]);if(i<0||i>=count)die("get: index out of bounds");return iterator_item(a[0],(int)i);
     }
     if (a[1].k==V_INT && (a[0].k==V_STR||a[0].k==V_WORD||a[0].k==V_LITERAL||a[0].k==V_LABEL||a[0].k==V_SYMBOL||a[0].k==V_SYMBOLLITERAL||a[0].k==V_TYPE||a[0].k==V_VERSION||a[0].k==V_ERRORKIND||a[0].k==V_REGEX||a[0].k==V_ATTRIBUTE||a[0].k==V_ATTRIBUTELABEL)){
-        long i=a[1].u.i;size_t len=strlen(a[0].u.s);if(i<0||i>=(long)len)die("get: index out of bounds");return v_char(a[0].u.s[i]);
+        long i=a[1].u.i;int total=rune_count(a[0].u.s);if(i<0||i>=total)die("get: index out of bounds");{const char*p=rune_offset(a[0].u.s,(int)i);char rb[5];rune_at(p,rb);return v_char_text(rb);}
     }
     if(a[1].k==V_RANGE&&(a[0].k==V_STR||a[0].k==V_WORD||a[0].k==V_LITERAL||a[0].k==V_LABEL)){
         size_t len=strlen(a[0].u.s);int count=iterator_count(a[1]);char *out=xmalloc((size_t)count+1);int used=0;
@@ -2115,54 +2482,101 @@ static Value b_call(Env*e,Value*a,int n){
 
 /* ---- builtins the compiler's own source needs ---------------------------- */
 
-/* host renders floats in fixed decimal (never scientific), with the shortest
- * round-trip digits and always at least one fractional digit (`0.0`,`3.5`,
- * `15000000000.0`,`0.00001`). */
+/* host renders floats like Nim's `$` (dragonbox shortest round-trip): fixed
+ * decimal when -6 <= decimalPoint <= 17 (decimalPoint = number of integer
+ * digits), scientific otherwise. Fixed forms keep at least one fractional digit
+ * (`0.0`,`3.5`,`10000000000.0`,`0.00001`); scientific forms use `e` + sign +
+ * bare exponent (`1e+308`,`1e-8`,`1.2345678901234568e+17`). All writes are
+ * bounds-checked: values outside the fixed range stay in scientific notation. */
+static void fstr_put(char *out, size_t cap, size_t *at, char c){
+    if (*at + 1 < cap) out[(*at)++] = c;
+}
+static void fstr_puts(char *out, size_t cap, size_t *at, const char *s){
+    while (*s && *at + 1 < cap) out[(*at)++] = *s++;
+}
+static void fstr_zeros(char *out, size_t cap, size_t *at, int n){
+    for (int i = 0; i < n; i++) fstr_put(out, cap, at, '0');
+}
 static char *fstr(double f, char *out, size_t cap){
-    if(isnan(f)){ snprintf(out,cap,"nan"); return out; }
-    if(isinf(f)){ snprintf(out,cap,"%s",signbit(f)?"-∞":"∞"); return out; }
-    if (f == (double)(long)f) {
-        snprintf(out, cap, "%.0f", f);
-        size_t l=strlen(out); if(l+2<cap){ out[l]='.'; out[l+1]='0'; out[l+2]=0; }
+    if (cap == 0) return out;
+    out[0] = 0;
+    if (isnan(f)){ snprintf(out, cap, "nan"); return out; }
+    if (isinf(f)){ snprintf(out, cap, "%s", signbit(f) ? "-∞" : "∞"); return out; }
+    if (f == 0.0){ snprintf(out, cap, "%s0.0", signbit(f) ? "-" : ""); return out; }
+
+    /* shortest round-trip digit string via %g, smallest precision first */
+    int p;
+    for (p = 1; p <= 17; p++){
+        snprintf(out, cap, "%.*g", p, f);
+        if (atof(out) == f) break;
+    }
+    /* out is e.g. "1e+308", "1e-07", "0.0001", "1.5", "1000000000000000" */
+    int sign = (out[0] == '-') ? 1 : 0;
+    const char *body = out + sign;
+    const char *e = strchr(body, 'e');
+    if (e == NULL) e = strchr(body, 'E');
+
+    if (e == NULL){
+        /* plain decimal; make sure it has a fractional digit */
+        if (strchr(body, '.') == NULL){
+            size_t l = strlen(out);
+            if (l + 2 < cap){ out[l] = '.'; out[l+1] = '0'; out[l+2] = 0; }
+        }
         return out;
     }
-    int p;
-    for (p=1; p<=17; p++){
-        snprintf(out, cap, "%.*g", p, f);
-        if (atof(out)==f) break;
-    }
-    char *e=strchr(out,'e'); if(!e) e=strchr(out,'E');
-    if (e){
-        int exp=atoi(e+1); *e=0;
-        char mant[64]; strcpy(mant,out);
-        char *dot=strchr(mant,'.');
-        if(!dot){
-            if(exp>=0){
-                snprintf(out,cap,"%s",mant); size_t l=strlen(out);
-                for(int i=0;i<exp;i++) if(l<cap-1) out[l++]='0';
-                out[l]='.'; out[l+1]='0'; out[l+2]=0;
-            } else {
-                snprintf(out,cap,"0."); size_t l=2;
-                for(int i=0;i<(-exp-1);i++) out[l++]='0';
-                strcpy(out+l,mant);
-            }
+
+    /* scientific form from %g. Extract mantissa digits and decimal exponent. */
+    const char *dot = strchr(body, '.');
+    long intPart = dot ? (long)(dot - body) : (long)(e - body);
+    long exp = atol(e + 1);
+    long decimalPoint = intPart + exp;
+
+    char mant[40];
+    size_t mk = 0;
+    for (const char *cp = body; cp != e; cp++) if (*cp != '.') mant[mk++] = *cp;
+    mant[mk] = 0;
+
+    if (decimalPoint >= -6 && decimalPoint <= 17){
+        /* fixed notation, bounded: the fixed form is at most ~24 chars */
+        char buf[64]; size_t at = 0;
+        if (sign) fstr_put(buf, sizeof buf, &at, '-');
+        if (decimalPoint <= 0){
+            fstr_puts(buf, sizeof buf, &at, "0.");
+            fstr_zeros(buf, sizeof buf, &at, (int)(-decimalPoint));
+            fstr_puts(buf, sizeof buf, &at, mant);
+        } else if ((long)mk < decimalPoint){
+            fstr_puts(buf, sizeof buf, &at, mant);
+            fstr_zeros(buf, sizeof buf, &at, (int)(decimalPoint - (long)mk));
+            fstr_puts(buf, sizeof buf, &at, ".0");
         } else {
-            char dig[64]; int k=0; for(char*cp=mant;*cp;cp++) if(*cp!='.') dig[k++]=*cp; dig[k]=0;
-            int intpart=(int)(dot-mant), pp=intpart+exp;
-            if(pp<=0){
-                snprintf(out,cap,"0."); size_t l=2;
-                for(int i=0;i<(-pp);i++) out[l++]='0';
-                strcpy(out+l,dig);
-            } else if(pp>=k){
-                snprintf(out,cap,"%s",dig); size_t l=k;
-                for(int i=0;i<(pp-k);i++) out[l++]='0';
-                out[l++]='.'; out[l++]='0'; out[l]=0;
-            } else {
-                strncpy(out,dig,pp); out[pp]='.'; strcpy(out+pp+1,dig+pp);
-            }
+            size_t start = at;
+            fstr_puts(buf, sizeof buf, &at, mant);
+            memmove(buf + start + (size_t)decimalPoint + 1, buf + start + (size_t)decimalPoint,
+                    (size_t)mk - (size_t)decimalPoint);
+            buf[start + (size_t)decimalPoint] = '.';
+            at = start + (size_t)mk + 1;
         }
+        buf[at] = 0;
+        snprintf(out, cap, "%s", buf);
+        return out;
     }
-    if(!strchr(out,'.')){ size_t l=strlen(out); out[l]='.'; out[l+1]='0'; out[l+2]=0; }
+
+    /* scientific: mantissa then `e` + sign + bare exponent (no leading zeros) */
+    char buf[64]; size_t at = 0;
+    if (sign) fstr_put(buf, sizeof buf, &at, '-');
+    fstr_put(buf, sizeof buf, &at, mant[0]);
+    if (mant[1]){ fstr_put(buf, sizeof buf, &at, '.'); fstr_puts(buf, sizeof buf, &at, mant + 1); }
+    long sciExp = decimalPoint - 1;
+    fstr_put(buf, sizeof buf, &at, 'e');
+    fstr_put(buf, sizeof buf, &at, sciExp < 0 ? '-' : '+');
+    long absExp = sciExp < 0 ? -sciExp : sciExp;
+    if (absExp < 10) fstr_put(buf, sizeof buf, &at, (char)('0' + absExp));
+    else {
+        char tmp[24]; snprintf(tmp, sizeof tmp, "%ld", absExp);
+        fstr_puts(buf, sizeof buf, &at, tmp);
+    }
+    buf[at] = 0;
+    snprintf(out, cap, "%s", buf);
     return out;
 }
 void rt_write_float(double f){
@@ -2179,6 +2593,7 @@ static char *val_str(Value v){
     char b[64];
     switch (v.k) {
         case V_INT:    snprintf(b,64,"%ld",v.u.i); return strdup(b);
+        case V_BIGINT: return strdup(v.u.s?v.u.s:"0");
         case V_FLOAT:  { char fb[64]; fstr(v.u.f,fb,sizeof fb); return strdup(fb); }
         case V_RATIONAL: snprintf(b,64,"%ld/%ld",v.u.rational.num,v.u.rational.den); return strdup(b);
         case V_COMPLEX: {
@@ -2192,14 +2607,14 @@ static char *val_str(Value v){
         case V_COLOR: return color_text(v);
         case V_BINARY: {char *s=(char*)xmalloc(v.u.binary.len*3+1);size_t at=0;for(size_t i=0;i<v.u.binary.len;i++){if(i)s[at++]=' ';snprintf(s+at,3,"%02X",v.u.binary.data[i]);at+=2;}s[at]=0;return s;}
         case V_STR:    return strdup(v.u.s);
-        case V_CHAR:   { char c[2]={v.u.c,0}; return strdup(c); }
+        case V_CHAR:   return strdup(v.u.c);
         case V_BOOL:   return strdup(v.u.b?"true":"false");
         case V_NULL:   return strdup("null");
         case V_FUNC:   return strdup("function");
         case V_BUILTIN:return strdup(v.u.s);
         case V_ERROR:  return strdup(v.u.error.message?v.u.error.message:"");
         case V_VERSION: case V_ERRORKIND: return strdup(v.u.s?v.u.s:"");
-        case V_RANGE:  snprintf(b,64,"%ld..%ld",v.u.range.lo,v.u.range.hi); return strdup(b);
+        case V_RANGE:  { char rb[64]; range_text(v, rb, sizeof rb); return strdup(rb); }
         case V_BLOCK: {
             /* host `to :string` of a block wraps the elements in brackets */
             size_t cap=32, len=0; char *out=xmalloc(cap); out[0]=0;
@@ -2270,7 +2685,7 @@ static int value_eq(Value a, Value b){
     if (a.k==V_STR && b.k==V_STR) return !strcmp(a.u.s,b.u.s);
     if (a.k==V_BOOL && b.k==V_BOOL) return a.u.b==b.u.b;
     if (a.k==V_NULL && b.k==V_NULL) return 1;
-    if (a.k==V_CHAR && b.k==V_CHAR) return a.u.c==b.u.c;
+    if (a.k==V_CHAR && b.k==V_CHAR) return !strcmp(a.u.c,b.u.c);
     char *sa=val_str(a), *sb=val_str(b); int r=!strcmp(sa,sb); free(sa); free(sb); return r;
 }
 
@@ -2337,10 +2752,12 @@ static Value b_to(Env*e,Value*a,int n){
         Value r=v_token(kind,s);free(s);return r;
     }
     if(!strcmp(ty,":integer")){
-        if(v.k==V_STR) return v_int(atol(v.u.s));
+        if(v.k==V_STR) return v_int_from_text(v.u.s);
         if(v.k==V_FLOAT) return v_int((long)v.u.f);
         if(v.k==V_INT) return v;
+        if(v.k==V_BIGINT) return v;
         if(v.k==V_BOOL) return v_int(v.u.b?1:0);
+        if(v.k==V_CHAR) return v_int(utf8_codepoint(v.u.c));
         if(v.k==V_RATIONAL) return v_int(v.u.rational.num/v.u.rational.den);
         if(v.k==V_COMPLEX) return v_int((long)v.u.complex.real);
         die("to :integer"); return v_null();
@@ -2360,7 +2777,7 @@ static Value b_to(Env*e,Value*a,int n){
         return v_bool(v_truthy(v));
     }
     if(!strcmp(ty,":char")){
-        if(v.k==V_STR) return v_char(v.u.s[0]);
+        if(v.k==V_STR){char rb[5];rune_at(v.u.s,rb);return v_char_text(rb);}
         if(v.k==V_INT) return v_char((char)v.u.i);
         if(v.k==V_CHAR) return v;
         die("to :char"); return v_null();
@@ -2489,30 +2906,30 @@ static Value b_onep(Env*e,Value*a,int n){
     return v_bool(0);
 }
 static Value b_asciip(Env*e,Value*a,int n){
-    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? (char[]){a[0].u.c,0} : a[0].u.s);
+    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? a[0].u.c : a[0].u.s);
     for(;*s;s++) if(*s>127) return v_bool(0);
     return v_bool(1);
 }
 static Value b_whitespacep(Env*e,Value*a,int n){
-    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? (char[]){a[0].u.c,0} : a[0].u.s);
+    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? a[0].u.c : a[0].u.s);
     if(!*s) return v_bool(0);
     for(;*s;s++) if(!isspace(*s)) return v_bool(0);
     return v_bool(1);
 }
 static Value b_lowerp(Env*e,Value*a,int n){
-    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? (char[]){a[0].u.c,0} : a[0].u.s);
+    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? a[0].u.c : a[0].u.s);
     for(;*s;s++) if(!islower(*s)) return v_bool(0);
     return v_bool(1);
 }
 static Value b_upperp(Env*e,Value*a,int n){
-    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? (char[]){a[0].u.c,0} : a[0].u.s);
+    const unsigned char *s=(const unsigned char*)(a[0].k==V_CHAR ? a[0].u.c : a[0].u.s);
     for(;*s;s++) if(!isupper(*s)) return v_bool(0);
     return v_bool(1);
 }
 static Value b_numericp(Env*e,Value*a,int n){
     if(a[0].k==V_INT||a[0].k==V_FLOAT||a[0].k==V_RATIONAL||a[0].k==V_COMPLEX||a[0].k==V_QUANTITY)return v_bool(1);
-    char buf[2]={0,0}; const char *s;
-    if(a[0].k==V_CHAR){ buf[0]=a[0].u.c; s=buf; } else s=a[0].u.s;
+    char buf[8]={0,0,0,0,0,0,0,0}; const char *s;
+    if(a[0].k==V_CHAR){ memcpy(buf,a[0].u.c,5); s=buf; } else s=a[0].u.s;
     if(!s || !*s) return v_bool(0);
     char *end=NULL; (void)strtod(s,&end);
     return v_bool(end && end!=s && *end=='\0');
@@ -2535,8 +2952,9 @@ static int value_same(Value a, Value b){
     switch(a.k){
         case V_NULL: return 1;
         case V_INT: return a.u.i==b.u.i;
+        case V_BIGINT: return !strcmp(a.u.s,b.u.s);
         case V_FLOAT: return a.u.f==b.u.f;
-        case V_CHAR: return a.u.c==b.u.c;
+        case V_CHAR: return !strcmp(a.u.c,b.u.c);
         case V_BOOL: return a.u.b==b.u.b;
         case V_RATIONAL: return a.u.rational.num==b.u.rational.num&&a.u.rational.den==b.u.rational.den;
         case V_COMPLEX: return a.u.complex.real==b.u.complex.real&&a.u.complex.imag==b.u.complex.imag;
@@ -2809,11 +3227,11 @@ static Value mut_load(Env *e, Value receiver, MutTarget *target){
     }
     target->kind=2;
     if(path_target(e,receiver,&target->container,&target->index)<0) die("mutation path not found");
-    return target->container.u.dict->vals[target->index];
+    return target->container.k==V_DICT?target->container.u.dict->vals[target->index]:*target->container.u.block.b->items[target->index];
 }
 static void mut_store(Env *e, MutTarget *target, Value value){
     if(target->kind==1) env_set(e,target->var,value);
-    else if(target->kind==2) target->container.u.dict->vals[target->index]=value;
+    else if(target->kind==2) path_store(target->container,target->index,value);
 }
 static Value b_escape(Env*e,Value*a,int n){MutTarget target;Value source=mut_load(e,a[0],&target),result=escape_value(e,&source,n);if(target.kind){mut_store(e,&target,result);return v_null();}return result;}
 static Value b_unescape(Env*e,Value*a,int n){MutTarget target;Value source=mut_load(e,a[0],&target),result=unescape_value(e,&source,n);if(target.kind){mut_store(e,&target,result);return v_null();}return result;}
@@ -2824,7 +3242,7 @@ static Value step_numeric(Value v,int direction){if(v.k==V_INT)return v_int(v.u.
 static Value mutate_unary(Env*e,Value receiver,int direction){MutTarget target;Value value=mut_load(e,receiver,&target),result=step_numeric(value,direction);if(target.kind){mut_store(e,&target,result);return v_null();}return result;}
 static Value b_inc(Env*e,Value*a,int n){(void)n;return mutate_unary(e,a[0],1);}
 static Value b_dec(Env*e,Value*a,int n){(void)n;return mutate_unary(e,a[0],-1);}
-static Value b_neg(Env*e,Value*a,int n){(void)n;MutTarget target;Value value=mut_load(e,a[0],&target),result;if(value.k==V_QUANTITY)result=value.u.quantity.integral?v_quantity_int((long)-value.u.quantity.amount,value.u.quantity.unit):v_quantity(-value.u.quantity.amount,value.u.quantity.unit);else if(value.k==V_COMPLEX)result=v_complex(-value.u.complex.real,-value.u.complex.imag);else if(value.k==V_FLOAT)result=v_float(-value.u.f);else if(value.k==V_RATIONAL)result=v_rational(-value.u.rational.num,value.u.rational.den);else result=v_int(-as_int(value));if(target.kind){mut_store(e,&target,result);return v_null();}return result;}
+static Value b_neg(Env*e,Value*a,int n){(void)n;MutTarget target;Value value=mut_load(e,a[0],&target),result;if(value.k==V_QUANTITY)result=value.u.quantity.integral?v_quantity_int((long)-value.u.quantity.amount,value.u.quantity.unit):v_quantity(-value.u.quantity.amount,value.u.quantity.unit);else if(value.k==V_COMPLEX)result=v_complex(-value.u.complex.real,-value.u.complex.imag);else if(value.k==V_FLOAT)result=v_float(-value.u.f);else if(value.k==V_RATIONAL)result=v_rational(-value.u.rational.num,value.u.rational.den);else if(value.k==V_BIGINT)result=v_bigint_text(big_negate(value.u.s));else if(value.k==V_INT)result=v_int(-value.u.i);else die("neg: expected number");if(target.kind){mut_store(e,&target,result);return v_null();}return result;}
 static Value b_normalize(Env*e,Value*a,int n){
     (void)n;MutTarget target;Value source=mut_load(e,a[0],&target);Value result=normalize_value(source);
     if(target.kind){mut_store(e,&target,result);return v_null();}return result;
@@ -2993,7 +3411,7 @@ static Value b_remove(Env*e,Value*a,int n){
     MutTarget t; Value v=mut_load(e,a[0],&t);
     if(v.k==V_BLOCK){Block*b=v.u.block.b;int at=0,once=rt_has_attr("once"),removed=0;if(rt_has_attr("index")){long index=as_int(a[1]);for(int i=0;i<b->n;i++)if(i!=index)b->items[at++]=b->items[i];}else if(a[1].k==V_BLOCK&&!rt_has_attr("instance")){Block*needle=a[1].u.block.b;if(needle->n>0){for(int i=0;i<b->n;){int match=i+needle->n<=b->n;for(int j=0;match&&j<needle->n;j++)if(!value_eq(*b->items[i+j],*needle->items[j]))match=0;if(match&&(!once||!removed)){i+=needle->n;removed=1;}else b->items[at++]=b->items[i++];}}else for(int i=0;i<b->n;i++)b->items[at++]=b->items[i];}else for(int i=0;i<b->n;i++){int match=value_eq(*b->items[i],a[1]);if(match&&(!once||!removed))removed=1;else b->items[at++]=b->items[i];}b->n=at;return t.kind?v_null():v;}
     if(v.k==V_DICT){int at=0,keyMode=rt_has_attr("key");for(int i=0;i<v.u.dict->n;i++){int match=keyMode?!strcmp(v.u.dict->keys[i],key_text(a[1])):value_eq(v.u.dict->vals[i],a[1]);if(!match){v.u.dict->keys[at]=v.u.dict->keys[i];v.u.dict->vals[at++]=v.u.dict->vals[i];}}v.u.dict->n=at;return t.kind?v_null():v;}
-    if(v.k==V_STR){ char*needle=(a[1].k==V_CHAR&&a[1].u.c==39&&strchr(v.u.s,'+'))?strdup("+"):val_str(a[1]); size_t nl=strlen(needle); if(!nl){free(needle);return t.kind?v_null():v;} const char*p=v.u.s;size_t cap=strlen(p)+1,at=0;char*out=(char*)xmalloc(cap);int once=rt_has_attr("once"),prefix=rt_has_attr("prefix"),suffix=rt_has_attr("suffix"),removed=0;while(*p){size_t remaining=strlen(p);int match=!strncmp(p,needle,nl)&&(!prefix||p==v.u.s)&&(!suffix||remaining==nl);if(match&&(!once||!removed)){p+=nl;removed=1;}else out[at++]=*p++;}out[at]=0;Value r=v_str(out);free(out);free(needle);if(t.kind){mut_store(e,&t,r);return v_null();}return r; }
+    if(v.k==V_STR){ char*needle=(a[1].k==V_CHAR&&a[1].u.c[0]==39&&strchr(v.u.s,'+'))?strdup("+"):val_str(a[1]); size_t nl=strlen(needle); if(!nl){free(needle);return t.kind?v_null():v;} const char*p=v.u.s;size_t cap=strlen(p)+1,at=0;char*out=(char*)xmalloc(cap);int once=rt_has_attr("once"),prefix=rt_has_attr("prefix"),suffix=rt_has_attr("suffix"),removed=0;while(*p){size_t remaining=strlen(p);int match=!strncmp(p,needle,nl)&&(!prefix||p==v.u.s)&&(!suffix||remaining==nl);if(match&&(!once||!removed)){p+=nl;removed=1;}else out[at++]=*p++;}out[at]=0;Value r=v_str(out);free(out);free(needle);if(t.kind){mut_store(e,&t,r);return v_null();}return r; }
     die("remove: unsupported value"); return v_null();
 }
 static Value b_repeat(Env*e,Value*a,int n){
@@ -3210,17 +3628,30 @@ static Value b_slice(Env*e,Value*a,int n){
     long from=as_int(a[1]), to=as_int(a[2]);
     if(source.k==V_BLOCK){
         int m=source.u.block.b->n;
-        if(from<0) from=0; if(from>m) from=m; if(to>=m) to=m-1;
-        int cnt=(int)(to-from+1); if(cnt<0) cnt=0;
-        Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
-        for(int i=0;i<cnt;i++) items[i]=source.u.block.b->items[from+i];Value result=v_block(items,cnt);if(target.kind){mut_store(e,&target,result);return v_null();}return result;
+        if(from>=0 && to<=m-1){
+            long cnt=to-from+1; if(cnt<0)cnt=0; if(cnt>m-from)cnt=m-from;
+            Value **items=(Value**)xmalloc((size_t)(cnt?cnt:1)*sizeof(Value*));
+            for(long i=0;i<cnt;i++) items[i]=source.u.block.b->items[from+i];
+            Value result=v_block(items,(int)cnt);
+            if(target.kind){mut_store(e,&target,result);return v_null();}return result;
+        }
+        Value result=v_block(NULL,0);
+        if(target.kind){mut_store(e,&target,result);return v_null();}return result;
     }
     if(source.k==V_STR){
-        const char*s=source.u.s; long m=(long)strlen(s);
-        if(from<0) from=0; if(from>m) from=m; if(to>=m) to=m-1;
-        long cnt=to-from+1; if(cnt<0) cnt=0;
-        char *out=xmalloc(cnt+1); memcpy(out,s+from,cnt); out[cnt]=0;
-        Value r=v_str(out); free(out);if(target.kind){mut_store(e,&target,r);return v_null();}return r;
+        int total=rune_count(source.u.s);
+        if(from>=0 && to<=total){
+            long len=to-from+1; if(len<0)len=0;
+            int avail=total-(int)from; if(len>avail)len=avail; if(len<0)len=0;
+            const char*start=rune_offset(source.u.s,(int)from);
+            const char*p=start; int bytes=0;
+            for(int k=0;k<(int)len;k++){bytes+=utf8_rune_len(p);p+=utf8_rune_len(p);}
+            char *out=xmalloc((size_t)bytes+1); memcpy(out,start,(size_t)bytes); out[bytes]=0;
+            Value r=v_str(out); free(out);
+            if(target.kind){mut_store(e,&target,r);return v_null();}return r;
+        }
+        Value r=v_str("");
+        if(target.kind){mut_store(e,&target,r);return v_null();}return r;
     }
     die("slice"); return v_null();
 }
@@ -3247,7 +3678,7 @@ static Value b_split(Env*e,Value*a,int n){
             for(int choice=0;choice<choices;choice++){
                 Value delimiter=delimiters.k==V_BLOCK?*delimiters.u.block.b->items[choice]:delimiters;size_t length=0;
                 if(delimiter.k==V_REGEX){regex_t rx;if(regcomp(&rx,delimiter.u.s,REG_EXTENDED)==0){regmatch_t match;if(regexec(&rx,cursor,1,&match,0)==0&&match.rm_so==0&&match.rm_eo>0)length=(size_t)match.rm_eo;regfree(&rx);}}
-                else if(delimiter.k==V_CHAR){if((unsigned char)*cursor==(unsigned char)delimiter.u.c)length=1;}
+                else if(delimiter.k==V_CHAR){if(!strncmp(cursor,delimiter.u.c,strlen(delimiter.u.c)))length=strlen(delimiter.u.c);}
                 else {char *text=val_str(delimiter);size_t candidate=strlen(text);if(candidate&&strncmp(cursor,text,candidate)==0)length=candidate;free(text);}
                 if(length>matched)matched=length;
             }
@@ -3783,9 +4214,9 @@ static int collect_block_attrs(Env *e, Value **it, int n, int *ip){
 
 static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
     Value v = *it[*ip];
-    if(v.k==V_STR&&!strcmp(v.u.s,"~")&&*ip+1<n&&it[*ip+1]->k==V_STR){Value argument=*it[*ip+1];(*ip)+=2;return b_render(e,&argument,1);}
+    if((v.k==V_STR||v.k==V_SYMBOL)&&!strcmp(v.u.s,"~")&&*ip+1<n&&it[*ip+1]->k==V_STR){Value argument=*it[*ip+1];(*ip)+=2;return b_render(e,&argument,1);}
     if (v.k == V_BLOCK) { (*ip)++; return runBlockValue(e, v); }  /* inline (sub)expr */
-    if (v.k == V_STR && !strcmp(v.u.s,"@")) {
+    if ((v.k == V_STR || v.k == V_SYMBOL) && !strcmp(v.u.s,"@")) {
         /* `@[a b]` — an EVALUATED block value. In action-body block VALUES the
          * `@` and its block are raw tokens (`parts: parts ++ @[pa]`); parsePrimary
          * must combine them into a block whose elements are evaluated, or the `@`
@@ -3823,7 +4254,7 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
             if(env_bound(e,v.u.s)){Value bound=env_get(e,v.u.s);(*ip)++;if(bound.k==V_FUNC||bound.k==V_BUILTIN)return applyFunc(e,bound,NULL,0);return bound;}
             (*ip)++;return v;
         }
-        if (rt_builtin_known(v.u.s) && !env_bound(e, v.u.s)) {
+        if (rt_builtin_known(v.u.s) && (!env_bound(e, v.u.s) || !is_shadowable(v.u.s))) {
             /* function head: apply to the following expression(s). Arity-aware
              * when the head has a known fixed arity (loop/map/fold/select take
              * trailing block args verbatim); otherwise scan to a statement
@@ -3896,12 +4327,22 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
 }
 static Value evalExpr(Env *e, Value **it, int n, int *ip) {
     Value left = parsePrimary(e, it, n, ip);
-    while (*ip < n && is_binop(*it[*ip])) {
-        const char *op = (*it[*ip]).u.s; (*ip)++;
-        Value right = parsePrimary(e, it, n, ip);
-        left = apply_binop(e, left, op, right);
+    if (*ip >= n || !is_binop(*it[*ip])) return left;
+    /* Infix chains are single-precedence and RIGHT-associative (host rule:
+     * `a op1 b op2 c` == `a op1 (b op2 c)`, so `0 = x % 2` == `0 = (x % 2)`).
+     * Collect the whole chain, then fold from the right. */
+    Value *operands=(Value*)xmalloc((size_t)(n+1)*sizeof(Value));
+    const char **ops=(const char**)xmalloc((size_t)(n+1)*sizeof(const char*));
+    int count=0;
+    operands[count++]=left;
+    while (*ip<n && is_binop(*it[*ip])) {
+        ops[count-1]=(*it[*ip]).u.s; (*ip)++;
+        operands[count++]=parsePrimary(e,it,n,ip);
     }
-    return left;
+    Value result=operands[count-1];
+    for (int i=count-2;i>=0;i--) result=apply_binop(e,operands[i],ops[i],result);
+    free(operands); free(ops);
+    return result;
 }
 /* ---- dynamic paths in block-as-code --------------------------------------
  * A dynamic path value has "@DYN" as seg[0], the base variable name as seg[1],
@@ -4145,6 +4586,20 @@ Value runSeq(Env *e, IR **seq, int n) {
     return result;
 }
 
+/* host stdlib words are dispatch-through-the-symbol-table functions, so a user
+ * binding shadows them; compiled opcodes always win (empirically classified). */
+static int is_shadowable(const char *name){
+    static const char *words[] = {
+        "sum","first","last","max","min","upper","lower","sort","filter","fold",
+        "until","abs","floor","ceil","round","sqrt","trim","strip","repeat",
+        "contains?","key?","values","keys","push","pop","remove","insert",
+        "type","empty","index",
+        NULL
+    };
+    for (int i=0;words[i];i++) if(!strcmp(words[i],name)) return 1;
+    return 0;
+}
+
 /* a call whose callee is intrinsic: dispatch to a builtin */
 static Value callIntrinsic(Env *e, IR *node) {
     const char *name = node->fn->name;
@@ -4164,6 +4619,13 @@ static Value callIntrinsic(Env *e, IR *node) {
     Value out;
     int arithmeticRef=node->nargs>0&&argv[0].k==V_PATH&&(!strcmp(name,"add")||!strcmp(name,"sub")||!strcmp(name,"mul")||!strcmp(name,"div")||!strcmp(name,"fdiv")||!strcmp(name,"mod")||!strcmp(name,"pow"));
     if(arithmeticRef){MutTarget target;argv[0]=mut_load(e,argv[0],&target);if(rt_builtin(name,e,argv,node->nargs,&out)){mut_store(e,&target,out);if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);return v_null();}}
+    if (is_shadowable(name) && env_bound(e, name)) {
+        Value bound = env_get(e, name);
+        if (bound.k==V_FUNC || bound.k==V_BUILTIN) {
+            Value r = applyFunc(e, bound, argv, node->nargs);
+            if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);return r;
+        }
+    }
     if (rt_builtin(name, e, argv, node->nargs, &out)) { if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);return out; }
     if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);
     fprintf(stderr,"[unknown intrinsic: %s]\n", name);
@@ -4178,6 +4640,24 @@ static Value callIntrinsic(Env *e, IR *node) {
  * truthy and cNode sent every dict through the path emitter. Dispatch a leading
  * passthrough whose text is an infix symbol to the mapped builtin over the
  * following statements (arity-limited, like the block-as-code evaluator). */
+/* host auto-applies a block that is EXACTLY two expressions where one value is
+ * a function: `[f x]` -> f(x), `[x f]` -> f(x). Applies to function bodies,
+ * `do` blocks, and code-executed block values. A statement (`define`, `if`,
+ * `loop`, `return`, ...) in the two-expression tail disables it — the host
+ * only folds two trailing *value* expressions, not `[x: 5 f x]`. */
+static int node_is_stmt(IR *node){
+    if (!node || !node->op) return 1;
+    return !strcmp(node->op,"define")||!strcmp(node->op,"let")||!strcmp(node->op,"if")||
+           !strcmp(node->op,"unless")||!strcmp(node->op,"while")||!strcmp(node->op,"until")||
+           !strcmp(node->op,"loop")||!strcmp(node->op,"return")||!strcmp(node->op,"break")||
+           !strcmp(node->op,"continue")||!strcmp(node->op,"switch")||!strcmp(node->op,"case");
+}
+static Value apply_tail_two(Env *e, Value second, Value last){
+    if (last.k == V_FUNC && second.k != V_FUNC) return applyFunc(e, last, &second, 1);
+    if (second.k == V_FUNC && last.k != V_FUNC) return applyFunc(e, second, &last, 1);
+    return last;
+}
+
 static Value runDoSeq(Env *e, IR **seq, int n){
     if (n >= 3 && seq[0] && seq[0]->op && !strcmp(seq[0]->op,"passthrough")) {
         const char *nm = binop_name(seq[0]->v.u.s);
@@ -4192,8 +4672,9 @@ static Value runDoSeq(Env *e, IR **seq, int n){
             free(argv);
         }
     }
-    Value r = v_null();
-    for (int i=0;i<n;i++) r = runNode0(e, seq[i]);
+    Value r = v_null(), second = v_null();
+    for (int i=0;i<n;i++){ second = r; r = runNode0(e, seq[i]); if (rt_ret_set||rt_brk_set||rt_cont_set) break; }
+    if (n == 2 && !node_is_stmt(seq[0]) && !node_is_stmt(seq[1])) return apply_tail_two(e, second, r);
     return r;
 }
 
@@ -4210,9 +4691,11 @@ static Value runNode0(Env *e, IR *node) {
         if (!strcmp(node->name,"null"))  return v_null();
         if (!strcmp(node->name,"runtimeError")) return v_errorkind("Runtime Error");
         Value v = env_get(e, node->name);
-        if (v.k==V_NULL && rt_builtin_known(node->name)) {
+        if (v.k != V_NULL) return v;
+        if (rt_builtin_known(node->name)) {
             Value b; memset(&b,0,sizeof b); b.k=V_BUILTIN; b.u.s=(char*)node->name; return b;
         }
+        if (!env_bound(e, node->name)) { char msg[256]; snprintf(msg,sizeof msg,"name error: identifier not found: %s",node->name); die(msg); }
         return v;
     }
     if (!strcmp(node->op,"intrinsic")) return v_str(node->name); /* hostword marker */
@@ -4283,7 +4766,7 @@ static Value runNode0(Env *e, IR *node) {
     }
     if (!strcmp(node->op,"dictionary")) {
         IR *body=node->nargs ? node->args[0] : NULL;
-        if(body&&body->op&&!strcmp(body->op,"__seq")&&body->nargs>0){int stringData=1;size_t length=0;for(int i=0;i<body->nargs;i++){IR *part=body->args[i];if(!part||!part->op||strcmp(part->op,"const")||part->v.k!=V_CHAR){stringData=0;break;}length++;}if(stringData){char *path=xmalloc(length+1);for(size_t i=0;i<length;i++)path[i]=body->args[i]->v.u.c;path[length]=0;FILE*f=fopen(path,"rb");if(!f){char msg[512];snprintf(msg,sizeof msg,"dictionary: file not found '%s'",path);free(path);die(msg);}fclose(f);free(path);}}
+        if(body&&body->op&&!strcmp(body->op,"__seq")&&body->nargs>0){int stringData=1;size_t length=0;for(int i=0;i<body->nargs;i++){IR *part=body->args[i];if(!part||!part->op||strcmp(part->op,"const")||part->v.k!=V_CHAR){stringData=0;break;}length+=strlen(part->v.u.c);}if(stringData){char *path=xmalloc(length+1);size_t at=0;for(int i=0;i<body->nargs;i++){size_t n=strlen(body->args[i]->v.u.c);memcpy(path+at,body->args[i]->v.u.c,n);at+=n;}path[at]=0;FILE*f=fopen(path,"rb");if(!f){char msg[512];snprintf(msg,sizeof msg,"dictionary: file not found '%s'",path);free(path);die(msg);}fclose(f);free(path);}}
         Env *child=env_new(e);
         if(body&&body->op&&!strcmp(body->op,"__seq"))for(int i=0;i<body->nargs;i++){IR *field=body->args[i];if(field&&field->op&&!strcmp(field->op,"load")&&field->name&&!env_bound(child,field->name))env_define_local(child,field->name,v_null());}
         if(body && body->op && !strcmp(body->op,"__seq"))
@@ -4838,6 +5321,13 @@ static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline){
                 free(sb.b);
             }
         } else if(is_digit(c)){
+            /* `0x...` hex literal: host lexes 0xE8 as 232 (lowercase `0x` only;
+             * `0X1f` is `0` + the word `X1f` on the host, which then errors) */
+            if(c=='0'&&lx_peek(x,1)=='x'&&isxdigit((unsigned char)lx_peek(x,2))){
+                x->pos+=2;SB hx;sb_init(&hx);
+                while(x->pos<x->len&&isxdigit((unsigned char)lx_at(x))){sb_add(&hx,lx_at(x));x->pos++;}
+                lb_add(&b,v_int((long)strtoll(hx.b,NULL,16)));free(hx.b);continue;
+            }
             SB sb; sb_init(&sb); int hasDot; parse_number(x,&sb,&hasDot);
             if(!hasDot&&lx_at(x)==':'&&is_digit((unsigned char)lx_peek(x,1))){
                 x->pos++;SB denominator;sb_init(&denominator);while(x->pos<x->len&&is_digit((unsigned char)lx_at(x))){sb_add(&denominator,lx_at(x));x->pos++;}
@@ -4863,7 +5353,7 @@ static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline){
                 }
                 else lb_add(&b, v_float(atof(sb.b)));
             } else {
-                lb_add(&b, v_int(atol(sb.b)));
+                lb_add(&b, v_int_from_text(sb.b));
             }
             free(sb.b);
         } else if((unsigned char)c==0xC3 && (unsigned char)lx_peek(x,1)==0xB8){
@@ -4939,7 +5429,7 @@ static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline){
                     else lb_add(&b, v_token(V_SYMBOLLITERAL, g.b));
                     free(g.b);
                 } else {
-                    x->pos=initialP; SB s2; sb_init(&s2); parse_string(x,&s2,'\''); lb_add(&b, v_char(s2.b[0])); free(s2.b);
+                    x->pos=initialP; SB s2; sb_init(&s2); parse_string(x,&s2,'\''); lb_add(&b, v_char_text(s2.b)); free(s2.b);
                 }
             } else {
                 if(lx_at(x)=='\\' && (is_id_start((unsigned char)lx_peek(x,1))||is_digit((unsigned char)lx_peek(x,1)))){
@@ -4947,7 +5437,7 @@ static Value parse_block(LX*x,int level,int isSubBlock,int isSubInline){
                     Value p=parse_path(x,root,1);
                     lb_add(&b, mk_pathkind(V_PATHLITERAL,p));
                 } else if(lx_at(x)=='\''){
-                    x->pos++; lb_add(&b, v_char(sb.b[0])); free(sb.b);
+                    x->pos++; lb_add(&b, v_char_text(sb.b)); free(sb.b);
                 } else {
                     lb_add(&b, v_token(V_LITERAL, sb.b)); free(sb.b);
                 }

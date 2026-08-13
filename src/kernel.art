@@ -279,11 +279,16 @@ loadRule: function [env name][
     if "false" = name -> return false
     if "null" = name -> return null
     if "runtimeError" = name -> return runtimeError
-    ; The host resolves builtin words to the builtin, never
-    ; to a user function of the same name (verified: a user
-    ; `add` does not shadow the builtin `add`). So builtins
-    ; always delegate.
-    if key? BUILTIN_ARITY name -> return #[nodek: "hostword" name: name]
+    ; The host resolves COMPILED builtins to the builtin, never to a user
+    ; function of the same name (verified: a user `add` does not shadow the
+    ; builtin `add`). But STDLIB words (sum, first, last, max, min, ...) are
+    ; not compiled opcodes: the host dispatches them through the symbol table,
+    ; so a user `sum: function [a b][...]` DOES shadow them. A user binding of
+    ; a shadowable word wins over the builtin.
+    if key? BUILTIN_ARITY name [
+        if and? (key? SHADOWABLE name) [bound? env name] -> return lookup env name
+        return #[nodek: "hostword" name: name]
+    ]
     if bound? env name -> return lookup env name
     #[nodek: "hostword" name: name]
 ]
@@ -563,6 +568,7 @@ higherApply: function [env coll params action mode][
 ]
 
 evalHigher: function [env argv mode][
+    if 3 > size argv [ panic ("not enough parameters: " ++ mode) ]
     coll: evalNode env argv\0 :interpret
     if or? ("chunk" = mode) [or? ("cluster" = mode) ["gather" = mode]] [
         return higherGroup env coll argv\1 argv\2 mode
@@ -571,6 +577,7 @@ evalHigher: function [env argv mode][
 ]
 
 runHigher: function [env argv mode][
+    if 3 > size argv [ panic ("not enough parameters: " ++ mode) ]
     coll: runNode env argv\0
     params: runNode env argv\1
     action: runNode env argv\2
@@ -581,6 +588,10 @@ runHigher: function [env argv mode][
 ]
 
 emitHigher: function [env argv name][
+    if 3 > size argv [
+        msg: "not enough parameters: " ++ name
+        return #[op: "call" fn: #[op: "intrinsic" name: "panic"] args: @[#[op: "const" value: msg]]]
+    ]
     collIR: emitNode env argv\0
     paramsIR: emitNode env argv\1
     actionIR: emitNode env argv\2
@@ -1483,6 +1494,7 @@ evalInterpret: function [env node][
         if "arity" = node\name -> return kernelArity env
         if "symbols" = node\name -> return kernelSymbols env
         if 0 = BUILTIN_ARITY\[node\name] -> return delegateNullary node\name
+        if and? (key? SHADOWABLE node\name) [bound? env node\name] -> return lookup env node\name
         return #[nodek: "hostword" name: node\name]
     ]
     if and? (isNode node) ["define" = node\nodek] -> return evalDefine env node
@@ -1540,6 +1552,7 @@ runNode: function [env node][
         if "arity" = node\name -> return kernelArity env
         if "symbols" = node\name -> return kernelSymbols env
         if 0 = BUILTIN_ARITY\[node\name] -> return delegateNullary node\name
+        if and? (key? SHADOWABLE node\name) [bound? env node\name] -> return lookup env node\name
         return #[nodek: "hostword" name: node\name]
     ]
     if "break" = op [ LOOP_SIGNAL\break: true  return null ]
@@ -2205,6 +2218,9 @@ defRule "type" #[
     eval: function [env argv][
         value: evalNode env argv\0 :interpret
         if kernelObject? value -> return value\__type
+        if and? (:dictionary = type value) [key? value "nodek"] [
+            if "closure" = value\nodek -> return ":function"
+        ]
         delegate "type" @[value]
     ]
     emit: function [env argv][
@@ -2214,6 +2230,9 @@ defRule "type" #[
     run: function [env argv][
         value: runNode env argv\0
         if kernelObject? value -> return value\__type
+        if and? (:dictionary = type value) [key? value "nodek"] [
+            if "closure" = value\nodek -> return ":function"
+        ]
         delegate "type" @[value]
     ]
 ]
