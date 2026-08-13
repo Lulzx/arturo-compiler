@@ -144,8 +144,10 @@ static size_t checked_mul_size(size_t left,size_t right,const char *operation){
 static char *seg_text(Value v);
 static Value runNode0(Env *e, IR *node);
 static Value apply_tail_two(Env *e, Value second, Value last);
+static Value applyFunc(Env *caller, Value fn, Value *argv, int n);
 static int node_is_stmt(IR *node);
 static int is_shadowable(const char *name);
+static int fn_arity(const char *name);
 static int utf8_codepoint(const char *s);
 static int utf8_rune_len(const char *s);
 static int rune_count(const char *s);
@@ -985,6 +987,43 @@ static int   rt_brk_set = 0;   /* `break` inside a loop body */
 static int   rt_cont_set = 0;  /* `continue` inside a loop body */
 
 /* ---- apply a function value to evaluated args ----------------------------- */
+/* arity of a function VALUE (V_FUNC params block, or builtin arity by name) */
+static int value_arity(Value fn){
+    if (fn.k == V_FUNC) {
+        IR *p = fn.u.fn.params;
+        if (p && p->op && !strcmp(p->op,"block")) return p->nargs;
+        return p ? 1 : 0;
+    }
+    if (fn.k == V_BUILTIN && fn.u.s) return fn_arity(fn.u.s);
+    return -1;
+}
+static int is_pathget_ir(IR *node){
+    return node && node->op && !strcmp(node->op,"call") && node->fn
+        && node->fn->op && !strcmp(node->fn->op,"intrinsic")
+        && !strcmp(node->fn->name,"pathGet");
+}
+/* A statement whose value is a function read through a path, followed by its
+ * arguments (`ops\add a b`, `d\size 5`), is a call on the host: CheckCallablePath
+ * resolves the path and the invoke consumes exactly `arity` following items.
+ * `ir` is the statement that produced `fn`; returns 1 and fills `*r` when it
+ * consumed the tail, else 0 (caller keeps evaluating normally). */
+static int path_call_tail(Env *e, IR **seq, int n, int *ip, IR *ir, Value fn, Value *r){
+    if (!is_pathget_ir(ir)) return 0;
+    int arity = value_arity(fn);
+    if (arity < 0) return 0;
+    int avail = n - (*ip) - 1;
+    if (avail < 0) return 0;
+    int m = arity < avail ? arity : avail;
+    Value *argv = (Value*)xmalloc((size_t)(m+1)*sizeof(Value));
+    for (int k=0;k<m;k++){
+        argv[k] = runNode0(e, seq[*ip + 1 + k]);
+        if (rt_ret_set || rt_brk_set || rt_cont_set) { free(argv); return 0; }
+    }
+    *r = applyFunc(e, fn, argv, m);
+    free(argv);
+    *ip = *ip + m;
+    return 1;
+}
 static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
     if (fn.k==V_BUILTIN || fn.k==V_LITERAL || fn.k==V_WORD || fn.k==V_STR) {
         /* Arturo's `call 'name args` resolves a literal function reference.
@@ -1012,6 +1051,9 @@ static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
         second = r;
         r = runNode0(child, fn.u.fn.body[i]);
         if (rt_ret_set || rt_brk_set || rt_cont_set) break;
+        if (i==0 && r.k==V_FUNC && fn.u.fn.nbody>1
+            && path_call_tail(child, fn.u.fn.body, fn.u.fn.nbody, &i, fn.u.fn.body[0], r, &r))
+            continue;
     }
     for(int i=0;i<fn.u.fn.nexports;i++)if(env_find(child,fn.u.fn.exports[i])>=0)env_set(child->parent,fn.u.fn.exports[i],env_get(child,fn.u.fn.exports[i]));
     if (rt_ret_set) { rt_ret_set=0; return rt_ret_val; }
@@ -4673,7 +4715,12 @@ static Value runDoSeq(Env *e, IR **seq, int n){
         }
     }
     Value r = v_null(), second = v_null();
-    for (int i=0;i<n;i++){ second = r; r = runNode0(e, seq[i]); if (rt_ret_set||rt_brk_set||rt_cont_set) break; }
+    for (int i=0;i<n;i++){
+        second = r;
+        r = runNode0(e, seq[i]);
+        if (rt_ret_set||rt_brk_set||rt_cont_set) break;
+        if (i==0 && r.k==V_FUNC && n>1 && path_call_tail(e, seq, n, &i, seq[0], r, &r)) continue;
+    }
     if (n == 2 && !node_is_stmt(seq[0]) && !node_is_stmt(seq[1])) return apply_tail_two(e, second, r);
     return r;
 }

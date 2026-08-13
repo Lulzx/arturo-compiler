@@ -904,7 +904,32 @@ lowerWalk: function [blok start stopAtRoot][
             g: buildPathGet parts
             rewind ctx
             tryInfix ctx
-            appendValue ctx g
+            ; a path read as the DIRECT argument of `return`, whose last segment
+            ; names a known function, is a call head (host CheckCallablePath):
+            ; `return ops\add a b` applies the read function to a and b, and
+            ; `return ops\add` alone is an arity error — both matched.
+            segArity: null
+            if not? empty? ctx\stack [
+                fr: last ctx\stack
+                if "call" = fr\nodek [
+                    if "return" = calleeName fr\fn [
+                        if empty? fr\args [
+                            if 1 < size parts [
+                                lastSeg: parts\[dec (size parts)]
+                                if or? (:word = type lastSeg) [:literal = type lastSeg] [
+                                    segName: to :string lastSeg
+                                    if key? BUILTIN_ARITY segName [ segArity: BUILTIN_ARITY\[segName] ]
+                                    if null? segArity [
+                                        if key? ARITY segName [ segArity: ARITY\[segName] ]
+                                    ]
+                                ]
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+            if not? null? segArity [ descendCall ctx g segArity ]
+            if null? segArity [ appendValue ctx g ]
             ctx\i: ctx\i + 1
             ctx\processed: ctx\processed + 1
         ]

@@ -814,7 +814,40 @@ applyClosure: function [cl argVals][
     RET\value: null
     result: null
     if cl\ir -> result: runSeq child cl\body
-    if not? cl\ir -> result: evalSeq child (lowerBlock cl\body)
+    if not? cl\ir [
+        seq: lowerBlock cl\body
+        handled: false
+        ; a path read whose value is a closure, followed by its arguments
+        ; (`ops\add a b`), is a call on the host; apply it like CheckCallablePath.
+        if not? empty? seq [
+            firstNode: seq\0
+            if and? (:dictionary = type firstNode) ["call" = firstNode\nodek] [
+                if "pathGet" = calleeName firstNode\fn [
+                    fnVal: evalNode child firstNode :interpret
+                    if and? (:dictionary = type fnVal) ["closure" = fnVal\nodek] [
+                        arity: size fnVal\params
+                        n: size seq
+                        take: arity
+                        if take > (n - 1) -> take: n - 1
+                        argVals: @[]
+                        if 1 =< take [
+                            loop 1..take [j][
+                                addItem argVals (evalNode child seq\[j] :interpret)
+                            ]
+                        ]
+                        result: applyVal child fnVal argVals
+                        handled: true
+                        if take < (n - 1) [
+                            remaining: @[]
+                            loop (take + 1)..(n - 1) [k][ addItem remaining seq\[k] ]
+                            result: evalSeq child remaining
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        if not? handled -> result: evalSeq child seq
+    ]
     if RET\set [
         RET\set: false
         return RET\value
