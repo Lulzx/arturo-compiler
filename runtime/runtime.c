@@ -30,6 +30,55 @@
 #endif
 extern char **environ;
 
+/* ---- process arena ----------------------------------------------------- */
+/* Arturo blocks, dictionaries, environments, functions, and token strings
+ * are freely aliased. Their ownership boundary is the generated process, so
+ * track every runtime allocation and release the whole graph exactly once at
+ * shutdown. Temporary frees remove entries early without needing reference
+ * counts or recursive destruction. The bookkeeping nodes deliberately use the
+ * system allocator directly; the macros below only affect runtime allocations. */
+typedef struct ArenaAllocation ArenaAllocation;
+struct ArenaAllocation { void *pointer; ArenaAllocation *next; };
+static ArenaAllocation *g_arena_allocations=NULL;
+static int g_arena_cleanup_registered=0;
+static void arena_track(void *pointer){
+    ArenaAllocation *entry=(ArenaAllocation*)malloc(sizeof *entry);
+    if(!entry){fprintf(stderr,"runtime error: out of memory\n");exit(1);}
+    entry->pointer=pointer;entry->next=g_arena_allocations;g_arena_allocations=entry;
+}
+void *runtime_alloc(size_t size){
+    if(!g_arena_cleanup_registered){if(atexit(runtime_cleanup)!=0){fprintf(stderr,"runtime error: cannot register cleanup\n");exit(1);}g_arena_cleanup_registered=1;}
+    void *pointer=malloc(size?size:1);
+    if(!pointer){fprintf(stderr,"runtime error: out of memory\n");exit(1);}
+    arena_track(pointer);return pointer;
+}
+static void *arena_realloc(void *pointer,size_t size){
+    if(!pointer)return runtime_alloc(size);
+    ArenaAllocation *entry=g_arena_allocations;
+    while(entry&&entry->pointer!=pointer)entry=entry->next;
+    void *resized=realloc(pointer,size?size:1);
+    if(!resized){fprintf(stderr,"runtime error: out of memory\n");exit(1);}
+    if(entry)entry->pointer=resized;else arena_track(resized);
+    return resized;
+}
+static char *arena_strdup(const char *source){
+    size_t size=strlen(source)+1;char *copy=(char*)runtime_alloc(size);memcpy(copy,source,size);return copy;
+}
+static void arena_free(void *pointer){
+    if(!pointer)return;
+    ArenaAllocation **link=&g_arena_allocations;
+    while(*link&&(*link)->pointer!=pointer)link=&(*link)->next;
+    if(*link){ArenaAllocation *entry=*link;*link=entry->next;free(entry);}
+    free(pointer);
+}
+void runtime_cleanup(void){
+    while(g_arena_allocations){ArenaAllocation *entry=g_arena_allocations;g_arena_allocations=entry->next;free(entry->pointer);free(entry);}
+}
+#define malloc runtime_alloc
+#define realloc arena_realloc
+#define strdup arena_strdup
+#define free arena_free
+
 /* forward declaration so line_map_add (below, above the allocator
  * definitions) can grow the line map */
 static void *xrealloc(void *p, size_t n);

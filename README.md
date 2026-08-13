@@ -78,7 +78,9 @@ the parity corpus, because its expected result differs from the pinned host.
     make compat             # expected output for documented host fixes
     make unsupported        # reject intentionally unavailable capabilities
     make coverage           # declared vs implemented native intrinsics
-    make sanitize           # ASan + UBSan over every generated native program
+    make random             # seeded generated four-engine/native parity
+    make negative           # host/native invalid-program failure parity
+    make sanitize           # ASan + UBSan; Linux LSan over every native case
 
 Or by hand:
 
@@ -112,7 +114,8 @@ Or by hand:
 
 Built against Arturo 0.10.0, pinned to the revision in `corpus/m1/RESULTS.md`.
 CI downloads the prebuilt `v0.10.0` release binary on Linux and macOS before
-running parity, compatibility, ASan, and UBSan checks.
+running parity, compatibility, ASan, and UBSan checks. Linux also runs the
+LeakSanitizer gate; Apple Clang does not provide LeakSanitizer on macOS.
 Read `SPEC.md` for the precise proof boundary and design, and
 `LANGUAGE_SUPPORT.md` for the production-readiness gate and the route to full
 language coverage.

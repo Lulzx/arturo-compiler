@@ -3,7 +3,8 @@
 The compiler is self-hosting and differential tests prove its current corpus,
 but the standalone C target does **not** yet implement the entire Arturo
 language. `make coverage` reports the mechanical intrinsic boundary; `make
-check` proves behavior only for the checked-in corpus and compatibility cases.
+check` proves behavior for the checked-in corpus, compatibility cases,
+deterministically generated valid programs, and representative invalid cases.
 
 ## Current target boundary
 
@@ -35,9 +36,9 @@ check` proves behavior only for the checked-in corpus and compatibility cases.
 3. **Own structural semantics.** Add compiler rules and IR nodes for modules,
    objects/method dispatch, assignment/rebinding, structured exceptions, and
    interpolation. Each starts with a host-pinned corpus case.
-4. **Expand differential testing.** Import Arturo's upstream language test
-   suite, then add randomized and negative tests. Compare stdout, stderr, exit
-   status, and filesystem effects—not stdout alone.
+4. **Expand differential testing.** Keep importing Arturo's upstream language
+   suite and broadening deterministic randomized and negative tests. Compare
+   stdout, stderr, exit status, and filesystem effects—not stdout alone.
 5. **Harden the product.** Add source locations and diagnostics, sanitizers and
    leak checks for the C runtime, deterministic/reproducible builds, CI across
    supported operating systems and architectures, versioned artifacts, and a
@@ -50,11 +51,20 @@ native cases, plus thirty-two unmodified tests from the pinned upstream suite. `
 proves unavailable capabilities fail during compilation without producing an
 executable.
 
-`make sanitize` is the current ASan/UBSan gate across all 111 local and thirty-two
-vendored-upstream native cases. Leak
-checking remains separate because runtime values still use process-lifetime
-allocation; making ownership explicit is required before LeakSanitizer can be
-enabled without suppressing real leaks.
+`make sanitize` is the ASan/UBSan gate across all 111 local and thirty-two
+vendored-upstream native cases. Runtime allocations have an explicit
+process-lifetime arena ownership boundary and are reclaimed at exit. Linux
+therefore enables LeakSanitizer as a hard gate for every sanitizer case;
+Apple Clang runs ASan/UBSan without leak detection because it does not provide
+LeakSanitizer on macOS.
+
+`make random` currently exercises 25 reproducible seeds across host, kernel,
+compiled bytecode, runIR, and the standalone native executable. `make negative`
+checks eleven representative invalid programs: host and native must both fail
+without a signal and must agree on output emitted before the error. Exact native
+stderr remains enforced separately by `make diagnostics`. Generated collection
+indices stay inside the currently supported bounds; out-of-range `slice`
+semantics remain a known compatibility gap to close with a fixed regression.
 
 The release gate for a “full Arturo compiler” is: the pinned upstream suite and
 the local suite pass against the host for every supported target, no

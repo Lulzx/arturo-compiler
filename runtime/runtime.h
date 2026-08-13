@@ -147,6 +147,10 @@ IR *ir_op_attrs(const char *op, IR **args, int n, const char **names, IR **value
 IR *ir_seq(IR **items, int n);                 /* internal __seq of statements */
 
 /* ---- evaluation -------------------------------------------------------- */
+/* Process-lifetime arena used by runtime values and generated direct code.
+ * Aliased Arturo reference values are reclaimed together at process exit. */
+void *runtime_alloc(size_t size);
+void runtime_cleanup(void);
 void runtime_set_args(int argc, char **argv);
 void runtime_set_source(const char *path);
 Value runSeq(Env *e, IR **seq, int n);
