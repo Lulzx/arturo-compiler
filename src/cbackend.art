@@ -1480,7 +1480,7 @@ nativeHigher: function [n state selecting][
         seq: "dh_s" ++ (to :string state\next)
         state\next: state\next + 1
         lines: @[]
-        addItem lines ("DScalar *" ++ arr ++ " = (DScalar*)malloc(sizeof(DScalar) * " ++ (to :string (size checks)) ++ ");")
+        addItem lines ("DScalar *" ++ arr ++ " = (DScalar*)runtime_alloc(sizeof(DScalar) * " ++ (to :string (size checks)) ++ ");")
         addItem lines ("DSeq " ++ seq ++ " = ds_block(" ++ arr ++ ", 0);")
         loop checks [check][ addItem lines ("if (" ++ check\cond ++ ") " ++ arr ++ "[" ++ seq ++ ".n++] = " ++ check\value ++ ";") ]
         addItem lines seq
@@ -1859,13 +1859,13 @@ nativeProgram: function [ir][
     if not? body\ok [ return "" ]
     helpers: ""
     if state\concat [
-        helpers: "static char *dc_concat(const char *a, const char *b){ size_t na=strlen(a), nb=strlen(b); char *r=(char*)malloc(na+nb+1); memcpy(r,a,na); memcpy(r+na,b,nb+1); return r; }\n\n"
+        helpers: "static char *dc_concat(const char *a, const char *b){ size_t na=strlen(a), nb=strlen(b); char *r=(char*)runtime_alloc(na+nb+1); memcpy(r,a,na); memcpy(r+na,b,nb+1); return r; }\n\n"
     ]
     if state\checkedArithmetic [
         helpers: helpers ++ "static long dc_div(long a,long b){ if(!b) rt_error(\"division by zero\"); return a/b; }\nstatic long dc_mod(long a,long b){ if(!b) rt_error(\"division by zero\"); return a%b; }\n\n"
     ]
     if state\dynamic [
-        helpers: helpers ++ "typedef struct DSeq DSeq;\ntypedef struct { int tag; long i; double f; const char *s; DSeq *b; } DScalar;\nstruct DSeq { DScalar *items; size_t n; };\nstatic DScalar ds_null(void){ return (DScalar){0,0,0,NULL,NULL}; }\nstatic DScalar ds_int(long x){ return (DScalar){1,x,0,NULL,NULL}; }\nstatic DScalar ds_float(double x){ return (DScalar){2,0,x,NULL,NULL}; }\nstatic DScalar ds_string(const char *x){ return (DScalar){3,0,0,x,NULL}; }\nstatic DScalar ds_bool(int x){ return (DScalar){4,x,0,NULL,NULL}; }\nstatic DSeq ds_block(DScalar *x,size_t n){ return (DSeq){x,n}; }\nstatic DScalar ds_seq(DSeq x){ DSeq *p=(DSeq*)malloc(sizeof(DSeq)); *p=x; return (DScalar){5,0,0,NULL,p}; }\nstatic int ds_truth(DScalar x){ return x.tag != 0 && (x.tag != 4 || x.i); }\nstatic void ds_print_inner(DScalar x){ if(x.tag==0) printf(\"null\"); else if(x.tag==1) printf(\"%ld\",x.i); else if(x.tag==2) rt_write_float(x.f); else if(x.tag==3) printf(\"%s\",x.s); else if(x.tag==4) printf(x.i?\"true\":\"false\"); else { printf(\"[\"); for(size_t i=0;i<x.b->n;i++){ if(i)printf(\" \"); ds_print_inner(x.b->items[i]); } printf(\"]\"); } }\nstatic void ds_print(DScalar x){ ds_print_inner(x); putchar('\\n'); }\nstatic void ds_print_seq(DSeq x){ for(size_t i=0;i<x.n;i++){ ds_print_inner(x.items[i]); putchar(' '); } putchar('\\n'); }\n\n"
+        helpers: helpers ++ "typedef struct DSeq DSeq;\ntypedef struct { int tag; long i; double f; const char *s; DSeq *b; } DScalar;\nstruct DSeq { DScalar *items; size_t n; };\nstatic DScalar ds_null(void){ return (DScalar){0,0,0,NULL,NULL}; }\nstatic DScalar ds_int(long x){ return (DScalar){1,x,0,NULL,NULL}; }\nstatic DScalar ds_float(double x){ return (DScalar){2,0,x,NULL,NULL}; }\nstatic DScalar ds_string(const char *x){ return (DScalar){3,0,0,x,NULL}; }\nstatic DScalar ds_bool(int x){ return (DScalar){4,x,0,NULL,NULL}; }\nstatic DSeq ds_block(DScalar *x,size_t n){ return (DSeq){x,n}; }\nstatic DScalar ds_seq(DSeq x){ DSeq *p=(DSeq*)runtime_alloc(sizeof(DSeq)); *p=x; return (DScalar){5,0,0,NULL,p}; }\nstatic int ds_truth(DScalar x){ return x.tag != 0 && (x.tag != 4 || x.i); }\nstatic void ds_print_inner(DScalar x){ if(x.tag==0) printf(\"null\"); else if(x.tag==1) printf(\"%ld\",x.i); else if(x.tag==2) rt_write_float(x.f); else if(x.tag==3) printf(\"%s\",x.s); else if(x.tag==4) printf(x.i?\"true\":\"false\"); else { printf(\"[\"); for(size_t i=0;i<x.b->n;i++){ if(i)printf(\" \"); ds_print_inner(x.b->items[i]); } printf(\"]\"); } }\nstatic void ds_print(DScalar x){ ds_print_inner(x); putchar('\\n'); }\nstatic void ds_print_seq(DSeq x){ for(size_t i=0;i<x.n;i++){ ds_print_inner(x.items[i]); putchar(' '); } putchar('\\n'); }\n\n"
     ]
     content: body\code
     if not? empty? content [ content: "\t" ++ (replace content "\n" "\n\t") ++ "\n" ]

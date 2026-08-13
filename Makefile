@@ -14,7 +14,7 @@ RUNTIME_A = runtime/runtime.a
 SOURCES  = src/intrinsics.art src/modules.art src/semantics.art src/front.art src/kernel.art \
            src/ir.art src/backend.art src/cbackend.art runtime/runtime.c
 
-.PHONY: ncomp test verify upstream compat diagnostics unsupported coverage sanitize check clean
+.PHONY: ncomp test verify upstream compat diagnostics unsupported coverage random negative sanitize check clean
 
 # The native compiler: emitted by its own C backend, linked against runtime.c.
 ncomp: $(NCCOMP)
@@ -61,10 +61,18 @@ unsupported: ncomp
 coverage:
 	bash tools/language_coverage.sh
 
+# Deterministic generated valid programs stress combinations and boundaries
+# beyond the fixed corpus while remaining reproducible by seed.
+random: ncomp
+	bash tools/random_differential_test.sh
+
+negative: ncomp
+	bash tools/negative_differential_test.sh
+
 sanitize: ncomp
 	bash tools/sanitize_test.sh
 
-check: coverage test verify upstream compat diagnostics unsupported
+check: coverage test verify upstream compat diagnostics unsupported random negative
 
 clean:
 	rm -f $(NCCOMP) tmp/ncomp_src.art native_compiler
