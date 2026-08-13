@@ -84,6 +84,14 @@ static void *xmalloc(size_t n) {
     if (!p) { die("out of memory"); }
     return p;
 }
+static size_t checked_add_size(size_t left,size_t right,const char *operation){
+    if(right>SIZE_MAX-left)die(operation);
+    return left+right;
+}
+static size_t checked_mul_size(size_t left,size_t right,const char *operation){
+    if(left&&right>SIZE_MAX/left)die(operation);
+    return left*right;
+}
 static char *seg_text(Value v);
 static Value v_block_cpy(Value **items, int n);
 static char *fstr(double f, char *out, size_t cap);
@@ -1079,11 +1087,11 @@ static Value b_mul(Env*e,Value*a,int n){
     return num2(as_int(a[0])*as_int(a[1]));
 }
 static Value b_div(Env*e,Value*a,int n){
-    if(a[0].k==V_QUANTITY&&(a[1].k==V_INT||a[1].k==V_FLOAT||a[1].k==V_RATIONAL))return v_quantity(a[0].u.quantity.amount/as_float(a[1]),a[0].u.quantity.unit);
+    if(a[0].k==V_QUANTITY&&(a[1].k==V_INT||a[1].k==V_FLOAT||a[1].k==V_RATIONAL)){double denominator=as_float(a[1]);if(denominator==0.0)die("division by zero");return v_quantity(a[0].u.quantity.amount/denominator,a[0].u.quantity.unit);}
     if(a[0].k==V_QUANTITY&&a[1].k==V_QUANTITY){
         const char *leftProperty=unit_property(a[0].u.quantity.unit),*rightProperty=unit_property(a[1].u.quantity.unit);
         if(!strcmp(leftProperty,rightProperty)&&strcmp(leftProperty,"time"))return v_float(a[0].u.quantity.amount/quantity_convert_amount(a[1],a[0].u.quantity.unit));
-        int reduced;char *unit=quantity_quotient_unit(a[0].u.quantity.unit,a[1].u.quantity.unit,&reduced);double x=a[0].u.quantity.amount/a[1].u.quantity.amount;Value result=a[0].u.quantity.integral&&a[1].u.quantity.integral&&floor(x)==x?v_quantity_int((long)x,unit):v_quantity(x,unit);free(unit);return result;
+        double denominator=a[1].u.quantity.amount;if(denominator==0.0)die("division by zero");int reduced;char *unit=quantity_quotient_unit(a[0].u.quantity.unit,a[1].u.quantity.unit,&reduced);double x=a[0].u.quantity.amount/denominator;Value result=a[0].u.quantity.integral&&a[1].u.quantity.integral&&floor(x)==x?v_quantity_int((long)x,unit):v_quantity(x,unit);free(unit);return result;
     }
     if(a[0].k==V_RATIONAL&&a[1].k==V_COMPLEX){die("div: rational cannot receive complex");return v_null();}
     if(a[0].k==V_COMPLEX||a[1].k==V_COMPLEX){double ar,ai,br,bi;complex_parts(a[0],&ar,&ai);complex_parts(a[1],&br,&bi);double d=br*br+bi*bi;if(d==0.0)die("division by zero");return v_complex((ar*br+ai*bi)/d,(ai*br-ar*bi)/d);}
@@ -2941,8 +2949,9 @@ static Value b_remove(Env*e,Value*a,int n){
 }
 static Value b_repeat(Env*e,Value*a,int n){
     MutTarget t; Value v=mut_load(e,a[0],&t); long times=as_int(a[1]); if(times<0)times=0;
-    if(v.k==V_STR){size_t len=strlen(v.u.s),total=len*(size_t)times;char*s=(char*)xmalloc(total+1);for(long i=0;i<times;i++)memcpy(s+(size_t)i*len,v.u.s,len);s[total]=0;Value r=v_str(s);free(s);if(t.kind){mut_store(e,&t,r);return v_null();}return r;}
-    if(v.k==V_BLOCK){Block*b=v.u.block.b;int old=b->n,total=(int)(old*times);Value**items=(Value**)xmalloc((size_t)(total?total:1)*sizeof(Value*));for(int i=0;i<total;i++){items[i]=(Value*)xmalloc(sizeof(Value));*items[i]=*b->items[i%old];}Value r=v_block(items,total);if(t.kind){mut_store(e,&t,r);return v_null();}return r;}
+    if(v.k==V_STR){size_t len=strlen(v.u.s),total=checked_mul_size(len,(size_t)times,"repeat: result too large");char*s=(char*)xmalloc(checked_add_size(total,1,"repeat: result too large"));for(long i=0;i<times;i++)memcpy(s+(size_t)i*len,v.u.s,len);s[total]=0;Value r=v_str(s);free(s);if(t.kind){mut_store(e,&t,r);return v_null();}return r;}
+    if(v.k==V_BLOCK){Block*b=v.u.block.b;size_t total_size=checked_mul_size((size_t)b->n,(size_t)times,"repeat: result too large");if(total_size>INT_MAX)die("repeat: result too large");int old=b->n,total=(int)total_size;Value**items=(Value**)xmalloc((size_t)(total?total:1)*sizeof(Value*));for(int i=0;i<total;i++){items[i]=(Value*)xmalloc(sizeof(Value));*items[i]=*b->items[i%old];}Value r=v_block(items,total);if(t.kind){mut_store(e,&t,r);return v_null();}return r;}
+    if((unsigned long)times>(unsigned long)INT_MAX)die("repeat: result too large");
     {Value**items=xmalloc((size_t)(times?times:1)*sizeof(Value*));for(int i=0;i<times;i++){items[i]=xmalloc(sizeof(Value));*items[i]=clone_value(v);}Value r=v_block(items,(int)times);if(t.kind){mut_store(e,&t,r);return v_null();}return r;}
 }
 static Value b_rotate(Env*e,Value*a,int n){
@@ -3083,10 +3092,13 @@ static Value b_replace(Env*e,Value*a,int n){
     if(source.k!=V_STR||a[1].k!=V_STR||a[2].k!=V_STR)die("replace: expected strings");
     const char *s=source.u.s, *from=a[1].u.s, *to=a[2].u.s;
     if(!*from){Value result=v_str(s);if(target.kind){mut_store(e,&target,result);return v_null();}return result;}
-    int cnt=0; for(const char*p=s;(p=strstr(p,from));p+=strlen(from)) cnt++;
+    size_t cnt=0; for(const char*p=s;(p=strstr(p,from));p+=strlen(from)) cnt++;
     if(!cnt){Value result=v_str(s);if(target.kind){mut_store(e,&target,result);return v_null();}return result;}
     size_t fl=strlen(from), tl=strlen(to), sl=strlen(s);
-    char *out=xmalloc(sl + cnt*(tl-fl) + 1);
+    size_t replaced=checked_mul_size(cnt,fl,"replace: result too large");
+    size_t inserted=checked_mul_size(cnt,tl,"replace: result too large");
+    size_t out_length=checked_add_size(sl-replaced,inserted,"replace: result too large");
+    char *out=xmalloc(checked_add_size(out_length,1,"replace: result too large"));
     char *o=out;
     const char *p;
     while((p=strstr(s,from))){
@@ -3149,14 +3161,14 @@ static Value b_slice(Env*e,Value*a,int n){
     long from=as_int(a[1]), to=as_int(a[2]);
     if(source.k==V_BLOCK){
         int m=source.u.block.b->n;
-        if(from<0) from=0; if(to>=m) to=m-1;
+        if(from<0) from=0; if(from>m) from=m; if(to>=m) to=m-1;
         int cnt=(int)(to-from+1); if(cnt<0) cnt=0;
         Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
         for(int i=0;i<cnt;i++) items[i]=source.u.block.b->items[from+i];Value result=v_block(items,cnt);if(target.kind){mut_store(e,&target,result);return v_null();}return result;
     }
     if(source.k==V_STR){
         const char*s=source.u.s; long m=(long)strlen(s);
-        if(from<0) from=0; if(to>=m) to=m-1;
+        if(from<0) from=0; if(from>m) from=m; if(to>=m) to=m-1;
         long cnt=to-from+1; if(cnt<0) cnt=0;
         char *out=xmalloc(cnt+1); memcpy(out,s+from,cnt); out[cnt]=0;
         Value r=v_str(out); free(out);if(target.kind){mut_store(e,&target,r);return v_null();}return r;
@@ -3165,7 +3177,7 @@ static Value b_slice(Env*e,Value*a,int n){
 }
 /* `split s sep` — split a string into a block of substrings. */
 static Value b_split(Env*e,Value*a,int n){
-    MutTarget target;Value source=mut_load(e,a[0],&target);long width=rt_has_attr("every")?as_int(rt_attr_value("every",v_int(1))):1;if(source.k==V_BLOCK&&rt_has_attr("every")){int count=(source.u.block.b->n+(int)width-1)/(int)width;Value **groups=xmalloc((size_t)(count?count:1)*sizeof(Value*));for(int g=0;g<count;g++){int start=g*(int)width,items=source.u.block.b->n-start;if(items>width)items=(int)width;Value **part=xmalloc((size_t)(items?items:1)*sizeof(Value*));for(int i=0;i<items;i++){part[i]=xmalloc(sizeof(Value));*part[i]=*source.u.block.b->items[start+i];}groups[g]=xmalloc(sizeof(Value));*groups[g]=v_block(part,items);}Value result=v_block(groups,count);if(target.kind){mut_store(e,&target,result);return v_null();}return result;}if(source.k==V_BLOCK&&!rt_has_attr("at"))return target.kind?v_null():source;if(source.k!=V_STR&&source.k!=V_BLOCK)die("split: expected string or block");const char *s=source.k==V_STR?source.u.s:"";
+    MutTarget target;Value source=mut_load(e,a[0],&target);long width=rt_has_attr("every")?as_int(rt_attr_value("every",v_int(1))):1;if(rt_has_attr("every")&&(width<=0||width>INT_MAX))die("split.every: expected positive width");if(source.k==V_BLOCK&&rt_has_attr("every")){int count=(source.u.block.b->n+(int)width-1)/(int)width;Value **groups=xmalloc((size_t)(count?count:1)*sizeof(Value*));for(int g=0;g<count;g++){int start=g*(int)width,items=source.u.block.b->n-start;if(items>width)items=(int)width;Value **part=xmalloc((size_t)(items?items:1)*sizeof(Value*));for(int i=0;i<items;i++){part[i]=xmalloc(sizeof(Value));*part[i]=*source.u.block.b->items[start+i];}groups[g]=xmalloc(sizeof(Value));*groups[g]=v_block(part,items);}Value result=v_block(groups,count);if(target.kind){mut_store(e,&target,result);return v_null();}return result;}if(source.k==V_BLOCK&&!rt_has_attr("at"))return target.kind?v_null():source;if(source.k!=V_STR&&source.k!=V_BLOCK)die("split: expected string or block");const char *s=source.k==V_STR?source.u.s:"";
     if(rt_has_attr("at")){
         long cut=as_int(rt_attr_value("at",v_int(0)));if(cut<0)cut=0;
         Value **halves=xmalloc(2*sizeof(Value*));
@@ -3695,19 +3707,19 @@ static int block_arg(const char *name, int idx){
  * block-as-code evaluation (`join.with: " " lst` inside a `case` arm or loop
  * body). Installs them into g_attrs and returns 1 when any were found. */
 static int collect_block_attrs(Env *e, Value **it, int n, int *ip){
-    char **names=NULL; Value *vals=NULL; int cnt=0;
+    const char **names=NULL; Value *vals=NULL; int cnt=0;
     while(*ip<n){
         Value t=*it[*ip];
         if(t.k==V_ATTRIBUTELABEL){
             const char *nm=t.u.s; (*ip)++;
             Value v=evalExpr(e,it,n,ip);
-            names=(char**)xrealloc(names,(size_t)(cnt+1)*sizeof(char*));
+            names=(const char**)xrealloc(names,(size_t)(cnt+1)*sizeof(char*));
             vals=(Value*)xrealloc(vals,(size_t)(cnt+1)*sizeof(Value));
             names[cnt]=strdup(nm); vals[cnt]=v; cnt++;
             continue;
         }
         if(t.k==V_ATTRIBUTE){
-            names=(char**)xrealloc(names,(size_t)(cnt+1)*sizeof(char*));
+            names=(const char**)xrealloc(names,(size_t)(cnt+1)*sizeof(char*));
             vals=(Value*)xrealloc(vals,(size_t)(cnt+1)*sizeof(Value));
             names[cnt]=strdup(t.u.s); vals[cnt]=v_bool(1); cnt++;
             (*ip)++;

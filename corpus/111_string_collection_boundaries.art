@@ -1,0 +1,10 @@
+; Replacement shrinking and empty out-of-range slices exercise allocation and
+; pointer boundaries that normal collection cases do not reach.
+s: "hello"
+replace 's "ll" "x"
+print s
+print slice "abc" 99 100
+print slice [1 2 3] 99 100
+print slice "abc" 2 1
+print slice [1 2 3] 2 1
+print repeat [] 2

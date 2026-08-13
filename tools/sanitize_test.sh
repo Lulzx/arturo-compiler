@@ -6,13 +6,13 @@
 # (Linux) a leak REPORT is produced but does not fail the run, so the ownership
 # boundary stays visible without silently accepting an incomplete gate.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 root=$PWD
 work=$(mktemp -d /tmp/arturo-sanitize.XXXXXX)
 trap 'rm -rf "$work"' EXIT
 
 cc_bin=${CC:-cc}
-flags=(-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined)
+flags=(-O1 -g -fno-omit-frame-pointer "-fsanitize=address,undefined")
 crypto_lib=(-lcrypto)
 leak_report=0
 if [ "$(uname -s)" = Darwin ]; then crypto_lib=(); else leak_report=1; fi
@@ -43,7 +43,8 @@ leak_summary() {
         ASAN_OPTIONS=detect_leaks=1:halt_on_error=0 \
             ARTURO_NO_COLOR=1 "$generated.san" >/dev/null 2>"$generated.lsan"
     ) || true
-    local definitely=$(grep -m1 "Definitely lost:" "$generated.lsan" | awk '{print $3, $4, $5}')
+    local definitely
+    definitely=$(grep -m1 "Definitely lost:" "$generated.lsan" | awk '{print $3, $4, $5}' || true)
     echo "LSAN $base: definitely lost ${definitely:-n/a}"
 }
 
@@ -63,7 +64,7 @@ for source in upstream/*/*.art; do
 done
 
 if [ "$leak_report" -eq 1 ]; then
-    first=$(ls corpus/*.art | head -1)
+    first=$(find corpus -maxdepth 1 -name '*.art' -print | sort | head -1)
     leak_summary "$(basename "$first" .art)" "$(basename "$first" .art)"
 fi
 

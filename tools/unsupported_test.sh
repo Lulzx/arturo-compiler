@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/arturo-unsupported.XXXXXX")
 trap 'rm -rf "$work"' EXIT
