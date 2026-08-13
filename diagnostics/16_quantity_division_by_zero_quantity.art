@@ -1,0 +1,2 @@
+print "before"
+print 1`m / 0`s

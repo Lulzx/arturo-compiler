@@ -1087,11 +1087,11 @@ static Value b_mul(Env*e,Value*a,int n){
     return num2(as_int(a[0])*as_int(a[1]));
 }
 static Value b_div(Env*e,Value*a,int n){
-    if(a[0].k==V_QUANTITY&&(a[1].k==V_INT||a[1].k==V_FLOAT||a[1].k==V_RATIONAL))return v_quantity(a[0].u.quantity.amount/as_float(a[1]),a[0].u.quantity.unit);
+    if(a[0].k==V_QUANTITY&&(a[1].k==V_INT||a[1].k==V_FLOAT||a[1].k==V_RATIONAL)){double denominator=as_float(a[1]);if(denominator==0.0)die("division by zero");return v_quantity(a[0].u.quantity.amount/denominator,a[0].u.quantity.unit);}
     if(a[0].k==V_QUANTITY&&a[1].k==V_QUANTITY){
         const char *leftProperty=unit_property(a[0].u.quantity.unit),*rightProperty=unit_property(a[1].u.quantity.unit);
         if(!strcmp(leftProperty,rightProperty)&&strcmp(leftProperty,"time"))return v_float(a[0].u.quantity.amount/quantity_convert_amount(a[1],a[0].u.quantity.unit));
-        int reduced;char *unit=quantity_quotient_unit(a[0].u.quantity.unit,a[1].u.quantity.unit,&reduced);double x=a[0].u.quantity.amount/a[1].u.quantity.amount;Value result=a[0].u.quantity.integral&&a[1].u.quantity.integral&&floor(x)==x?v_quantity_int((long)x,unit):v_quantity(x,unit);free(unit);return result;
+        double denominator=a[1].u.quantity.amount;if(denominator==0.0)die("division by zero");int reduced;char *unit=quantity_quotient_unit(a[0].u.quantity.unit,a[1].u.quantity.unit,&reduced);double x=a[0].u.quantity.amount/denominator;Value result=a[0].u.quantity.integral&&a[1].u.quantity.integral&&floor(x)==x?v_quantity_int((long)x,unit):v_quantity(x,unit);free(unit);return result;
     }
     if(a[0].k==V_RATIONAL&&a[1].k==V_COMPLEX){die("div: rational cannot receive complex");return v_null();}
     if(a[0].k==V_COMPLEX||a[1].k==V_COMPLEX){double ar,ai,br,bi;complex_parts(a[0],&ar,&ai);complex_parts(a[1],&br,&bi);double d=br*br+bi*bi;if(d==0.0)die("division by zero");return v_complex((ar*br+ai*bi)/d,(ai*br-ar*bi)/d);}
