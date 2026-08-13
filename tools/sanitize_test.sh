@@ -44,7 +44,7 @@ leak_summary() {
             ARTURO_NO_COLOR=1 "$generated.san" >/dev/null 2>"$generated.lsan"
     ) || true
     local definitely
-    definitely=$(grep -m1 "Definitely lost:" "$generated.lsan" | awk '{print $3, $4, $5}')
+    definitely=$(grep -m1 "Definitely lost:" "$generated.lsan" | awk '{print $3, $4, $5}' || true)
     echo "LSAN $base: definitely lost ${definitely:-n/a}"
 }
 
