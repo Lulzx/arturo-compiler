@@ -305,8 +305,13 @@ evalLet: function [env argv][
 ]
 
 evalReturn: function [env valNode][
+    ; Evaluate the argument FIRST: `return <call f>` must run f (whose
+    ; applyClosure resets RET\set at entry) without clobbering the flag this
+    ; op is about to raise — mirroring the native runtime's applyFunc.
+    v: evalNode env valNode :interpret
     RET\set: true
-    RET\value: evalNode env valNode :interpret
+    RET\value: v
+    v
 ]
 
 makeClosure: function [env params body][
@@ -816,37 +821,42 @@ applyClosure: function [cl argVals][
     if cl\ir -> result: runSeq child cl\body
     if not? cl\ir [
         seq: lowerBlock cl\body
-        handled: false
+        j: 0
+        n: size seq
         ; a path read whose value is a closure, followed by its arguments
-        ; (`ops\add a b`), is a call on the host; apply it like CheckCallablePath.
-        if not? empty? seq [
-            firstNode: seq\0
-            if and? (:dictionary = type firstNode) ["call" = firstNode\nodek] [
-                if "pathGet" = calleeName firstNode\fn [
-                    fnVal: evalNode child firstNode :interpret
+        ; (`ops\add a b`), is a call on the host; apply it like CheckCallablePath
+        ; at ANY statement position, consuming exactly `arity` following items.
+        while [j < n][
+            handled: false
+            node: seq\[j]
+            if and? (:dictionary = type node) ["call" = node\nodek] [
+                if "pathGet" = calleeName node\fn [
+                    fnVal: evalNode child node :interpret
                     if and? (:dictionary = type fnVal) ["closure" = fnVal\nodek] [
                         arity: size fnVal\params
-                        n: size seq
-                        take: arity
-                        if take > (n - 1) -> take: n - 1
+                        avail: (n - j) - 1
+                        if avail < arity -> panic "not enough parameters"
                         argVals: @[]
-                        if 1 =< take [
-                            loop 1..take [j][
-                                addItem argVals (evalNode child seq\[j] :interpret)
-                            ]
+                        if 1 =< arity [
+                            loop 1..arity [kk][ addItem argVals (evalNode child seq\[j + kk] :interpret) ]
                         ]
                         result: applyVal child fnVal argVals
+                        j: j + arity + 1
                         handled: true
-                        if take < (n - 1) [
-                            remaining: @[]
-                            loop (take + 1)..(n - 1) [k][ addItem remaining seq\[k] ]
-                            result: evalSeq child remaining
-                        ]
                     ]
                 ]
             ]
+            if handled [
+                if RET\set -> break
+            ]
+            if not? handled [
+                result: evalNode child node :interpret
+                j: j + 1
+                if RET\set -> break
+                if LOOP_SIGNAL\break -> break
+                if LOOP_SIGNAL\continue -> break
+            ]
         ]
-        if not? handled -> result: evalSeq child seq
     ]
     if RET\set [
         RET\set: false

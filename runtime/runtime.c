@@ -994,7 +994,10 @@ static int value_arity(Value fn){
         if (p && p->op && !strcmp(p->op,"block")) return p->nargs;
         return p ? 1 : 0;
     }
-    if (fn.k == V_BUILTIN && fn.u.s) return fn_arity(fn.u.s);
+    /* every intrinsic has a declared arity (the same table the host's
+     * CheckCallablePath uses); the hand-curated fn_arity list only covered a
+     * fraction of names, so `ops\print 3` in statement position went unapplied. */
+    if (fn.k == V_BUILTIN && fn.u.s) return declared_arity_of(fn.u.s);
     return -1;
 }
 static int is_pathget_ir(IR *node){
@@ -5031,6 +5034,10 @@ static Value runNode0(Env *e, IR *node) {
         }
         /* user callee: evaluate to a function value and apply */
         Value fn = runNode0(e, node->fn);
+        /* a path whose value is DATA is not a call on the host (CheckCallablePath
+         * only fires for a function), so a front-grouped `return d\add 3 4` where
+         * `d\add` holds 5 returns the value and drops the args — it must not die. */
+        if (is_pathget_ir(node->fn) && fn.k != V_FUNC && fn.k != V_BUILTIN) return fn;
         Value *attrValues=(Value*)xmalloc((size_t)(node->nattrs+1)*sizeof(Value));
         for(int i=0;i<node->nattrs;i++)attrValues[i]=runNode0(e,node->attr_values[i]);
         Value *argv=(Value*)xmalloc((node->nargs+1)*sizeof(Value));
