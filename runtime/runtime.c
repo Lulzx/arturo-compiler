@@ -1005,24 +1005,40 @@ static int is_pathget_ir(IR *node){
 /* A statement whose value is a function read through a path, followed by its
  * arguments (`ops\add a b`, `d\size 5`), is a call on the host: CheckCallablePath
  * resolves the path and the invoke consumes exactly `arity` following items.
- * `ir` is the statement that produced `fn`; returns 1 and fills `*r` when it
- * consumed the tail, else 0 (caller keeps evaluating normally). */
+ * `ir` is the statement that produced `fn` (or the pathGet argument of a
+ * `return` statement); returns 1 and fills `*r` when it consumed the tail,
+ * else 0 (caller keeps evaluating normally). The host raises "not enough
+ * parameters" when fewer than `arity` items follow; applying with fewer
+ * silently ran a closure with unbound params, so that too is an error here. */
 static int path_call_tail(Env *e, IR **seq, int n, int *ip, IR *ir, Value fn, Value *r){
     if (!is_pathget_ir(ir)) return 0;
     int arity = value_arity(fn);
     if (arity < 0) return 0;
     int avail = n - (*ip) - 1;
     if (avail < 0) return 0;
-    int m = arity < avail ? arity : avail;
-    Value *argv = (Value*)xmalloc((size_t)(m+1)*sizeof(Value));
-    for (int k=0;k<m;k++){
+    if (avail < arity) {
+        const char *nm = (fn.k==V_BUILTIN && fn.u.s) ? fn.u.s : "function";
+        char msg[256];
+        snprintf(msg,sizeof msg,"%s: not enough arguments (expected %d, got %d)", nm, arity, avail);
+        die(msg);
+    }
+    Value *argv = (Value*)xmalloc((size_t)(arity+1)*sizeof(Value));
+    for (int k=0;k<arity;k++){
         argv[k] = runNode0(e, seq[*ip + 1 + k]);
         if (rt_ret_set || rt_brk_set || rt_cont_set) { free(argv); return 0; }
     }
-    *r = applyFunc(e, fn, argv, m);
+    *r = applyFunc(e, fn, argv, arity);
     free(argv);
-    *ip = *ip + m;
+    *ip = *ip + arity;
     return 1;
+}
+/* the pathGet argument of a `return <pathGet>` statement the front could not
+ * group into a call (a runtime-valued dict function): the returned value is a
+ * function read through a path, and the host applies the following items to it. */
+static IR *ret_pathget(IR *node){
+    if (!node || !node->op || strcmp(node->op,"return")) return NULL;
+    if (node->nargs < 1) return NULL;
+    return is_pathget_ir(node->args[0]) ? node->args[0] : NULL;
 }
 static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
     if (fn.k==V_BUILTIN || fn.k==V_LITERAL || fn.k==V_WORD || fn.k==V_STR) {
@@ -1047,17 +1063,32 @@ static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
     }
     rt_ret_set=0;
     Value r = v_null(), second = v_null();
+    int tailed = 0;   /* a path call consumed its tail; skip the 2-expr fold */
     for (int i=0;i<fn.u.fn.nbody;i++){
         second = r;
         r = runNode0(child, fn.u.fn.body[i]);
-        if (rt_ret_set || rt_brk_set || rt_cont_set) break;
-        if (i==0 && r.k==V_FUNC && fn.u.fn.nbody>1
-            && path_call_tail(child, fn.u.fn.body, fn.u.fn.nbody, &i, fn.u.fn.body[0], r, &r))
+        if (rt_brk_set || rt_cont_set) break;
+        if (rt_ret_set) {
+            /* `return ops\f a b` when the front could not group the path (a
+             * runtime-valued dict function): the returned value is a function
+             * read through a path, so its arguments follow as statements. */
+            IR *pg = ret_pathget(fn.u.fn.body[i]);
+            if (pg && (r.k==V_FUNC || r.k==V_BUILTIN)) {
+                rt_ret_set = 0;  /* the return already delivered; a tail may follow */
+                if (path_call_tail(child, fn.u.fn.body, fn.u.fn.nbody, &i, pg, r, &r)) rt_ret_val = r;
+                rt_ret_set = 1;
+            }
+            break;
+        }
+        if (r.k==V_FUNC && fn.u.fn.nbody>1
+            && path_call_tail(child, fn.u.fn.body, fn.u.fn.nbody, &i, fn.u.fn.body[i], r, &r)) {
+            tailed = 1;
             continue;
+        }
     }
     for(int i=0;i<fn.u.fn.nexports;i++)if(env_find(child,fn.u.fn.exports[i])>=0)env_set(child->parent,fn.u.fn.exports[i],env_get(child,fn.u.fn.exports[i]));
     if (rt_ret_set) { rt_ret_set=0; return rt_ret_val; }
-    if (fn.u.fn.nbody == 2 && !node_is_stmt(fn.u.fn.body[0]) && !node_is_stmt(fn.u.fn.body[1])) return apply_tail_two(child, second, r);
+    if (!tailed && fn.u.fn.nbody == 2 && !node_is_stmt(fn.u.fn.body[0]) && !node_is_stmt(fn.u.fn.body[1])) return apply_tail_two(child, second, r);
     return r;
 }
 
@@ -4715,13 +4746,23 @@ static Value runDoSeq(Env *e, IR **seq, int n){
         }
     }
     Value r = v_null(), second = v_null();
+    int tailed = 0;   /* a path call consumed its tail; skip the 2-expr fold */
     for (int i=0;i<n;i++){
         second = r;
         r = runNode0(e, seq[i]);
-        if (rt_ret_set||rt_brk_set||rt_cont_set) break;
-        if (i==0 && r.k==V_FUNC && n>1 && path_call_tail(e, seq, n, &i, seq[0], r, &r)) continue;
+        if (rt_brk_set || rt_cont_set) break;
+        if (rt_ret_set) {
+            IR *pg = ret_pathget(seq[i]);
+            if (pg && (r.k==V_FUNC || r.k==V_BUILTIN)) {
+                rt_ret_set = 0;
+                if (path_call_tail(e, seq, n, &i, pg, r, &r)) rt_ret_val = r;
+                rt_ret_set = 1;
+            }
+            break;
+        }
+        if (r.k==V_FUNC && n>1 && path_call_tail(e, seq, n, &i, seq[i], r, &r)) { tailed = 1; continue; }
     }
-    if (n == 2 && !node_is_stmt(seq[0]) && !node_is_stmt(seq[1])) return apply_tail_two(e, second, r);
+    if (!tailed && n == 2 && !node_is_stmt(seq[0]) && !node_is_stmt(seq[1])) return apply_tail_two(e, second, r);
     return r;
 }
 
