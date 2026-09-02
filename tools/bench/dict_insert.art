@@ -1,0 +1,6 @@
+d: #[]
+loop 1..50000 'i -> set d (to :string i) i
+hits: 0
+loop 1..50000 'i [ if key? d (to :string i) -> hits: hits + get d (to :string i) ]
+print size d
+print hits

@@ -1,0 +1,7 @@
+xs: map 1..100000 'i -> (i * 7919) % 100003
+s: sort xs
+print first s
+print last s
+print s\50000
+words: map 1..30000 'i -> to :string (i * 31) % 9973
+print first sort words

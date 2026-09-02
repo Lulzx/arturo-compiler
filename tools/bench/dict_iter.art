@@ -1,0 +1,5 @@
+d: #[]
+loop 1..20000 'i -> set d (to :string i) i * 2
+acc: 0
+loop 1..10 'r [ loop d [k v][ acc: acc + v + size k ] ]
+print acc

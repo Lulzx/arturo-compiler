@@ -1,0 +1,10 @@
+k: 5
+addk: function [x][ x + k ]
+xs: map 1..100000 'i -> addk i
+total: 0
+loop xs 'x [ total: total + x ]
+sq: function [v][ v * v ]
+print total
+print sum map 1..50000 'i -> sq i
+twice: function [f v][ do [f f v] ]
+print twice 'sq 3

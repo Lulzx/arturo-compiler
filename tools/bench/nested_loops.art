@@ -1,0 +1,9 @@
+count: 0
+loop 1..100 'a [
+    loop 1..100 'b [
+        loop 1..30 'c [
+            if 0 = (a + b + c) % 7 -> count: count + 1
+        ]
+    ]
+]
+print count

@@ -1,0 +1,9 @@
+xs: map 1..200000 'i -> i * 3
+evens: select xs 'x -> 0 = x % 2
+big: filter evens 'x -> x < 1000
+print size big
+print every? big 'x -> x > 999
+print some? evens 'x -> x = 6
+s: 0
+loop (map evens 'e -> e / 3) 'v [ s: s + v ]
+print s

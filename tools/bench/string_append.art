@@ -1,0 +1,6 @@
+s: ""
+loop 1..20000 'i -> s: s ++ "ab"
+parts: map 1..20000 'i -> to :string i
+j: join parts
+print size s
+print size j

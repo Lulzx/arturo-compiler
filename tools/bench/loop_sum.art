@@ -1,0 +1,6 @@
+total: 0
+loop 1..300000 'x [ total: total + x ]
+xs: map 1..1000 'i -> i
+acc: 0
+loop 1..200 'k [ loop xs 'x [ acc: acc + x ] ]
+print total + acc

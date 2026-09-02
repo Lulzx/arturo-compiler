@@ -8,13 +8,16 @@ AR      ?= ar
 # bootstrap link on macOS, while `-O1` builds the same compiler in seconds and
 # keeps its corpus compile throughput effectively unchanged.
 CFLAGS  ?= -O1 -fvisibility=hidden
+# The runtime is one translation unit linked into every program; its hot
+# paths deserve -O2, which costs nothing noticeable at build time.
+RUNTIME_CFLAGS ?= -O2 -fvisibility=hidden
 NCCOMP   = tmp/ncomp
 RUNTIME_O = runtime/runtime.o
 RUNTIME_A = runtime/runtime.a
 SOURCES  = src/intrinsics.art src/modules.art src/semantics.art src/front.art src/kernel.art \
            src/ir.art src/backend.art src/cbackend.art runtime/runtime.c
 
-.PHONY: ncomp test verify upstream compat diagnostics unsupported coverage random negative sanitize check clean
+.PHONY: bench ncomp test verify upstream compat diagnostics unsupported coverage random negative sanitize check clean
 
 # The native compiler: emitted by its own C backend, linked against runtime.c.
 ncomp: $(NCCOMP)
@@ -27,7 +30,7 @@ runtime/intrinsic_arity.inc: src/intrinsics.art tools/gen_intrinsic_arity.sh
 	sh tools/gen_intrinsic_arity.sh
 
 $(RUNTIME_O): runtime/runtime.c runtime/runtime.h runtime/intrinsic_arity.inc Makefile
-	$(CC) $(CFLAGS) -c -Iruntime runtime/runtime.c -o $(RUNTIME_O)
+	$(CC) $(RUNTIME_CFLAGS) -c -Iruntime runtime/runtime.c -o $(RUNTIME_O)
 
 $(RUNTIME_A): $(RUNTIME_O)
 	$(AR) rcs $(RUNTIME_A) $(RUNTIME_O)
@@ -72,6 +75,10 @@ negative: ncomp
 
 sanitize: ncomp
 	bash tools/sanitize_test.sh
+
+# Host vs native timing table over tools/bench/*.art (also checks output parity).
+bench: ncomp
+	bash tools/bench.sh
 
 check: coverage test verify upstream compat diagnostics unsupported random negative
 
