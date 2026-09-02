@@ -120,7 +120,19 @@ void rt_write_float(double f);        /* Arturo-compatible float text, no newlin
 void rt_print_float(double f);        /* Arturo-compatible float text + newline */
 
 /* ---- environments (frames with a parent chain) ----------------------- */
-struct Env { char **names; Value *vals; int n; Env *parent; int rebind_parent; };
+#define ENV_INLINE_SLOTS 6
+struct Env {
+    char **names;
+    Value *vals;
+    int n,cap;
+    Env *parent;
+    int rebind_parent;
+    unsigned char captured;
+    unsigned long created;
+    Env *live_prev,*live_next;
+    char *inline_names[ENV_INLINE_SLOTS];
+    Value inline_vals[ENV_INLINE_SLOTS];
+};
 Env *env_new(Env *parent);
 Value env_get(Env *e, const char *name);   /* returns V_NULL if unbound */
 int   env_bound(Env *e, const char *name);

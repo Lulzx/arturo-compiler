@@ -54,3 +54,25 @@ comparators retain insertion sort because comparator calls are observable.
     sort                   163       139   1.17x        69
     string_append           37       121   0.31x       472
     while_counter          368       494   0.74x       267
+
+## Phase 2: arena allocation, interned names, and reclaimed frames
+
+Phase 2 was implemented after Phase 3 in this branch. Normal builds use 1 MiB
+chunks with size-class freelists and tracked large allocations; ASan or
+`ARTURO_TRACKED_HEAP` builds retain real `malloc`/`free`. Environment names are
+interned, six bindings are inline, escaping closure chains are marked captured,
+and uncaptured function/action/loop frames are reclaimed. Stack buffers cover
+the common call and block-expression paths. `ARTURO_NATIVE_HEAPCHECK=1` disables
+frame reclamation for differential diagnosis.
+
+    program            host_ms native_ms   ratio native_MB
+    closures                82        49   1.67x        14
+    dict_insert             61        48   1.27x        14
+    dict_iter               81        46   1.76x        11
+    fib                    233        93   2.51x         1
+    loop_sum                94        49   1.92x         1
+    map_select             111        91   1.22x        44
+    nested_loops            86        25   3.44x         1
+    sort                   174        76   2.29x        25
+    string_append           39       106   0.37x       465
+    while_counter          387       153   2.53x         1

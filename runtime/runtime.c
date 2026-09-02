@@ -37,15 +37,16 @@
 extern char **environ;
 
 /* ---- process arena ----------------------------------------------------- */
-/* Arturo blocks, dictionaries, environments, functions, and token strings
- * are freely aliased. Their ownership boundary is the generated process, so
- * track every runtime allocation and release the whole graph exactly once at
- * shutdown. Temporary frees remove entries early without needing reference
- * counts or recursive destruction. The bookkeeping nodes deliberately use the
- * system allocator directly; the macros below only affect runtime allocations. */
-/* Open-addressed pointer set: tracking, untracking, and realloc bookkeeping
- * are O(1), so runtime allocation cost does not grow with the live heap.
- * Slots hold a pointer, NULL (empty), or ARENA_TOMB (deleted). */
+#ifndef __has_feature
+#define __has_feature(feature) 0
+#endif
+
+/* Sanitizer builds retain real malloc/free so use-after-free remains visible.
+ * ARTURO_TRACKED_HEAP provides the same diagnostic allocator in an ordinary
+ * build. Normal binaries use chunked size classes: Arturo values are heavily
+ * aliased and process-owned, while short-lived parser and call buffers benefit
+ * from O(1) freelist reuse instead of a hash-table operation per allocation. */
+#if defined(ARTURO_TRACKED_HEAP) || defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
 #define ARENA_TOMB ((void*)1)
 static void **g_arena_slots=NULL;
 static size_t g_arena_cap=0,g_arena_used=0,g_arena_tomb=0;
@@ -118,6 +119,87 @@ void runtime_cleanup(void){
     for(size_t i=0;i<g_arena_cap;i++)if(g_arena_slots[i]&&g_arena_slots[i]!=ARENA_TOMB)free(g_arena_slots[i]);
     free(g_arena_slots);g_arena_slots=NULL;g_arena_cap=g_arena_used=g_arena_tomb=0;
 }
+#else
+#define ARENA_CHUNK_BYTES ((size_t)1024*1024)
+#define ARENA_CLASS_COUNT 10
+#define ARENA_MAGIC 0x41525452u
+#define ARENA_LARGE_CLASS UINT32_MAX
+typedef struct ArenaHeader { size_t requested; uint32_t class_id; uint32_t magic; } ArenaHeader;
+typedef struct ArenaChunk ArenaChunk;
+struct ArenaChunk {
+    ArenaChunk *next;
+    size_t used;
+    size_t capacity;
+    union { max_align_t align; unsigned char bytes[1]; } data;
+};
+typedef struct ArenaLarge ArenaLarge;
+struct ArenaLarge {
+    ArenaLarge *prev,*next;
+    ArenaHeader header;
+};
+static const size_t ARENA_CLASS_SIZE[ARENA_CLASS_COUNT]={16,32,64,128,256,512,1024,2048,4096,8192};
+static void *g_arena_free[ARENA_CLASS_COUNT];
+static ArenaChunk *g_arena_chunks=NULL;
+static ArenaLarge *g_arena_large=NULL;
+static int g_arena_cleanup_registered=0;
+static struct { const char *s; int index; const char *at; int count; } g_rune_cache;
+static void rune_cache_forget(const void *s){if(s&&s==(const void*)g_rune_cache.s)g_rune_cache.s=NULL;}
+static void arena_register_cleanup(void){
+    if(!g_arena_cleanup_registered){if(atexit(runtime_cleanup)!=0){fprintf(stderr,"runtime error: cannot register cleanup\n");exit(1);}g_arena_cleanup_registered=1;}
+}
+static int arena_class_for(size_t size){
+    for(int i=0;i<ARENA_CLASS_COUNT;i++)if(size<=ARENA_CLASS_SIZE[i])return i;
+    return -1;
+}
+static void *arena_small_alloc(size_t size,int class_id){
+    void *pointer=g_arena_free[class_id];
+    if(pointer){g_arena_free[class_id]=*(void**)pointer;ArenaHeader *h=(ArenaHeader*)pointer-1;h->requested=size;return pointer;}
+    size_t total=sizeof(ArenaHeader)+ARENA_CLASS_SIZE[class_id];
+    ArenaChunk *chunk=g_arena_chunks;
+    if(!chunk||chunk->capacity-chunk->used<total){
+        size_t offset=offsetof(ArenaChunk,data.bytes);
+        chunk=(ArenaChunk*)malloc(offset+ARENA_CHUNK_BYTES);
+        if(!chunk){fprintf(stderr,"runtime error: out of memory\n");exit(1);}
+        chunk->next=g_arena_chunks;chunk->used=0;chunk->capacity=ARENA_CHUNK_BYTES;g_arena_chunks=chunk;
+    }
+    ArenaHeader *h=(ArenaHeader*)(chunk->data.bytes+chunk->used);chunk->used+=total;
+    h->requested=size;h->class_id=(uint32_t)class_id;h->magic=ARENA_MAGIC;return h+1;
+}
+void *runtime_alloc(size_t size){
+    arena_register_cleanup();if(!size)size=1;int class_id=arena_class_for(size);
+    if(class_id>=0)return arena_small_alloc(size,class_id);
+    ArenaLarge *large=(ArenaLarge*)malloc(sizeof(ArenaLarge)+size);
+    if(!large){fprintf(stderr,"runtime error: out of memory\n");exit(1);}
+    large->prev=NULL;large->next=g_arena_large;if(g_arena_large)g_arena_large->prev=large;g_arena_large=large;
+    large->header.requested=size;large->header.class_id=ARENA_LARGE_CLASS;large->header.magic=ARENA_MAGIC;
+    return &large->header+1;
+}
+static void arena_free(void *pointer){
+    if(!pointer)return;rune_cache_forget(pointer);ArenaHeader *h=(ArenaHeader*)pointer-1;
+    if(h->magic!=ARENA_MAGIC){fprintf(stderr,"runtime error: invalid arena pointer\n");abort();}
+    if(h->class_id==ARENA_LARGE_CLASS){
+        ArenaLarge *large=(ArenaLarge*)((unsigned char*)h-(size_t)offsetof(ArenaLarge,header));
+        if(large->prev)large->prev->next=large->next;else g_arena_large=large->next;
+        if(large->next)large->next->prev=large->prev;h->magic=0;free(large);return;
+    }
+    int class_id=(int)h->class_id;*(void**)pointer=g_arena_free[class_id];g_arena_free[class_id]=pointer;
+}
+static void *arena_realloc(void *pointer,size_t size){
+    if(!pointer)return runtime_alloc(size);if(!size)size=1;rune_cache_forget(pointer);
+    ArenaHeader *h=(ArenaHeader*)pointer-1;
+    if(h->magic!=ARENA_MAGIC){fprintf(stderr,"runtime error: invalid arena pointer\n");abort();}
+    size_t capacity=h->class_id==ARENA_LARGE_CLASS?h->requested:ARENA_CLASS_SIZE[h->class_id];
+    if(size<=capacity){h->requested=size;return pointer;}
+    size_t old_size=h->requested;void *resized=runtime_alloc(size);memcpy(resized,pointer,old_size);arena_free(pointer);return resized;
+}
+static char *arena_strdup(const char *source){size_t size=strlen(source)+1;char *copy=(char*)runtime_alloc(size);memcpy(copy,source,size);return copy;}
+void runtime_cleanup(void){
+    while(g_arena_large){ArenaLarge *next=g_arena_large->next;free(g_arena_large);g_arena_large=next;}
+    while(g_arena_chunks){ArenaChunk *next=g_arena_chunks->next;free(g_arena_chunks);g_arena_chunks=next;}
+    memset(g_arena_free,0,sizeof g_arena_free);
+}
+#endif
+static void libc_free(void *pointer){free(pointer);}
 #define malloc runtime_alloc
 #define realloc arena_realloc
 #define strdup arena_strdup
@@ -203,6 +285,8 @@ static char *fstr(double f, char *out, size_t cap);
 static char *val_str(Value v);
 static Value runBlockValue(Env *e, Value block);
 static void env_define_local(Env *e, const char *name, Value v);
+static void env_capture(Env *e);
+static void env_release(Env *e);
 static Value b_replace(Env *e,Value *a,int n);
 static const char *type_name(Value v);
 static Value clone_value(Value v);
@@ -246,21 +330,21 @@ static void block_grow(Block *b, int need){
 }
 
 /* ---- value constructors ------------------------------------------------- */
-Value v_null(void)  { Value v; memset(&v,0,sizeof v); v.k=V_NULL;  return v; }
-Value v_int(long i) { Value v; memset(&v,0,sizeof v); v.k=V_INT;   v.u.i=i; return v; }
-Value v_float(double f){Value v; memset(&v,0,sizeof v); v.k=V_FLOAT; v.u.f=f; return v; }
+Value v_null(void)  { Value v;v.k=V_NULL;return v; }
+Value v_int(long i) { Value v;v.k=V_INT;v.u.i=i;return v; }
+Value v_float(double f){Value v;v.k=V_FLOAT;v.u.f=f;return v; }
 Value v_rational(long numerator,long denominator){
     if(denominator==0)die("division by zero");
     if(denominator<0){numerator=-numerator;denominator=-denominator;}
     long a=labs(numerator),b=labs(denominator);
     while(b){long r=a%b;a=b;b=r;}
     long g=a?a:1;
-    Value v;memset(&v,0,sizeof v);v.k=V_RATIONAL;
+    Value v;v.k=V_RATIONAL;
     v.u.rational.num=numerator/g;v.u.rational.den=denominator/g;return v;
 }
-Value v_complex(double real,double imaginary){Value v;memset(&v,0,sizeof v);v.k=V_COMPLEX;v.u.complex.real=real;v.u.complex.imag=imaginary;return v;}
+Value v_complex(double real,double imaginary){Value v;v.k=V_COMPLEX;v.u.complex.real=real;v.u.complex.imag=imaginary;return v;}
 Value v_float_text(const char *text){if(!strcmp(text,"∞"))return v_float(INFINITY);if(!strcmp(text,"-∞"))return v_float(-INFINITY);return v_float(strtod(text,NULL));}
-Value v_quantity(double amount,const char *unit){Value v;memset(&v,0,sizeof v);v.k=V_QUANTITY;v.u.quantity.amount=amount;v.u.quantity.unit=strdup(canonical_unit(unit?unit:""));return v;}
+Value v_quantity(double amount,const char *unit){Value v;v.k=V_QUANTITY;v.u.quantity.amount=amount;v.u.quantity.unit=strdup(canonical_unit(unit?unit:""));v.u.quantity.integral=0;return v;}
 Value v_quantity_int(long amount,const char *unit){Value v=v_quantity((double)amount,unit);v.u.quantity.integral=1;return v;}
 Value v_unit(const char *unit){Value v=v_token(V_UNIT,canonical_unit(unit?unit:""));return v;}
 Value v_date_iso(const char *iso){
@@ -270,7 +354,7 @@ Value v_date_iso(const char *iso){
     struct tm tmv;memset(&tmv,0,sizeof tmv);tmv.tm_year=y-1900;tmv.tm_mon=mo-1;tmv.tm_mday=d;tmv.tm_hour=h;tmv.tm_min=mi;tmv.tm_sec=s;
     time_t stamp=timegm(&tmv);
     if(got>=9){long off=(long)(oh*3600+om*60);stamp+=(sign=='-'?off:-off);}
-    Value v;memset(&v,0,sizeof v);v.k=V_DATE;v.u.epoch=(long long)stamp;return v;
+    Value v;v.k=V_DATE;v.u.epoch=(long long)stamp;return v;
 }
 Value v_color_hex(const char *hex){
     const char *s=hex&&hex[0]=='#'?hex+1:hex;
@@ -279,13 +363,13 @@ Value v_color_hex(const char *hex){
         {"blue",0x0000FF},{"magenta",0xFF00FF},{"orange",0xFFA500},{"cyan",0x00FFFF},
         {"white",0xFFFFFF},{"gray",0x808080},{"grey",0x808080},{"lightblue",0xADD8E6},{NULL,0}
     };
-    for(int i=0;named[i].name;i++)if(!strcasecmp(s,named[i].name)){Value v;memset(&v,0,sizeof v);v.k=V_COLOR;v.u.rgba=(named[i].rgb<<8)|0xffu;return v;}
+    for(int i=0;named[i].name;i++)if(!strcasecmp(s,named[i].name)){Value v;v.k=V_COLOR;v.u.rgba=(named[i].rgb<<8)|0xffu;return v;}
     unsigned long raw=strtoul(s,NULL,16);size_t n=strlen(s);
-    Value v;memset(&v,0,sizeof v);v.k=V_COLOR;v.u.rgba=(unsigned int)(n<=6?((raw<<8)|0xffu):raw);return v;
+    Value v;v.k=V_COLOR;v.u.rgba=(unsigned int)(n<=6?((raw<<8)|0xffu):raw);return v;
 }
-Value v_binary_text(const char *text){size_t n=strlen(text);Value v;memset(&v,0,sizeof v);v.k=V_BINARY;v.u.binary.data=(unsigned char*)xmalloc(n?n:1);memcpy(v.u.binary.data,text,n);v.u.binary.len=n;return v;}
+Value v_binary_text(const char *text){size_t n=strlen(text);Value v;v.k=V_BINARY;v.u.binary.data=(unsigned char*)xmalloc(n?n:1);memcpy(v.u.binary.data,text,n);v.u.binary.len=n;return v;}
 static char *color_text(Value v){char *s=(char*)xmalloc(10);unsigned x=v.u.rgba;if((x&0xffu)==0xffu)snprintf(s,10,"#%02X%02X%02X",(x>>24)&255,(x>>16)&255,(x>>8)&255);else snprintf(s,10,"#%08X",x);return s;}
-static Value color_rgba(int r,int g,int b,int a){Value v;memset(&v,0,sizeof v);v.k=V_COLOR;v.u.rgba=((unsigned)(r&255)<<24)|((unsigned)(g&255)<<16)|((unsigned)(b&255)<<8)|(unsigned)(a&255);return v;}
+static Value color_rgba(int r,int g,int b,int a){Value v;v.k=V_COLOR;v.u.rgba=((unsigned)(r&255)<<24)|((unsigned)(g&255)<<16)|((unsigned)(b&255)<<8)|(unsigned)(a&255);return v;}
 static int color_chan(Value v,int shift){return (int)((v.u.rgba>>shift)&255u);}
 static Value b_blend(Env*e,Value*a,int n){(void)e;(void)n;if(a[0].k!=V_COLOR||a[1].k!=V_COLOR)die("blend: expected colors");return color_rgba((int)round((color_chan(a[0],24)+color_chan(a[1],24))/2.0),(int)round((color_chan(a[0],16)+color_chan(a[1],16))/2.0),(int)round((color_chan(a[0],8)+color_chan(a[1],8))/2.0),(int)round((color_chan(a[0],0)+color_chan(a[1],0))/2.0));}
 static Value color_value(Value v,double percent){int r=color_chan(v,24),g=color_chan(v,16),b=color_chan(v,8),a=color_chan(v,0),sign=percent<0?-1:1;double p=fabs(percent);r+=sign*(int)round(r*p);g+=sign*(int)round(g*p);b+=sign*(int)round(b*p);if(r>255)r=255;if(g>255)g=255;if(b>255)b=255;if(r<0)r=0;if(g<0)g=0;if(b<0)b=0;return color_rgba(r,g,b,a);}
@@ -397,6 +481,18 @@ static size_t name_hash(const char *s){
     while(*s){h^=(unsigned char)*s++;h*=(size_t)1099511628211ull;}
     return h;
 }
+typedef struct { char **slots; size_t cap,used; } InternTable;
+static InternTable g_intern;
+static void intern_grow(void){
+    size_t cap=g_intern.cap?g_intern.cap*2:1024;char **slots=(char**)xmalloc(cap*sizeof(char*));memset(slots,0,cap*sizeof(char*));
+    for(size_t i=0;i<g_intern.cap;i++)if(g_intern.slots[i]){size_t at=name_hash(g_intern.slots[i])&(cap-1);while(slots[at])at=(at+1)&(cap-1);slots[at]=g_intern.slots[i];}
+    free(g_intern.slots);g_intern.slots=slots;g_intern.cap=cap;
+}
+static const char *intern(const char *name){
+    if(!name)return NULL;if((g_intern.used+1)*2>g_intern.cap)intern_grow();size_t at=name_hash(name)&(g_intern.cap-1);
+    while(g_intern.slots[at]){if(!strcmp(g_intern.slots[at],name))return g_intern.slots[at];at=(at+1)&(g_intern.cap-1);}
+    char *copy=strdup(name);g_intern.slots[at]=copy;g_intern.used++;return copy;
+}
 static void name_index_build(NameIndex *ix,int count,const char *(*name_at)(int)){
     size_t cap=16;while(cap<(size_t)count*2)cap*=2;
     ix->slots=(NameIndexSlot*)calloc(cap,sizeof *ix->slots);
@@ -470,7 +566,7 @@ static Value b_symbols(Env*e,Value*a,int n){
 }
 static Value b_var(Env*e,Value*a,int n){(void)n;char *name=val_str(a[0]);if(!env_bound(e,name)){if(rt_builtin_known(name)||declared_arity_of(name)>=0){Value result=v_token(V_BUILTIN,name);free(name);return result;}free(name);die("var: identifier not found");}Value result=env_get(e,name);free(name);return result;}
 static Value b_unset(Env*e,Value*a,int n){
-    (void)n;char *name=val_str(a[0]);for(Env *frame=e;frame;frame=frame->parent)for(int i=0;i<frame->n;i++)if(!strcmp(frame->names[i],name)){free(frame->names[i]);for(int j=i+1;j<frame->n;j++){frame->names[j-1]=frame->names[j];frame->vals[j-1]=frame->vals[j];}frame->n--;free(name);return v_null();}free(name);return v_null();
+    (void)n;char *name=val_str(a[0]);const char *key=intern(name);for(Env *frame=e;frame;frame=frame->parent)for(int i=0;i<frame->n;i++)if(frame->names[i]==key){for(int j=i+1;j<frame->n;j++){frame->names[j-1]=frame->names[j];frame->vals[j-1]=frame->vals[j];}frame->n--;free(name);return v_null();}free(name);return v_null();
 }
 static int is_currency_unit(const char *unit){
     static const char *currencies[]={
@@ -596,7 +692,7 @@ static Value render_template_once(Env *e,const char *input){
     Value code=lex_source(source);(void)runBlockValue(frame,code);free(source);output=env_get(frame,"__template_output");
     size_t outCap=64,outUsed=0;char *joined=xmalloc(outCap);joined[0]=0;
     if(output.k==V_BLOCK)for(int i=0;i<output.u.block.b->n;i++){char *part=val_str(*output.u.block.b->items[i]);text_add(&joined,&outUsed,&outCap,part);free(part);}
-    Value result=v_str(joined);free(joined);return result;
+    Value result=v_str(joined);free(joined);env_release(frame);return result;
 }
 static Value render_value(Env*e,Value*a,int n){
     (void)n;if(a[0].k!=V_STR)die("render: expected string");char *current=strdup(a[0].u.s);int rounds=rt_has_attr("once")?1:100;
@@ -737,7 +833,7 @@ static Value b_with(Env*e,Value*a,int n){
     (void)n;if(a[1].k!=V_BLOCK)die("with: expected body block");Env *capture=env_new(e);
     if(a[0].k==V_DICT)for(int i=0;i<a[0].u.dict->n;i++)env_set(capture,a[0].u.dict->keys[i],a[0].u.dict->vals[i]);
     else if(a[0].k==V_BLOCK)for(int i=0;i<a[0].u.block.b->n;i++){char *name=val_str(*a[0].u.block.b->items[i]);if(env_bound(e,name))env_set(capture,name,env_get(e,name));free(name);}
-    else {char *name=val_str(a[0]);if(env_bound(e,name))env_set(capture,name,env_get(e,name));free(name);}return with_substitute(capture,a[1]);
+    else {char *name=val_str(a[0]);if(env_bound(e,name))env_set(capture,name,env_get(e,name));free(name);}Value result=with_substitute(capture,a[1]);env_release(capture);return result;
 }
 static Value b_alias(Env*e,Value*a,int n){(void)e;(void)a;(void)n;return v_null();}
 static char *date_text(Value v){
@@ -754,56 +850,56 @@ static const char *object_type_name(Value v){
     }
     d->object_name=marked?name:NULL;d->object_checked=1;return d->object_name;
 }
-Value v_bool(int b) { Value v; memset(&v,0,sizeof v); v.k=V_BOOL;  v.u.b=b; return v; }
-Value v_char(char c){ Value v; memset(&v,0,sizeof v); v.k=V_CHAR; v.u.c[0]=c; v.u.c[1]=0; return v; }
-Value v_char_text(const char *s){ Value v; memset(&v,0,sizeof v); v.k=V_CHAR; size_t n=strlen(s); if(n>4)n=4; memcpy(v.u.c,s,n); v.u.c[n]=0; return v; }
+Value v_bool(int b) { Value v;v.k=V_BOOL;v.u.b=b;return v; }
+Value v_char(char c){ Value v;v.k=V_CHAR;v.u.c[0]=c;v.u.c[1]=0;return v; }
+Value v_char_text(const char *s){ Value v;v.k=V_CHAR;size_t n=strlen(s);if(n>4)n=4;memcpy(v.u.c,s,n);v.u.c[n]=0;return v; }
 Value v_str(const char *s) {
-    Value v; memset(&v,0,sizeof v); v.k=V_STR;
+    Value v;v.k=V_STR;
     v.u.s = (char*)xmalloc(strlen(s)+1); strcpy(v.u.s, s);
     return v;
 }
-static Value v_error_kind(const char *message,const char *kind){Value v;memset(&v,0,sizeof v);v.k=V_ERROR;v.u.error.message=strdup(message?message:"");v.u.error.kind=strdup(kind?kind:"Runtime Error");return v;}
+static Value v_error_kind(const char *message,const char *kind){Value v;v.k=V_ERROR;v.u.error.message=strdup(message?message:"");v.u.error.kind=strdup(kind?kind:"Runtime Error");return v;}
 Value v_error(const char *s) { return v_error_kind(s,g_last_error_kind); }
 Value v_version(const char *s) { return v_token(V_VERSION,s?s:""); }
 Value v_errorkind(const char *s) { return v_token(V_ERRORKIND,s?s:""); }
 Value v_block(Value **items, int n) {
-    Value v; memset(&v,0,sizeof v); v.k=V_BLOCK;
+    Value v;v.k=V_BLOCK;
     Block *b=(Block*)xmalloc(sizeof *b);
     b->items=items; b->n=n; b->cap=n;   /* takes ownership of the caller's array */
     v.u.block.b=b; return v;
 }
 Value v_dict(char **keys, Value *vals, int n) {
-    Value v; memset(&v,0,sizeof v); v.k=V_DICT;
+    Value v;v.k=V_DICT;
     Dict *d=(Dict*)xmalloc(sizeof *d);
     d->keys=keys; d->vals=vals; d->n=n; d->cap=n; d->index=NULL; d->index_cap=0; d->index_n=0; d->object_name=NULL; d->object_checked=0;
     v.u.dict=d; return v;
 }
 Value v_func(IR *params, IR **body, int nbody, Env *closure) {
-    Value v; memset(&v,0,sizeof v); v.k=V_FUNC;
-    v.u.fn.params=params; v.u.fn.body=body; v.u.fn.nbody=nbody; v.u.fn.closure=closure;v.u.fn.constructor=0;v.u.fn.exports=NULL;v.u.fn.nexports=0;
+    Value v;v.k=V_FUNC;
+    v.u.fn.params=params; v.u.fn.body=body; v.u.fn.nbody=nbody; v.u.fn.closure=closure;v.u.fn.constructor=0;v.u.fn.exports=NULL;v.u.fn.nexports=0;env_capture(closure);
     return v;
 }
 Value v_range(long lo, long hi) {
-    Value v;memset(&v,0,sizeof v);v.k=V_RANGE;v.u.range.lo=lo;v.u.range.hi=hi;v.u.range.step=hi>=lo?1:-1;return v;
+    Value v;v.k=V_RANGE;v.u.range.lo=lo;v.u.range.hi=hi;v.u.range.step=hi>=lo?1:-1;v.u.range.character=0;v.u.range.infinite=0;return v;
 }
 Value v_path(char **segs, int n) {
     /* Generated code passes a compound literal; own the segment array so the
      * value survives the builder function that created it. */
     char **copy=(char**)xmalloc((size_t)(n>0?n:1)*sizeof(char*));
     if(n>0&&segs)memcpy(copy,segs,(size_t)n*sizeof(char*));
-    Value v; memset(&v,0,sizeof v); v.k=V_PATH; v.u.path.segs=copy; v.u.path.nsegs=n; v.u.path.segv=NULL; return v;
+    Value v;v.k=V_PATH;v.u.path.segs=copy;v.u.path.nsegs=n;v.u.path.segv=NULL;return v;
 }
 Value v_pathv(Value *segv, int n) {
     /* build the string segs (for runtime path ops) from the segment Values
      * (for `to :block` reconstruction). Each seg is a word/literal/int/str. */
-    Value v; memset(&v,0,sizeof v); v.k=V_PATH; v.u.path.segv=segv; v.u.path.nsegs=n;
+    Value v;v.k=V_PATH;v.u.path.segv=segv;v.u.path.nsegs=n;
     char **ss=(char**)xmalloc(n*sizeof(char*));
     for(int i=0;i<n;i++) ss[i]=seg_text(segv[i]);
     v.u.path.segs=ss;
     return v;
 }
 Value v_token(VKind k, const char *s) {
-    Value v; memset(&v,0,sizeof v); v.k=k;
+    Value v;v.k=k;
     v.u.s=(char*)xmalloc(strlen(s)+1); strcpy(v.u.s,s);
     return v;
 }
@@ -1011,36 +1107,50 @@ void v_print(Value v) {
 }
 
 /* ---- environments -------------------------------------------------------- */
+static Env *g_env_live=NULL;static unsigned long g_env_serial=0;
+static int env_heapcheck(void){static int initialized=0,enabled=0;if(!initialized){const char*s=getenv("ARTURO_NATIVE_HEAPCHECK");enabled=s&&*s&&strcmp(s,"0");initialized=1;}return enabled;}
 Env *env_new(Env *parent) {
     Env *e = (Env*)xmalloc(sizeof *e);
-    e->names=NULL; e->vals=NULL; e->n=0; e->parent=parent; e->rebind_parent=0; return e;
+    e->names=e->inline_names;e->vals=e->inline_vals;e->n=0;e->cap=ENV_INLINE_SLOTS;e->parent=parent;e->rebind_parent=0;e->captured=0;e->created=++g_env_serial;
+    e->live_prev=NULL;e->live_next=g_env_live;if(g_env_live)g_env_live->live_prev=e;g_env_live=e;return e;
 }
-static int env_find(Env *e, const char *name) {
-    for (int i=0;i<e->n;i++) if (!strcmp(e->names[i], name)) return i;
+static void env_capture(Env *e){for(;e;e=e->parent)e->captured=1;}
+static void env_release(Env *e){
+    if(!e||e->captured||env_heapcheck())return;
+    if(e->live_prev)e->live_prev->live_next=e->live_next;else g_env_live=e->live_next;if(e->live_next)e->live_next->live_prev=e->live_prev;
+    if(e->names!=e->inline_names)free(e->names);if(e->vals!=e->inline_vals)free(e->vals);free(e);
+}
+static void env_rewind(unsigned long serial){for(Env *e=g_env_live,*next;e;e=next){next=e->live_next;if(e->created>serial&&!e->captured)env_release(e);}}
+static void env_grow(Env *e){
+    if(e->n<e->cap)return;int cap=e->cap*2;char **names=(char**)xmalloc((size_t)cap*sizeof(char*));Value *vals=(Value*)xmalloc((size_t)cap*sizeof(Value));
+    memcpy(names,e->names,(size_t)e->n*sizeof(char*));memcpy(vals,e->vals,(size_t)e->n*sizeof(Value));
+    if(e->names!=e->inline_names)free(e->names);if(e->vals!=e->inline_vals)free(e->vals);e->names=names;e->vals=vals;e->cap=cap;
+}
+static int env_find_interned(Env *e,const char *name){
+    for (int i=0;i<e->n;i++) if (e->names[i]==name) return i;
     return -1;
 }
+static int env_find(Env *e,const char *name){return env_find_interned(e,intern(name));}
 int env_bound(Env *e, const char *name) {
-    for (Env *f=e;f;f=f->parent) if (env_find(f,name)>=0) return 1;
+    const char *key=intern(name);for (Env *f=e;f;f=f->parent) if (env_find_interned(f,key)>=0) return 1;
     return 0;
 }
 Value env_get(Env *e, const char *name) {
-    for (Env *f=e;f;f=f->parent) { int i=env_find(f,name); if (i>=0) return f->vals[i]; }
-    if(!strcmp(name,"pi"))return v_float(M_PI);
-    if(!strcmp(name,"e"))return v_float(M_E);
-    if(!strcmp(name,"infinite"))return v_float(INFINITY);
+    const char *key=intern(name);for (Env *f=e;f;f=f->parent) { int i=env_find_interned(f,key); if (i>=0) return f->vals[i]; }
+    static const char *pi_name,*e_name,*infinite_name;if(!pi_name){pi_name=intern("pi");e_name=intern("e");infinite_name=intern("infinite");}
+    if(key==pi_name)return v_float(M_PI);if(key==e_name)return v_float(M_E);if(key==infinite_name)return v_float(INFINITY);
     return v_null();
 }
 /* `x: value` — updates the nearest existing binding (walking parent scopes),
  * matching the host's loop-body assignment (`loop xs [x][ cnt: cnt + 1 ]`
  * accumulates cnt). The compiler's @LBL action-body defines use this. */
 void env_set(Env *e, const char *name, Value v) {
+    const char *key=intern(name);
     for (Env *f=e; f; f=f->parent) {
-        int i = env_find(f, name);
+        int i = env_find_interned(f,key);
         if (i>=0) { f->vals[i]=v; return; }
     }
-    e->names = (char**)xrealloc(e->names, (e->n+1)*sizeof(char*));
-    e->vals  = (Value*)xrealloc(e->vals, (e->n+1)*sizeof(Value));
-    e->names[e->n] = (char*)xmalloc(strlen(name)+1); strcpy(e->names[e->n], name);
+    env_grow(e);e->names[e->n]=(char*)key;
     e->vals[e->n] = v; e->n++;
 }
 
@@ -1051,11 +1161,9 @@ void env_set(Env *e, const char *name, Value v) {
  * same name (the compiler's `c`/`parts`/`ctx` locals collided with the global
  * `c` and the crash was `get <stack> "stack"`). */
 static void env_define_local(Env *e, const char *name, Value v) {
-    int i = env_find(e, name);
+    const char *key=intern(name);int i=env_find_interned(e,key);
     if (i>=0) { e->vals[i]=v; return; }
-    e->names = (char**)xrealloc(e->names, (e->n+1)*sizeof(char*));
-    e->vals  = (Value*)xrealloc(e->vals, (e->n+1)*sizeof(Value));
-    e->names[e->n] = (char*)xmalloc(strlen(name)+1); strcpy(e->names[e->n], name);
+    env_grow(e);e->names[e->n]=(char*)key;
     e->vals[e->n] = v; e->n++;
 }
 
@@ -1070,8 +1178,9 @@ static void env_define_body(Env *e, const char *name, Value v) {
  * the current frame. This differs from a function-local label only when an
  * outer binding already exists: `let` reaches it, while `x:` shadows it. */
 static void env_let(Env *e, const char *name, Value v) {
+    const char *key=intern(name);
     for (Env *f=e; f; f=f->parent) {
-        int i=env_find(f,name);
+        int i=env_find_interned(f,key);
         if(i>=0){ f->vals[i]=v; return; }
     }
     env_define_local(e,name,v);
@@ -1090,7 +1199,7 @@ static Value literal_value(int code){
     switch(code){case 1:return v_bool(1);case 2:return v_bool(0);case 3:return v_null();default:return v_errorkind("Runtime Error");}
 }
 static IR *ir_new(const char *op) {
-    IR *n=(IR*)xmalloc(sizeof *n); memset(n,0,sizeof *n); n->op=op; n->opcode=opcode_of(op); return n;
+    IR *n=(IR*)xmalloc(sizeof *n); memset(n,0,sizeof *n); n->op=intern(op); n->opcode=opcode_of(op); return n;
 }
 /* Constructors own their argument arrays. Generated code passes compound
  * literals, whose storage ends with the enclosing builder function, so the
@@ -1102,13 +1211,13 @@ static IR **ir_copy_nodes(IR **items,int n){
 }
 static const char **ir_copy_names(const char **names,int n){
     const char **copy=(const char**)xmalloc((size_t)(n>0?n:1)*sizeof(char*));
-    if(n>0&&names)memcpy(copy,names,(size_t)n*sizeof(char*));
+    for(int i=0;i<n;i++)copy[i]=intern(names[i]);
     return copy;
 }
 IR *ir_const(Value v){ IR*n=ir_new("const"); n->v=v; return n; }
-IR *ir_load(const char *name){ IR*n=ir_new("load"); n->name=name; n->literal=literal_code(name); return n; }
+IR *ir_load(const char *name){ IR*n=ir_new("load"); n->name=intern(name); n->literal=literal_code(name); return n; }
 IR *ir_intrinsic(const char *name){
-    IR*n=ir_new("intrinsic"); n->name=name;
+    IR*n=ir_new("intrinsic"); n->name=intern(name);
     static const char *const arith[]={"add","sub","mul","div","fdiv","mod","pow",NULL};
     for(int i=0;arith[i];i++)if(!strcmp(arith[i],name))n->flags|=IRF_ARITH_REF;
     if(is_shadowable(name))n->flags|=IRF_SHADOWABLE;
@@ -1120,9 +1229,9 @@ IR *ir_intrinsic(const char *name){
  * node when it is NOT a call callee). On the host a bare word resolves var-first
  * (a bound parameter like `arity`/`env` loads its value), else a zero-arity
  * builtin (`args`, `break`) is called. */
-IR *ir_word(const char *name){ IR*n=ir_new("word"); n->name=name; n->literal=literal_code(name); return n; }
-IR *ir_define(const char *name, IR *expr){ IR*n=ir_new("define"); n->name=name; n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
-IR *ir_let(const char *name, IR *expr){ IR*n=ir_new("let"); n->name=name; n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
+IR *ir_word(const char *name){ IR*n=ir_new("word"); n->name=intern(name); n->literal=literal_code(name); return n; }
+IR *ir_define(const char *name, IR *expr){ IR*n=ir_new("define"); n->name=intern(name); n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
+IR *ir_let(const char *name, IR *expr){ IR*n=ir_new("let"); n->name=intern(name); n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
 IR *ir_call(IR *fn, IR **args, int n){ IR*x=ir_new("call"); x->fn=fn; x->args=ir_copy_nodes(args,n); x->nargs=n; return x; }
 IR *ir_call_attrs(IR *fn,IR **args,int n,const char **names,IR **values,int nattrs){IR*x=ir_call(fn,args,n);return ir_attrs(x,names,values,nattrs);}
 IR *ir_attrs(IR *node,const char **names,IR **values,int nattrs){node->attr_names=ir_copy_names(names,nattrs);node->attr_values=ir_copy_nodes(values,nattrs);node->nattrs=nattrs;return node;}
@@ -1179,13 +1288,13 @@ static int path_call_tail(Env *e, IR **seq, int n, int *ip, IR *ir, Value fn, Va
         snprintf(msg,sizeof msg,"%s: not enough arguments (expected %d, got %d)", nm, arity, avail);
         die(msg);
     }
-    Value *argv = (Value*)xmalloc((size_t)(arity+1)*sizeof(Value));
+    Value stack[8];Value *argv=arity<=8?stack:(Value*)xmalloc((size_t)(arity+1)*sizeof(Value));
     for (int k=0;k<arity;k++){
         argv[k] = runNode0(e, seq[*ip + 1 + k]);
-        if (rt_ret_set || rt_brk_set || rt_cont_set) { free(argv); return 0; }
+        if (rt_ret_set || rt_brk_set || rt_cont_set) { if(argv!=stack)free(argv); return 0; }
     }
     *r = applyFunc(e, fn, argv, arity);
-    free(argv);
+    if(argv!=stack)free(argv);
     *ip = *ip + arity;
     return 1;
 }
@@ -1244,9 +1353,9 @@ static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
         }
     }
     for(int i=0;i<fn.u.fn.nexports;i++)if(env_find(child,fn.u.fn.exports[i])>=0)env_set(child->parent,fn.u.fn.exports[i],env_get(child,fn.u.fn.exports[i]));
-    if (rt_ret_set) { rt_ret_set=0; return rt_ret_val; }
-    if (!tailed && fn.u.fn.nbody == 2 && !node_is_stmt(fn.u.fn.body[0]) && !node_is_stmt(fn.u.fn.body[1])) return apply_tail_two(child, second, r);
-    return r;
+    Value result=r;if(rt_ret_set){rt_ret_set=0;result=rt_ret_val;}
+    else if(!tailed&&fn.u.fn.nbody==2&&!node_is_stmt(fn.u.fn.body[0])&&!node_is_stmt(fn.u.fn.body[1]))result=apply_tail_two(child,second,r);
+    env_release(child);return result;
 }
 
 /* ---- builtins ------------------------------------------------------------- */
@@ -1263,7 +1372,7 @@ static int is_numeric_kind(Value v){
  * The host promotes int64 overflow to big integers (`2 ^ 63`,
  * `9223372036854775807 + 1`). The native runtime keeps normal values as int64
  * and uses decimal-string bigints only when the magnitude overflows. */
-Value v_bigint_text(const char *text){ Value v; memset(&v,0,sizeof v); v.k=V_BIGINT; v.u.s=strdup(text); return v; }
+Value v_bigint_text(const char *text){Value v;v.k=V_BIGINT;v.u.s=strdup(text);return v;}
 Value v_bigint_i128(__int128 i){
     int negative = i < 0;
     unsigned __int128 x = negative ? (unsigned __int128)(-(i+1)) + 1u : (unsigned __int128)i;
@@ -1836,7 +1945,7 @@ static Value b_print(Env*e,Value*a,int n){
                     Value bound=env_get(e,value.u.s);
                     if(bound.k==V_FUNC||bound.k==V_BUILTIN){
                         int arity=bound.k==V_FUNC?function_param_count(bound):declared_arity_of(bound.u.s);
-                        if(arity>=0&&i+arity<source->n){Value *argv=xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;for(int j=0;j<arity;j++){argv[j]=*source->items[i+1+j];if(argv[j].k==V_WORD){if(env_bound(e,argv[j].u.s))argv[j]=env_get(e,argv[j].u.s);else ready=0;}}if(ready){value=applyFunc(e,bound,argv,arity);i+=arity;}free(argv);}
+                        if(arity>=0&&i+arity<source->n){Value stack[8];Value *argv=arity<=8?stack:xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;for(int j=0;j<arity;j++){argv[j]=*source->items[i+1+j];if(argv[j].k==V_WORD){if(env_bound(e,argv[j].u.s))argv[j]=env_get(e,argv[j].u.s);else ready=0;}}if(ready){value=applyFunc(e,bound,argv,arity);i+=arity;}if(argv!=stack)free(argv);}
                     }else value=bound;
                 } else if(rt_builtin_known(value.u.s)){
                     /* an unbound word naming a builtin is a call head here too
@@ -1856,17 +1965,17 @@ static Value b_print(Env*e,Value*a,int n){
                         AttrContext saved=g_attrs;
                         g_attrs.names=anames; g_attrs.values=avals; g_attrs.n=acnt;
                         if(arity>=0 && at+arity<=source->n){
-                            Value *argv=xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;
+                            Value stack[8];Value *argv=arity<=8?stack:xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;
                             for(int j=0;j<arity;j++){argv[j]=*source->items[at+j];if(argv[j].k==V_WORD){if(env_bound(e,argv[j].u.s))argv[j]=env_get(e,argv[j].u.s);else ready=0;}}
                             if(ready){Value out;if(rt_builtin(value.u.s,e,argv,arity,&out)){value=out;i=at+arity-1;}}
-                            free(argv);
+                            if(argv!=stack)free(argv);
                         }
                         g_attrs=saved;
                     } else if(arity>=0&&i+arity<source->n&&!(i+1<source->n&&is_binop(*source->items[i+1]))){
-                        Value *argv=xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;
+                        Value stack[8];Value *argv=arity<=8?stack:xmalloc((size_t)(arity+1)*sizeof(Value));int ready=1;
                         for(int j=0;j<arity;j++){argv[j]=*source->items[i+1+j];if(argv[j].k==V_WORD){if(env_bound(e,argv[j].u.s))argv[j]=env_get(e,argv[j].u.s);else ready=0;}}
                         if(ready){Value out;if(rt_builtin(value.u.s,e,argv,arity,&out)){value=out;i+=arity;}}
-                        free(argv);
+                        if(argv!=stack)free(argv);
                     }
                 }
             }
@@ -2069,7 +2178,7 @@ static Value b_units(Env*e,Value*a,int n){(void)e;(void)n;if(a[0].k==V_QUANTITY)
 static Value b_scalar(Env*e,Value*a,int n){(void)e;(void)n;if(a[0].k!=V_QUANTITY)die("scalar: expected quantity");double x=a[0].u.quantity.amount;return floor(x)==x?v_int((long)x):v_float(x);}
 static Value b_convert(Env*e,Value*a,int n){(void)e;(void)n;const char *u=a[1].u.s;if(a[0].k==V_QUANTITY){double x=quantity_convert_amount(a[0],u);return a[0].u.quantity.integral&&floor(x)==x?v_quantity_int((long)x,u):v_quantity(x,u);}if(a[0].k==V_INT)return v_quantity_int(a[0].u.i,u);if(a[0].k==V_FLOAT||a[0].k==V_RATIONAL)return v_quantity(as_float(a[0]),u);die("convert: expected quantity or number");return v_null();}
 static Value b_in(Env*e,Value*a,int n){Value rev[2]={a[1],a[0]};return b_convert(e,rev,n);}
-static Value b_now(Env*e,Value*a,int n){(void)e;(void)a;(void)n;Value v;memset(&v,0,sizeof v);v.k=V_DATE;v.u.epoch=(long long)time(NULL);return v;}
+static Value b_now(Env*e,Value*a,int n){(void)e;(void)a;(void)n;Value v;v.k=V_DATE;v.u.epoch=(long long)time(NULL);return v;}
 static int date_weekday(Value v){time_t t=(time_t)v.u.epoch;struct tm tmv;localtime_r(&t,&tmv);return tmv.tm_wday;}
 static Value b_weekday(Env*e,Value*a,int n,int day){(void)e;(void)n;return v_bool(a[0].k==V_DATE&&date_weekday(a[0])==day);}
 static Value b_sundayp(Env*e,Value*a,int n){return b_weekday(e,a,n,0);} static Value b_mondayp(Env*e,Value*a,int n){return b_weekday(e,a,n,1);}
@@ -2081,7 +2190,7 @@ static Value b_todayp(Env*e,Value*a,int n){
     (void)e;(void)n;if(a[0].k!=V_DATE)return v_bool(0);time_t lhs=(time_t)a[0].u.epoch,rhs=time(NULL);struct tm l,r;localtime_r(&lhs,&l);localtime_r(&rhs,&r);return v_bool(l.tm_year==r.tm_year&&l.tm_yday==r.tm_yday);
 }
 static Value b_leapp(Env*e,Value*a,int n){(void)e;(void)n;long y;if(a[0].k==V_INT)y=a[0].u.i;else if(a[0].k==V_DATE){time_t t=(time_t)a[0].u.epoch;struct tm tmv;localtime_r(&t,&tmv);y=tmv.tm_year+1900;}else return v_bool(0);return v_bool((y%4==0&&y%100!=0)||y%400==0);}
-static Value date_epoch(time_t t){Value v;memset(&v,0,sizeof v);v.k=V_DATE;v.u.epoch=(long long)t;return v;}
+static Value date_epoch(time_t t){Value v;v.k=V_DATE;v.u.epoch=(long long)t;return v;}
 static Value b_timestamp(Env*e,Value*a,int n){
     (void)e;(void)n;struct stat st;if(a[0].k!=V_STR||stat(a[0].u.s,&st))return v_null();
     char **keys=xmalloc(3*sizeof(char*));Value *vals=xmalloc(3*sizeof(Value));const char *names[]={"created","accessed","modified"};
@@ -2460,6 +2569,7 @@ static Value b_loop(Env*e,Value*a,int n){
             }
             if(indexName&&*indexName)env_define_local(child,indexName,v_int(i));
             evalSeq(child, body.u.block.b->items, body.u.block.b->n);
+            env_release(child);
             if (rt_brk_set) break;
         }
         rt_brk_set=0;
@@ -2473,6 +2583,7 @@ static Value b_loop(Env*e,Value*a,int n){
     for(int i=0;i<cnt;i+=width,group++){
         Env *child=env_new(e);bindActionChunk(child,params,coll,i,cnt);if(indexName&&*indexName)env_define_local(child,indexName,v_int(group));
         evalSeq(child,body.u.block.b->items,body.u.block.b->n);
+        env_release(child);
         if (rt_brk_set) break;
     }
     rt_brk_set=0;
@@ -2529,14 +2640,14 @@ static Value b_join(Env*e,Value*a,int n){
 /* `try [blk]` — success is null; failure is a first-class error value. */
 static Value b_try(Env*e,Value*a,int n){
     if (a[0].k!=V_BLOCK) return v_null();
-    jmp_buf jb; jmp_buf *prev = g_try_jmp;AttrContext savedAttrs=g_attrs;
+    jmp_buf jb; jmp_buf *prev = g_try_jmp;AttrContext savedAttrs=g_attrs;unsigned long savedEnvSerial=g_env_serial;
     g_try_jmp = &jb;
     if (setjmp(jb)==0){
         (void)evalSeq(e, a[0].u.block.b->items, a[0].u.block.b->n);
         g_try_jmp = prev;
         return v_null();
     }
-    g_try_jmp = prev;g_attrs=savedAttrs;
+    g_try_jmp = prev;g_attrs=savedAttrs;env_rewind(savedEnvSerial);
     return v_error(g_last_error);
 }
 static Value b_throw(Env*e,Value*a,int n){
@@ -2545,9 +2656,9 @@ static Value b_throw(Env*e,Value*a,int n){
 }
 static Value b_throwsp(Env*e,Value*a,int n){
     if(a[0].k!=V_BLOCK)return v_bool(0);
-    jmp_buf jb;jmp_buf *prev=g_try_jmp;AttrContext savedAttrs=g_attrs;g_try_jmp=&jb;
+    jmp_buf jb;jmp_buf *prev=g_try_jmp;AttrContext savedAttrs=g_attrs;unsigned long savedEnvSerial=g_env_serial;g_try_jmp=&jb;
     if(setjmp(jb)==0){(void)evalSeq(e,a[0].u.block.b->items,a[0].u.block.b->n);g_try_jmp=prev;return v_bool(0);}
-    g_try_jmp=prev;g_attrs=savedAttrs;return v_bool(1);
+    g_try_jmp=prev;g_attrs=savedAttrs;env_rewind(savedEnvSerial);return v_bool(1);
 }
 static Value b_errorp(Env*e,Value*a,int n){return v_bool(a[0].k==V_ERROR);}
 static Value b_panic(Env*e,Value*a,int n){return b_throw(e,a,n);}
@@ -2785,9 +2896,9 @@ static Value b_call(Env*e,Value*a,int n){
         die("call: args not a block"); return v_null();
     }
     Value fn=a[0]; Value args=a[1];
-    Value *argv=(Value*)xmalloc((args.u.block.b->n+1)*sizeof(Value));
+    Value stack[8];Value *argv=args.u.block.b->n<=8?stack:(Value*)xmalloc((args.u.block.b->n+1)*sizeof(Value));
     for(int i=0;i<args.u.block.b->n;i++) argv[i]=*args.u.block.b->items[i];
-    return applyFunc(e,fn,argv,args.u.block.b->n);
+    Value result=applyFunc(e,fn,argv,args.u.block.b->n);if(argv!=stack)free(argv);return result;
 }
 
 /* ---- builtins the compiler's own source needs ---------------------------- */
@@ -3014,7 +3125,7 @@ static Value runtime_construct(Env *e,const char *typeName,Value values){
     for(int i=0;i<proto.u.dict->n;i++){
         Dict *d=instance.u.dict;dict_reserve(d,d->n+1);
         d->keys[d->n]=strdup(proto.u.dict->keys[i]);Value member=proto.u.dict->vals[i];
-        if(member.k==V_FUNC){Env *receiver=env_new(member.u.fn.closure);env_define_local(receiver,"this",instance);member.u.fn.closure=receiver;}
+        if(member.k==V_FUNC){Env *receiver=env_new(member.u.fn.closure);env_define_local(receiver,"this",instance);env_capture(receiver);member.u.fn.closure=receiver;}
         else member=clone_value(member);
         d->vals[d->n]=member;d->n++;dict_reindex(d);
     }
@@ -3032,9 +3143,9 @@ static Value runtime_construct(Env *e,const char *typeName,Value values){
             if(have){Value key=v_str(name);Value av[3]={instance,key,field};b_set(e,av,3);}
         }
     }else if(init>=0&&instance.u.dict->vals[init].k==V_FUNC){
-        Value *argv=NULL;int argc=0;
-        if(values.k==V_BLOCK){argc=values.u.block.b->n;argv=xmalloc((size_t)(argc?argc:1)*sizeof(Value));for(int i=0;i<argc;i++)argv[i]=*values.u.block.b->items[i];}
-        (void)applyFunc(e,instance.u.dict->vals[init],argv,argc);free(argv);
+        Value stack[8],*argv=NULL;int argc=0;
+        if(values.k==V_BLOCK){argc=values.u.block.b->n;argv=argc<=8?stack:xmalloc((size_t)argc*sizeof(Value));for(int i=0;i<argc;i++)argv[i]=*values.u.block.b->items[i];}
+        (void)applyFunc(e,instance.u.dict->vals[init],argv,argc);if(argv&&argv!=stack)free(argv);
     }else if(values.k==V_BLOCK){int at=0;for(int i=0;i<instance.u.dict->n&&at<values.u.block.b->n;i++)if(strncmp(instance.u.dict->keys[i],"__",2)&&instance.u.dict->vals[i].k!=V_FUNC)instance.u.dict->vals[i]=*values.u.block.b->items[at++];dict_invalidate_object(instance.u.dict);
     }
     return instance;
@@ -3155,7 +3266,7 @@ static Value b_to(Env*e,Value*a,int n){
     if(!strcmp(ty,":binary")){
         if(v.k==V_BINARY)return v;
         if(v.k==V_STR)return v_binary_text(v.u.s);
-        if(v.k==V_INT){unsigned long value=(unsigned long)v.u.i;size_t length=1;for(unsigned long scan=value;scan>255;scan>>=8)length++;Value out;memset(&out,0,sizeof out);out.k=V_BINARY;out.u.binary.len=length;out.u.binary.data=xmalloc(length);for(size_t i=0;i<length;i++)out.u.binary.data[length-1-i]=(unsigned char)(value>>(8*i));return out;}
+        if(v.k==V_INT){unsigned long value=(unsigned long)v.u.i;size_t length=1;for(unsigned long scan=value;scan>255;scan>>=8)length++;Value out;out.k=V_BINARY;out.u.binary.len=length;out.u.binary.data=xmalloc(length);for(size_t i=0;i<length;i++)out.u.binary.data[length-1-i]=(unsigned char)(value>>(8*i));return out;}
         die("to :binary");return v_null();
     }
     if(!strcmp(ty,":bytecode")){
@@ -3180,7 +3291,7 @@ static Value b_to(Env*e,Value*a,int n){
         if(v.k==V_BLOCK && (v.u.block.b->n==3||v.u.block.b->n==4)){
             unsigned r=(unsigned)as_int(*v.u.block.b->items[0])&255u,g=(unsigned)as_int(*v.u.block.b->items[1])&255u,b=(unsigned)as_int(*v.u.block.b->items[2])&255u;
             unsigned alpha=v.u.block.b->n==4?(unsigned)as_int(*v.u.block.b->items[3])&255u:255u;
-            Value out;memset(&out,0,sizeof out);out.k=V_COLOR;out.u.rgba=(r<<24)|(g<<16)|(b<<8)|alpha;return out;
+            Value out;out.k=V_COLOR;out.u.rgba=(r<<24)|(g<<16)|(b<<8)|alpha;return out;
         }
         die("to :color");return v_null();
     }
@@ -3714,7 +3825,7 @@ static Value b_prepend(Env*e,Value*a,int n){
     MutTarget t; Value v=mut_load(e,a[0],&t);
     if(v.k==V_BLOCK){ Block*b=v.u.block.b; block_grow(b,b->n+1); memmove(b->items+1,b->items,(size_t)b->n*sizeof(Value*)); b->items[0]=(Value*)xmalloc(sizeof(Value)); *b->items[0]=a[1]; b->n++; return t.kind?v_null():v; }
     if(v.k==V_STR||v.k==V_CHAR){ char*body=val_str(v),*prefix=val_str(a[1]); char*s=(char*)xmalloc(strlen(prefix)+strlen(body)+1); strcpy(s,prefix);strcat(s,body);Value r=v_str(s);free(body);free(prefix);free(s);if(t.kind){mut_store(e,&t,r);return v_null();}return r; }
-    if(v.k==V_BINARY){size_t prefix=a[1].k==V_BINARY?a[1].u.binary.len:1;Value r;memset(&r,0,sizeof r);r.k=V_BINARY;r.u.binary.len=prefix+v.u.binary.len;r.u.binary.data=xmalloc(r.u.binary.len);if(a[1].k==V_BINARY)memcpy(r.u.binary.data,a[1].u.binary.data,prefix);else r.u.binary.data[0]=(unsigned char)as_int(a[1]);memcpy(r.u.binary.data+prefix,v.u.binary.data,v.u.binary.len);if(t.kind){mut_store(e,&t,r);return v_null();}return r;}
+    if(v.k==V_BINARY){size_t prefix=a[1].k==V_BINARY?a[1].u.binary.len:1;Value r;r.k=V_BINARY;r.u.binary.len=prefix+v.u.binary.len;r.u.binary.data=xmalloc(r.u.binary.len);if(a[1].k==V_BINARY)memcpy(r.u.binary.data,a[1].u.binary.data,prefix);else r.u.binary.data[0]=(unsigned char)as_int(a[1]);memcpy(r.u.binary.data+prefix,v.u.binary.data,v.u.binary.len);if(t.kind){mut_store(e,&t,r);return v_null();}return r;}
     die("prepend: unsupported value"); return v_null();
 }
 static Value b_remove(Env*e,Value*a,int n){
@@ -3907,8 +4018,8 @@ static Value b_jaro(Env*e,Value*a,int n){
     const char*s=a[0].u.s,*t=a[1].u.s;int ls=(int)strlen(s),lt=(int)strlen(t);if(!ls&&!lt)return v_float(1.0);if(!ls||!lt)return v_float(0.0);
     int range=(ls>lt?ls:lt)/2-1;if(range<0)range=0;unsigned char*sm=(unsigned char*)calloc((size_t)ls,1),*tm=(unsigned char*)calloc((size_t)lt,1);if(!sm||!tm)die("out of memory");
     int matches=0;for(int i=0;i<ls;i++){int lo=i-range;if(lo<0)lo=0;int hi=i+range+1;if(hi>lt)hi=lt;for(int j=lo;j<hi;j++)if(!tm[j]&&s[i]==t[j]){sm[i]=1;tm[j]=1;matches++;break;}}
-    if(!matches){free(sm);free(tm);return v_float(0.0);}int trans=0,j=0;for(int i=0;i<ls;i++)if(sm[i]){while(!tm[j])j++;if(s[i]!=t[j])trans++;j++;}
-    free(sm);free(tm);double m=matches;return v_float((m/ls+m/lt+(m-trans/2.0)/m)/3.0);
+    if(!matches){libc_free(sm);libc_free(tm);return v_float(0.0);}int trans=0,j=0;for(int i=0;i<ls;i++)if(sm[i]){while(!tm[j])j++;if(s[i]!=t[j])trans++;j++;}
+    libc_free(sm);libc_free(tm);double m=matches;return v_float((m/ls+m/lt+(m-trans/2.0)/m)/3.0);
 }
 static int type_matches(Value spec,Value value){
     /* Arturo accepts a block in the signature for other predicate forms, but
@@ -4631,7 +4742,7 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
             AttrContext savedAttr=g_attrs;
             int hasAttr=collect_block_attrs(e, it, n, ip);
             int A = fn_arity(v.u.s);
-            Value *args = (Value*)xmalloc((n+1)*sizeof(Value));
+            Value stackArgs[8];Value *args=n<=8?stackArgs:(Value*)xmalloc((n+1)*sizeof(Value));
             int m = 0;
             if (A >= 0) {
                 for (int k=0; k<A && *ip<n; k++) {
@@ -4646,10 +4757,10 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
                     args[m++] = evalExpr(e, it, n, ip);
             }
             Value out;
-            if (rt_builtin(v.u.s, e, args, m, &out)) { g_attrs=savedAttr; free(args); return out; }
+            if (rt_builtin(v.u.s, e, args, m, &out)) { g_attrs=savedAttr; if(args!=stackArgs)free(args); return out; }
             g_attrs=savedAttr;
             (void)hasAttr;
-            free(args); die("unknown function in action"); return v_null();
+            if(args!=stackArgs)free(args); die("unknown function in action"); return v_null();
         }
         if (binop_name(v.u.s)) { (*ip)++; return v; }   /* lone operator: data */
         if (env_bound(e, v.u.s)) {
@@ -4664,14 +4775,14 @@ static Value parsePrimary(Env *e, Value **it, int n, int *ip) {
                 (*ip)++;
                 AttrContext savedAttr=g_attrs;
                 int hasAttr=collect_block_attrs(e,it,n,ip);
-                Value *args=(Value*)xmalloc((n+1)*sizeof(Value));
+                Value stackArgs[8];Value *args=n<=8?stackArgs:(Value*)xmalloc((n+1)*sizeof(Value));
                 int m=0;
                 while (*ip<n && !is_binop(*it[*ip]) && !arg_boundary(it,n,*ip))
                     args[m++]=evalExpr(e,it,n,ip);
                 Value out=applyFunc(e,bv,args,m);
                 g_attrs=savedAttr;
                 (void)hasAttr;
-                free(args); return out;
+                if(args!=stackArgs)free(args); return out;
             }
             (*ip)++; return bv;                         /* plain variable */
         }
@@ -4687,8 +4798,8 @@ static Value evalExpr(Env *e, Value **it, int n, int *ip) {
     /* Infix chains are single-precedence and RIGHT-associative (host rule:
      * `a op1 b op2 c` == `a op1 (b op2 c)`, so `0 = x % 2` == `0 = (x % 2)`).
      * Collect the whole chain, then fold from the right. */
-    Value *operands=(Value*)xmalloc((size_t)(n+1)*sizeof(Value));
-    const char **ops=(const char**)xmalloc((size_t)(n+1)*sizeof(const char*));
+    Value stackOperands[8];const char *stackOps[8];Value *operands=n<=8?stackOperands:(Value*)xmalloc((size_t)(n+1)*sizeof(Value));
+    const char **ops=n<=8?stackOps:(const char**)xmalloc((size_t)(n+1)*sizeof(const char*));
     int count=0;
     operands[count++]=left;
     while (*ip<n && is_binop(*it[*ip])) {
@@ -4697,7 +4808,7 @@ static Value evalExpr(Env *e, Value **it, int n, int *ip) {
     }
     Value result=operands[count-1];
     for (int i=count-2;i>=0;i--) result=apply_binop(e,operands[i],ops[i],result);
-    free(operands); free(ops);
+    if(operands!=stackOperands)free(operands);if(ops!=stackOps)free(ops);
     return result;
 }
 /* ---- dynamic paths in block-as-code --------------------------------------
@@ -4916,7 +5027,7 @@ static Value applyActionIndexed(Env *parent, Value params, Value action, Value e
     bindActionParam(child,params,el);
     if(indexName&&*indexName)env_define_local(child,indexName,v_int(index));
     Value r = evalSeq(child, action.u.block.b->items, action.u.block.b->n);
-    return r;
+    env_release(child);return r;
 }
 static Value applyAction(Env *parent, Value params, Value action, Value el, long index) {
     char *indexName=NULL;
@@ -4929,7 +5040,7 @@ static Value applyActionAt(Env *parent,Value params,Value action,Value collectio
     Env *child=env_new(parent);bindActionChunk(child,params,collection,start,iterator_count(collection));
     char *indexName=NULL;if(rt_has_attr("with"))indexName=val_str(rt_attr_value("with",v_null()));
     if(indexName&&*indexName)env_define_local(child,indexName,v_int(index));
-    Value result=evalSeq(child,action.u.block.b->items,action.u.block.b->n);free(indexName);return result;
+    Value result=evalSeq(child,action.u.block.b->items,action.u.block.b->n);free(indexName);env_release(child);return result;
 }
 
 Value runSeq(Env *e, IR **seq, int n) {
@@ -5030,11 +5141,11 @@ static Value runDoSeq(Env *e, IR **seq, int n){
             int A = fn_arity(nm);
             int avail = n - 1;
             if (A >= 0 && A < avail) avail = A;
-            Value *argv = (Value*)xmalloc((avail+1)*sizeof(Value));
+            Value stack[8];Value *argv=avail<=8?stack:(Value*)xmalloc((avail+1)*sizeof(Value));
             for (int k=0;k<avail;k++) argv[k] = runNode0(e, seq[1+k]);
             Value out;
-            if (rt_builtin(nm, e, argv, avail, &out)) { free(argv); return out; }
-            free(argv);
+            if (rt_builtin(nm, e, argv, avail, &out)) { if(argv!=stack)free(argv); return out; }
+            if(argv!=stack)free(argv);
         }
     }
     Value r = v_null(), second = v_null();
@@ -5072,7 +5183,7 @@ static Value runNode0(Env *e, IR *node) {
         Value v = env_get(e, node->name);
         if (v.k != V_NULL) return v;
         if (rt_builtin_known(node->name)) {
-            Value b; memset(&b,0,sizeof b); b.k=V_BUILTIN; b.u.s=(char*)node->name; return b;
+            Value b;b.k=V_BUILTIN;b.u.s=(char*)node->name;return b;
         }
         if (!env_bound(e, node->name)) { char msg[256]; snprintf(msg,sizeof msg,"name error: identifier not found: %s",node->name); die(msg); }
         return v;
@@ -5089,7 +5200,7 @@ static Value runNode0(Env *e, IR *node) {
                 Value out, zargv[1];
                 if (rt_builtin(node->name, e, zargv, 0, &out)) return out;
             }
-            Value b; memset(&b,0,sizeof b); b.k=V_BUILTIN; b.u.s=(char*)node->name; return b;
+            Value b;b.k=V_BUILTIN;b.u.s=(char*)node->name;return b;
         }
         return v_null();
     }
@@ -5155,7 +5266,7 @@ static Value runNode0(Env *e, IR *node) {
             keys[i]=strdup(child->names[i]);
             vals[i]=child->vals[i];
         }
-        return v_dict(keys,vals,child->n);
+        int count=child->n;Value result=v_dict(keys,vals,count);env_release(child);return result;
     }
     case OP_IF: {
         Value cond = runNode0(e, node->args[0]);
@@ -5188,18 +5299,18 @@ static Value runNode0(Env *e, IR *node) {
         env_define_local(child,"this",value);
         child->rebind_parent=1;
         IR *body=node->args[1];
-        if(body && body->op && (body->opcode==OP___SEQ))
-            return runSeq(child,body->args,body->nargs);
-        return body?runNode0(child,body):v_null();
+        Value result;if(body && body->op && (body->opcode==OP___SEQ))result=runSeq(child,body->args,body->nargs);
+        else result=body?runNode0(child,body):v_null();
+        env_release(child);return result;
     }
     case OP_TRY: case OP_THROWS_Q: {
         int predicate=(node->opcode==OP_THROWS_Q);
-        jmp_buf jb;jmp_buf *prev=g_try_jmp;AttrContext savedAttrs=g_attrs;g_try_jmp=&jb;
+        jmp_buf jb;jmp_buf *prev=g_try_jmp;AttrContext savedAttrs=g_attrs;unsigned long savedEnvSerial=g_env_serial;g_try_jmp=&jb;
         if(setjmp(jb)==0){
             (void)runNode0(e,node->args[0]);g_try_jmp=prev;
             return predicate?v_bool(0):v_null();
         }
-        g_try_jmp=prev;g_attrs=savedAttrs;
+        g_try_jmp=prev;g_attrs=savedAttrs;env_rewind(savedEnvSerial);
         return predicate?v_bool(1):v_error(g_last_error);
     }
     case OP_ENSURE: {
@@ -5281,6 +5392,7 @@ static Value runNode0(Env *e, IR *node) {
                 if(indexName&&*indexName)env_define_local(child,indexName,v_int(i));
                 child->rebind_parent=1;
                 runSeq(child, body_items, body_n);
+                env_release(child);
                 if (rt_ret_set || rt_brk_set) break;
                 rt_cont_set=0;
             }
@@ -5291,6 +5403,7 @@ static Value runNode0(Env *e, IR *node) {
                 if(indexName&&*indexName)env_define_local(child,indexName,v_int(group));
                 child->rebind_parent=1;
                 runSeq(child, body_items, body_n);
+                env_release(child);
                 if (rt_ret_set || rt_brk_set) break;
                 rt_cont_set=0;
             }
@@ -5303,13 +5416,13 @@ static Value runNode0(Env *e, IR *node) {
     case OP_RANGE: {
         Value from = runNode0(e, node->args[0]);
         Value to = runNode0(e, node->args[1]);
-        Value *attrValues=(Value*)xmalloc((size_t)(node->nattrs+1)*sizeof(Value));
+        Value stackAttrs[4];Value *attrValues=node->nattrs<=4?stackAttrs:(Value*)xmalloc((size_t)(node->nattrs+1)*sizeof(Value));
         for(int i=0;i<node->nattrs;i++)attrValues[i]=runNode0(e,node->attr_values[i]);
         AttrContext previous=g_attrs;
         if(node->nattrs>0){g_attrs.names=node->attr_names;g_attrs.values=attrValues;g_attrs.n=node->nattrs;}
         Value args[2]={from,to};Value result=b_range(e,args,2);
         if(node->nattrs>0)g_attrs=previous;
-        free(attrValues);
+        if(attrValues!=stackAttrs)free(attrValues);
         return result;
     }
     case OP_CALL: {
@@ -5323,12 +5436,12 @@ static Value runNode0(Env *e, IR *node) {
          * only fires for a function), so a front-grouped `return d\add 3 4` where
          * `d\add` holds 5 returns the value and drops the args — it must not die. */
         if (is_pathget_ir(node->fn) && fn.k != V_FUNC && fn.k != V_BUILTIN) return fn;
-        Value *attrValues=(Value*)xmalloc((size_t)(node->nattrs+1)*sizeof(Value));
+        Value stackAttrs[4],stackArgs[8];Value *attrValues=node->nattrs<=4?stackAttrs:(Value*)xmalloc((size_t)(node->nattrs+1)*sizeof(Value));
         for(int i=0;i<node->nattrs;i++)attrValues[i]=runNode0(e,node->attr_values[i]);
-        Value *argv=(Value*)xmalloc((node->nargs+1)*sizeof(Value));
+        Value *argv=node->nargs<=8?stackArgs:(Value*)xmalloc((node->nargs+1)*sizeof(Value));
         for (int i=node->nargs-1;i>=0;i--) argv[i]=runNode0(e,node->args[i]);
-        if (fn.k==V_FUNC || fn.k==V_BUILTIN){AttrContext previous=g_attrs;int replaceAttrs=node->nattrs>0;if(replaceAttrs){g_attrs.names=node->attr_names;g_attrs.values=attrValues;g_attrs.n=node->nattrs;}Value out=applyFunc(e,fn,argv,node->nargs);if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);return out;}
-        free(attrValues);free(argv);
+        if (fn.k==V_FUNC || fn.k==V_BUILTIN){AttrContext previous=g_attrs;int replaceAttrs=node->nattrs>0;if(replaceAttrs){g_attrs.names=node->attr_names;g_attrs.values=attrValues;g_attrs.n=node->nattrs;}Value out=applyFunc(e,fn,argv,node->nargs);if(replaceAttrs)g_attrs=previous;if(attrValues!=stackAttrs)free(attrValues);if(argv!=stackArgs)free(argv);return out;}
+        if(attrValues!=stackAttrs)free(attrValues);if(argv!=stackArgs)free(argv);
         die("cannot call non-function");
         return v_null();
     }
