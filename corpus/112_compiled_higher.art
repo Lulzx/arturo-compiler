@@ -1,0 +1,16 @@
+factor: 3
+print map [1 2 3] [x] [x * factor]
+
+stored: [x + factor]
+print map [1 2 3] [x] stored
+
+print map.with: 'position [10 20 30] [x] [x + position]
+print fold [1 2 3 4] [acc x] [acc + x]
+print fold ["a" "b"] [acc x] [acc ++ x]
+print fold [] [acc x] [acc + x]
+
+storedFold: [acc + x]
+print fold [2 4 6] [acc x] storedFold
+
+fold: function [x][x + 40]
+print fold 2

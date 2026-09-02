@@ -5,7 +5,7 @@ show: function [code][
     ir: compileToIR code
     print code
     print (ir2artSeq ir)
-    f: fold ir
+    f: foldIR ir
     print (ir2artSeq f)
 ]
 

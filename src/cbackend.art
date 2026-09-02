@@ -610,6 +610,7 @@ cNode: function [n][
         "while"        -> cWhile n
         "until"        -> cUntil n
         "loop"         -> cLoop n
+        "higher"       -> cHigher n
         "range"        -> cRange n
         "return"       -> cReturn n
     ]
@@ -666,6 +667,32 @@ cLoop: function [n][
             "}, " ++ (to :string (size attrNames)) ++ ")"
     ]
     "ir_op(\"loop\", (IR*[]){" ++ loopArgs ++ "}, 3)"
+]
+cHigher: function [n][
+    name: quoteC (to :string n\name)
+    coll: cNode n\args\0
+    paramItems: n\args\1
+    if :block <> type paramItems [
+        wrappedParams: @[]
+        addItem wrappedParams paramItems
+        paramItems: wrappedParams
+    ]
+    params: cBlock paramItems
+    body: cNode n\args\2
+    higherAttributes: #[]
+    if key? n "attrs" -> higherAttributes: n\attrs
+    if not? empty? higherAttributes [
+        attrNames: @[]
+        attrValues: @[]
+        loop higherAttributes [attrName attrNode][
+            addItem attrNames (quoteC attrName)
+            addItem attrValues (cNode attrNode)
+        ]
+        return "ir_higher(" ++ name ++ ", " ++ coll ++ ", " ++ params ++ ", " ++ body ++
+            ", (const char*[]){" ++ (joinWith attrNames ", ") ++ "}, (IR*[]){" ++
+            (joinWith attrValues ", ") ++ "}, " ++ (to :string (size attrNames)) ++ ")"
+    ]
+    "ir_higher(" ++ name ++ ", " ++ coll ++ ", " ++ params ++ ", " ++ body ++ ", NULL, NULL, 0)"
 ]
 cRange: function [n][
     fromc: cNode n\args\0
@@ -1944,7 +1971,7 @@ directProgram: function [ir][
 
 compileToC: function [src][
     rawIR: compileToIR src
-    ir: fold rawIR
+    ir: foldIR rawIR
     native: ""
     hasCustomTypes: contains? src ("define " ++ ":")
     ; The typed emitter is an optimization that inlines user functions. It is

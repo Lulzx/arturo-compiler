@@ -337,6 +337,23 @@ ir2art: function [node][
         body: ir2artSeq node\args\2
         return "loop " ++ coll ++ " " ++ params ++ " [" ++ body ++ "]"
     ]
+    if "higher" = op [
+        fnText: node\name
+        if key? node "attrs" [
+            loop node\attrs [attrName attrNode][
+                flag: false
+                if isConstNode attrNode [
+                    if :logical = type attrNode\value -> if attrNode\value -> flag: true
+                ]
+                if flag -> fnText: fnText ++ "." ++ attrName
+                if not? flag -> fnText: fnText ++ "." ++ attrName ++ ":" ++ (ir2art attrNode)
+            ]
+        ]
+        coll: ir2art node\args\0
+        params: ir2art node\args\1
+        body: ir2artSeq node\args\2
+        return fnText ++ " " ++ coll ++ " " ++ params ++ " [" ++ body ++ "]"
+    ]
     if "range" = op [
         fromText: ir2art node\args\0
         toText: ir2art node\args\1
@@ -635,6 +652,15 @@ foldNode: function [node][
         ]
         return #[op: "call" fn: ff args: fa attrs: foldedAttrs]
     ]
+    if "higher" = op [
+        fa: @[]
+        loop node\args [a][ addItem fa (foldArg a) ]
+        folded: #[op: "higher" name: node\name args: fa]
+        foldedAttrs: #[]
+        if key? node "attrs" -> loop node\attrs [name value][ foldedAttrs\[name]: foldNode value ]
+        if not? empty? foldedAttrs -> folded\attrs: foldedAttrs
+        return folded
+    ]
     ; every construct op folds by folding its arguments — the shape
     ; of an op is whatever its row's `emit` column declared, so one
     ; recursion serves all of them instead of one branch per op.
@@ -651,7 +677,7 @@ foldNode: function [node][
     node
 ]
 
-fold: function [ir][
+foldIR: function [ir][
     out: @[]
     loop ir [n][ addItem out (foldNode n) ]
     out

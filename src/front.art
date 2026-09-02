@@ -98,6 +98,10 @@ loop INTRINSICS [nm spec][
     ]
 ]
 
+; `fold` is implemented in the stdlib rather than the primitive table, but it
+; has fixed higher-order syntax and a dedicated compiler rule.
+BUILTIN_ARITY\fold: 3
+
 mutatesThroughRef?: function [name][ key? MUTATES name ]
 
 ;-----------------------------------------------
@@ -184,6 +188,7 @@ registerAliases: function [blok][
 ; and binds it normally.
 ;-----------------------------------------------
 SHADOWED: #[]
+CALLABLE_SHADOWED: #[]
 
 ; the name a shadowed builtin's variable is emitted under
 shadowName: function [name][ "_shadow_" ++ name ]
@@ -234,6 +239,8 @@ isIntrinsicNode: function [n][
 ; the node a source word becomes when it is read
 wordNode: function [name][
     if key? SHADOWED name -> return loadNode (shadowName name)
+    if key? CALLABLE_SHADOWED name -> return loadNode name
+    if name = "fold" -> return intrinsicNode name
     if key? INTRINSICS name -> return intrinsicNode name
     loadNode name
 ]
@@ -569,6 +576,7 @@ lowerWalk: function [blok start stopAtRoot][
                             ]
                             if :block <> type params -> ARITY\[top\name]: 1
                         ]
+                        if and? callableBinding [key? SHADOWABLE top\name] -> CALLABLE_SHADOWED\[top\name]: true
                         ; a call that is not a function: the name is a
                         ; plain variable now — forget any builtin arity
                         if not? callableBinding [

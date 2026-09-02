@@ -76,3 +76,24 @@ frame reclamation for differential diagnosis.
     sort                   174        76   2.29x        25
     string_append           39       106   0.37x       465
     while_counter          387       153   2.53x         1
+
+## Phase 4: compiled higher-order action bodies
+
+Literal action blocks for `map`, `select`, `filter`, `every?`, `some?`,
+`chunk`, `cluster`, `gather`, `arrange`, `enumerate`, `maximum`, `minimum`,
+and `fold` now execute pre-lowered IR. Stored action values and synthetic
+thick-arrow actions retain the token-block path. The full benchmark run below
+had a noisy `map_select` sample (100 ms); two immediately repeated focused runs
+were 67 ms and 68 ms native with output parity.
+
+    program            host_ms native_ms   ratio native_MB
+    closures                87        46   1.89x        14
+    dict_insert             63        46   1.37x        14
+    dict_iter               84        49   1.71x        10
+    fib                    248        99   2.51x         1
+    loop_sum                98        50   1.96x         1
+    map_select             117        68   1.72x        44
+    nested_loops           124        42   2.95x         1
+    sort                   185        61   3.03x        25
+    string_append           42       110   0.38x       465
+    while_counter          403       159   2.53x         1

@@ -311,6 +311,9 @@ static long as_int(Value v);
 static void floating_fraction(double value,long *numerator,long *denominator);
 static int actionParamCount(Value params);
 static void bindActionChunk(Env *child,Value params,Value collection,int start,int count);
+enum { ACTION_NORMAL=0,ACTION_CONTINUE=1,ACTION_STOP=2 };
+static int isIRAction(Value action);
+static int irActionSignal(Value action);
 static Value eval_data_item(Env *e,Value v);
 static int path_is_dyn(Value v);
 static Value path_read(Env *e,Value p);
@@ -467,6 +470,7 @@ static Value wordwrap_value(Env*e,Value*a,int n){
     Value r=v_str(out);free(out);free(copy);return r;
 }
 static struct {const char *name;int arity;} DECLARED_ARITIES[]={
+    {"fold",3},
 #include "intrinsic_arity.inc"
     {NULL,0}
 };
@@ -516,8 +520,8 @@ static int name_index_find(const NameIndex *ix,const char *name){
 /* Generated code names IR operations by string.  The interpreter used to
  * re-compare that string against every operation it knew on each visit; intern
  * it once at construction and dispatch on the integer instead. */
-typedef enum { OP_OTHER=0, OP___SEQ, OP_BLOCK, OP_BREAK, OP_CALL, OP_CASE, OP_CONST, OP_CONSTRUCTOR, OP_CONTINUE, OP_DEFINE, OP_DICTIONARY, OP_DO, OP_ENSURE, OP_FUNCTION, OP_IF, OP_INTRINSIC, OP_IS, OP_LET, OP_LOAD, OP_LOOP, OP_METHOD, OP_PASSTHROUGH, OP_RANGE, OP_RETURN, OP_SWITCH, OP_THROWS_Q, OP_TRY, OP_UNLESS, OP_UNTIL, OP_USING, OP_WHEN, OP_WHILE, OP_WORD } IROpcode;
-static const char *const OP_NAMES[]={"__seq", "block", "break", "call", "case", "const", "constructor", "continue", "define", "dictionary", "do", "ensure", "function", "if", "intrinsic", "is", "let", "load", "loop", "method", "passthrough", "range", "return", "switch", "throws?", "try", "unless", "until", "using", "when", "while", "word"};
+typedef enum { OP_OTHER=0, OP___SEQ, OP_BLOCK, OP_BREAK, OP_CALL, OP_CASE, OP_CONST, OP_CONSTRUCTOR, OP_CONTINUE, OP_DEFINE, OP_DICTIONARY, OP_DO, OP_ENSURE, OP_FUNCTION, OP_HIGHER, OP_IF, OP_INTRINSIC, OP_IS, OP_LET, OP_LOAD, OP_LOOP, OP_METHOD, OP_PASSTHROUGH, OP_RANGE, OP_RETURN, OP_SWITCH, OP_THROWS_Q, OP_TRY, OP_UNLESS, OP_UNTIL, OP_USING, OP_WHEN, OP_WHILE, OP_WORD } IROpcode;
+static const char *const OP_NAMES[]={"__seq", "block", "break", "call", "case", "const", "constructor", "continue", "define", "dictionary", "do", "ensure", "function", "higher", "if", "intrinsic", "is", "let", "load", "loop", "method", "passthrough", "range", "return", "switch", "throws?", "try", "unless", "until", "using", "when", "while", "word"};
 static NameIndex g_op_index;
 static const char *op_name_at(int i){return OP_NAMES[i];}
 static int opcode_of(const char *op){
@@ -876,7 +880,7 @@ Value v_dict(char **keys, Value *vals, int n) {
 }
 Value v_func(IR *params, IR **body, int nbody, Env *closure) {
     Value v;v.k=V_FUNC;
-    v.u.fn.params=params; v.u.fn.body=body; v.u.fn.nbody=nbody; v.u.fn.closure=closure;v.u.fn.constructor=0;v.u.fn.exports=NULL;v.u.fn.nexports=0;env_capture(closure);
+    v.u.fn.params=params; v.u.fn.body=body; v.u.fn.nbody=nbody; v.u.fn.closure=closure;v.u.fn.constructor=0;v.u.fn.is_action=0;v.u.fn.exports=NULL;v.u.fn.nexports=0;env_capture(closure);
     return v;
 }
 Value v_range(long lo, long hi) {
@@ -1240,6 +1244,9 @@ IR *ir_block(IR **items, int n){ IR*x=ir_new("block"); x->args=ir_copy_nodes(ite
 IR *ir_fn(IR *params, IR **body, int n){ IR*x=ir_new("function"); x->args=(IR**)xmalloc((n+1)*sizeof(IR*)); x->args[0]=params; for(int i=0;i<n;i++)x->args[i+1]=body[i]; x->nargs=n+1; return x; }
 IR *ir_op(const char *op, IR **args, int n){ IR*x=ir_new(op); x->args=ir_copy_nodes(args,n); x->nargs=n; return x; }
 IR *ir_op_attrs(const char *op,IR **args,int n,const char **names,IR **values,int nattrs){IR*x=ir_op(op,args,n);return ir_attrs(x,names,values,nattrs);}
+IR *ir_higher(const char *name,IR *collection,IR *params,IR *body,const char **names,IR **values,int nattrs){
+    IR *args[3]={collection,params,body};IR *x=ir_op("higher",args,3);x->name=intern(name);x->builtin=builtin_index_of(name);x->arity=declared_arity_of(name);return nattrs?ir_attrs(x,names,values,nattrs):x;
+}
 /* a seq: internal __seq node wrapping a list of statements */
 IR *ir_seq(IR **items, int n){ IR*x=ir_new("__seq"); x->args=ir_copy_nodes(items,n); x->nargs=n; return x; }
 
@@ -2273,6 +2280,8 @@ static Value applyAction(Env *parent, Value params, Value action, Value el, long
 static Value applyActionAt(Env *parent,Value params,Value action,Value collection,int start,long index);
 static Value applyActionIndexed(Env *parent, Value params, Value action, Value el,
                                 const char *indexName, long index);
+static Value applyFoldAction(Env *parent,Value params,Value action,Value accumulator,
+                             Value collection,int start,int width,long index);
 static Value evalSeq(Env *e, Value **it, int n);
 static Value evalExpr(Env *e, Value **it, int n, int *ip);
 static int  path_is_dyn(Value v);
@@ -2445,12 +2454,14 @@ static int order_value(Value left,Value right){
 }
 static Value b_map(Env*e,Value*a,int n){
     Value coll=a[0], params=a[1], action=a[2];
-    if((params.k!=V_BLOCK&&params.k!=V_LITERAL&&params.k!=V_WORD&&params.k!=V_STR)||action.k!=V_BLOCK)die("map: expected parameter name/block and action block");
+    if((params.k!=V_BLOCK&&params.k!=V_LITERAL&&params.k!=V_WORD&&params.k!=V_STR)||(action.k!=V_BLOCK&&!(action.k==V_FUNC&&action.u.fn.is_action)))die("map: expected parameter name/block and action block");
     int cnt=iterator_count(coll),width=actionParamCount(params),used=0;
     Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
     for(int i=0;i+width<=cnt;i+=width){
-        items[used]=(Value*)xmalloc(sizeof(Value)); items[used++][0]=applyActionAt(e,params,action,coll,i,i/width);
+        Value mapped=applyActionAt(e,params,action,coll,i,i/width);int signal=irActionSignal(action);if(signal==ACTION_STOP)break;if(signal==ACTION_CONTINUE)continue;
+        items[used]=(Value*)xmalloc(sizeof(Value));items[used++][0]=mapped;
     }
+    if(rt_ret_set)return rt_ret_val;
     return v_block(items,used);}
 static Value b_select(Env*e,Value*a,int n){
     Value coll=a[0], params=a[1], pred=a[2];
@@ -2458,7 +2469,8 @@ static Value b_select(Env*e,Value*a,int n){
     Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));
     int m=0;
     for(int i=0;i+width<=cnt;i+=width){
-        if(v_truthy(applyActionAt(e,params,pred,coll,i,i/width)))for(int j=0;j<width&&i+j<cnt;j++){
+        Value selected=applyActionAt(e,params,pred,coll,i,i/width);int signal=irActionSignal(pred);if(signal==ACTION_STOP)break;if(signal==ACTION_CONTINUE)continue;
+        if(v_truthy(selected))for(int j=0;j<width&&i+j<cnt;j++){
             items[m]=(Value*)xmalloc(sizeof(Value));items[m++][0]=iterator_item(coll,i+j);
         }
     }
@@ -2466,30 +2478,58 @@ static Value b_select(Env*e,Value*a,int n){
     if(rt_has_attr("first")){Value limit=rt_attr_value("first",v_int(1));keep=limit.k==V_BOOL?1:(int)as_int(limit);if(keep>m)keep=m;}
     if(rt_has_attr("last")){Value limit=rt_attr_value("last",v_int(1));keep=limit.k==V_BOOL?1:(int)as_int(limit);if(keep>m)keep=m;from=m-keep;}
     if(from>0)memmove(items,items+from,(size_t)keep*sizeof(Value*));
+    if(rt_ret_set)return rt_ret_val;
     return v_block(items,keep);
 }
 static Value b_filter(Env*e,Value*a,int n){
     Value coll=a[0],params=a[1],pred=a[2];
     int cnt=iterator_count(coll),width=actionParamCount(params);
-    int groups=cnt/width,*matched=xmalloc((size_t)(groups?groups:1)*sizeof(int)),matches=0;
-    for(int g=0;g<groups;g++){matched[g]=v_truthy(applyActionAt(e,params,pred,coll,g*width,g));if(matched[g])matches++;}
+    int groups=cnt/width,*matched=xmalloc((size_t)(groups?groups:1)*sizeof(int)),matches=0,evaluated=0;
+    for(int g=0;g<groups;g++){Value result=applyActionAt(e,params,pred,coll,g*width,g);int signal=irActionSignal(pred);if(signal==ACTION_STOP)break;matched[g]=signal==ACTION_CONTINUE?0:v_truthy(result);if(matched[g])matches++;evaluated++;}groups=evaluated;
     int firstLimit=-1,lastLimit=-1;if(rt_has_attr("first")){Value v=rt_attr_value("first",v_int(1));firstLimit=v.k==V_BOOL?1:(int)as_int(v);}if(rt_has_attr("last")){Value v=rt_attr_value("last",v_int(1));lastLimit=v.k==V_BOOL?1:(int)as_int(v);}
     Value **items=(Value**)xmalloc((cnt+1)*sizeof(Value*));int m=0,seen=0;
     for(int g=0;g<groups;g++){int remove=matched[g];if(remove&&firstLimit>=0)remove=seen<firstLimit;if(remove&&lastLimit>=0)remove=seen>=matches-lastLimit;if(matched[g])seen++;if(!remove)for(int j=0;j<width;j++){items[m]=xmalloc(sizeof(Value));*items[m++]=iterator_item(coll,g*width+j);}}
-    free(matched);
+    free(matched);if(rt_ret_set)return rt_ret_val;
     return v_block(items,m);
+}
+static Value fold_seed(Value coll){
+    int count=coll.k==V_DICT?coll.u.dict->n:iterator_count(coll);
+    if(count<1)return v_block((Value**)xmalloc(sizeof(Value*)),0);
+    Value first=coll.k==V_DICT?v_str(coll.u.dict->keys[0]):iterator_item(coll,0);
+    switch(first.k){
+        case V_STR: case V_WORD: case V_LABEL: case V_LITERAL: case V_SYMBOL:
+        case V_SYMBOLLITERAL: case V_CHAR: return v_str("");
+        case V_BLOCK:return v_block((Value**)xmalloc(sizeof(Value*)),0);
+        case V_DICT:return v_dict((char**)xmalloc(sizeof(char*)),(Value*)xmalloc(sizeof(Value)),0);
+        case V_FLOAT:return v_float(0.0);
+        case V_BOOL:return v_bool(0);
+        default:return v_int(0);
+    }
+}
+static Value b_fold(Env*e,Value*a,int n){
+    (void)n;Value coll=a[0],params=a[1],action=a[2];
+    if((params.k!=V_BLOCK&&params.k!=V_LITERAL&&params.k!=V_WORD&&params.k!=V_STR)||(action.k!=V_BLOCK&&!(action.k==V_FUNC&&action.u.fn.is_action)))die("fold: expected parameter name/block and action block");
+    int count=coll.k==V_DICT?coll.u.dict->n:iterator_count(coll),width=actionParamCount(params)-1;if(width<1)width=1;
+    Value accumulator=fold_seed(coll);
+    for(int i=0;i<count;i+=coll.k==V_DICT?1:width){
+        accumulator=applyFoldAction(e,params,action,accumulator,coll,i,width,i/width);
+        int signal=irActionSignal(action);if(signal==ACTION_STOP)break;if(signal==ACTION_CONTINUE)continue;
+    }
+    if(rt_ret_set)return rt_ret_val;
+    return accumulator;
 }
 static Value b_every(Env*e,Value*a,int n){
     Value coll=a[0],params=a[1],pred=a[2];int cnt=iterator_count(coll),width=actionParamCount(params);
-    for(int i=0;i+width<=cnt;i+=width)if(!v_truthy(applyActionAt(e,params,pred,coll,i,i/width)))return v_bool(0);return v_bool(1);
+    for(int i=0;i+width<=cnt;i+=width){Value result=applyActionAt(e,params,pred,coll,i,i/width);int signal=irActionSignal(pred);if(signal==ACTION_STOP)break;if(signal==ACTION_CONTINUE)continue;if(!v_truthy(result))return v_bool(0);}if(rt_ret_set)return rt_ret_val;return v_bool(1);
 }
 static Value b_some(Env*e,Value*a,int n){
     Value coll=a[0],params=a[1],pred=a[2];int cnt=iterator_count(coll),width=actionParamCount(params);
-    for(int i=0;i+width<=cnt;i+=width)if(v_truthy(applyActionAt(e,params,pred,coll,i,i/width)))return v_bool(1);return v_bool(0);
+    for(int i=0;i+width<=cnt;i+=width){Value result=applyActionAt(e,params,pred,coll,i,i/width);int signal=irActionSignal(pred);if(signal==ACTION_STOP)break;if(signal==ACTION_CONTINUE)continue;if(v_truthy(result))return v_bool(1);}if(rt_ret_set)return rt_ret_val;return v_bool(0);
 }
 static Value b_collect(Env*e,Value*a,int n){
     Value coll=a[0],params=a[1],pred=a[2];int count=iterator_count(coll),width=actionParamCount(params),after=rt_has_attr("after"),collecting=!after;Value **items=xmalloc((size_t)(count+1)*sizeof(Value*));int used=0;
-    for(int i=0;i+width<=count;i+=width){int matched=v_truthy(applyActionAt(e,params,pred,coll,i,i/width));if(after){if(!collecting&&matched)collecting=1;}else if(!matched)break;if(collecting)for(int j=0;j<width;j++){items[used]=xmalloc(sizeof(Value));*items[used++]=iterator_item(coll,i+j);}}
+    for(int i=0;i+width<=count;i+=width){Value result=applyActionAt(e,params,pred,coll,i,i/width);int signal=irActionSignal(pred);if(signal==ACTION_STOP)break;if(signal==ACTION_CONTINUE)continue;int matched=v_truthy(result);if(after){if(!collecting&&matched)collecting=1;}else if(!matched)break;if(collecting)for(int j=0;j<width;j++){items[used]=xmalloc(sizeof(Value));*items[used++]=iterator_item(coll,i+j);}}
+    if(rt_ret_set)return rt_ret_val;
     return v_block(items,used);
 }
 static Value b_grouped(Env*e,Value*a,int n,int mode){
@@ -2501,7 +2541,7 @@ static Value b_grouped(Env*e,Value*a,int n,int mode){
     int used=0;
     for(int i=0;i<count;i++){
         Value el=iterator_item(coll,i);
-        Value key=applyAction(e,params,action,el,i); int found=-1;
+        Value key=applyAction(e,params,action,el,i);int signal=irActionSignal(action);if(signal==ACTION_STOP)break;if(signal==ACTION_CONTINUE)continue;int found=-1;
         if(mode==0){ if(used>0&&value_eq(keys[used-1],key))found=used-1; }
         else for(int j=0;j<used;j++)if(value_eq(keys[j],key)){found=j;break;}
         if(found<0){
@@ -2510,6 +2550,7 @@ static Value b_grouped(Env*e,Value*a,int n,int mode){
         }
         block_append(groups[found],el);
     }
+    if(rt_ret_set){free(keys);free(groups);return rt_ret_val;}
     if(mode==2){
         char **names=(char**)xmalloc((size_t)(used?used:1)*sizeof(char*));
         Value *vals=(Value*)xmalloc((size_t)(used?used:1)*sizeof(Value));
@@ -2528,26 +2569,28 @@ static Value b_arrange(Env*e,Value*a,int n){
     Value *keys=(Value*)xmalloc((size_t)(count?count:1)*sizeof(Value));
     Value **items=(Value**)xmalloc((size_t)(count?count:1)*sizeof(Value*));int used=0;
     for(int i=0;i<count;i++){
-        Value item=iterator_item(coll,i),key=applyAction(e,params,action,item,i);int at=used;
+        Value item=iterator_item(coll,i),key=applyAction(e,params,action,item,i);int signal=irActionSignal(action);if(signal==ACTION_STOP)break;if(signal==ACTION_CONTINUE)continue;int at=used;
         for(int j=0;j<used;j++)if(rt_has_attr("descending")?order_value(key,keys[j])>0:order_value(key,keys[j])<0){at=j;break;}
         for(int j=used;j>at;j--){keys[j]=keys[j-1];items[j]=items[j-1];}
         keys[at]=key;items[at]=(Value*)xmalloc(sizeof(Value));*items[at]=item;used++;
     }
-    free(keys);return v_block(items,used);
+    free(keys);if(rt_ret_set)return rt_ret_val;return v_block(items,used);
 }
 static Value b_enumerate(Env*e,Value*a,int n){
     Value coll=a[0];int count=iterator_count(coll),matched=0;
-    for(int i=0;i<count;i++)if(v_truthy(applyAction(e,a[1],a[2],iterator_item(coll,i),i)))matched++;
+    for(int i=0;i<count;i++){Value result=applyAction(e,a[1],a[2],iterator_item(coll,i),i);int signal=irActionSignal(a[2]);if(signal==ACTION_STOP)break;if(signal==ACTION_CONTINUE)continue;if(v_truthy(result))matched++;}
+    if(rt_ret_set)return rt_ret_val;
     return v_int(matched);
 }
 static Value b_extreme(Env*e,Value*a,int n,int maximum){
     Value coll=a[0],best=v_null(),best_key=v_null();int count=iterator_count(coll),set=0;
     for(int i=0;i<count;i++){
-        Value item=iterator_item(coll,i),key=applyAction(e,a[1],a[2],item,i);
+        Value item=iterator_item(coll,i),key=applyAction(e,a[1],a[2],item,i);int signal=irActionSignal(a[2]);if(signal==ACTION_STOP)break;if(signal==ACTION_CONTINUE)continue;
         if(!set||(maximum?order_value(key,best_key)>0:order_value(key,best_key)<0)){
             best=item;best_key=key;set=1;
         }
     }
+    if(rt_ret_set)return rt_ret_val;
     return best;
 }
 static Value b_maximum(Env*e,Value*a,int n){return b_extreme(e,a,n,1);}
@@ -4475,7 +4518,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"get",b_get},{"pathGet",b_path_get},{"empty?",b_empty},{"call",b_call},{"type",b_type},
     {"attr",b_attr},{"attr?",b_attrp},{"attrs",b_attrs},
     {"concat",b_concat},{"range",b_range},{"key?",b_key},
-    {"map",b_map},{"select",b_select},{"filter",b_filter},{"every?",b_every},{"some?",b_some},{"collect",b_collect},
+    {"map",b_map},{"select",b_select},{"filter",b_filter},{"fold",b_fold},{"every?",b_every},{"some?",b_some},{"collect",b_collect},
     {"chunk",b_chunk},{"cluster",b_cluster},{"gather",b_gather},{"arrange",b_arrange},
     {"enumerate",b_enumerate},{"maximum",b_maximum},{"minimum",b_minimum},{"loop",b_loop},
     {"to",b_to},{"replace",b_replace},{"joinWith",b_joinWith},
@@ -4630,7 +4673,7 @@ static Value path_read(Env *e, Value p);
  * `if` branch, while `loop spec\muts [m][body]` must feed `loop` its two block
  * args. -1 means "scan to the boundary" (the old behaviour). */
 static int fn_arity(const char *name){
-    static const char *const three[]={"loop","map","select","filter","every?","some?","arrange","enumerate","maximum","minimum",NULL};
+    static const char *const three[]={"loop","map","select","filter","fold","every?","some?","arrange","enumerate","maximum","minimum",NULL};
     static const char *const one[]={"not?","first","last","do","size","type","pop","keys","values",NULL};
     static const char *const two[]={"key?","get","set","equal?","add","sub","mul","div","mod","to","append","contains?",NULL};
     static NameList l3={three,{0}},l1={one,{0}},l2={two,{0}};
@@ -4644,7 +4687,7 @@ static int fn_arity(const char *name){
 static int block_arg(const char *name, int idx){
     if (!strcmp(name,"do") && idx==0) return 1;
     if ((!strcmp(name,"loop")||!strcmp(name,"map")||!strcmp(name,"select")
-         ||!strcmp(name,"filter")||!strcmp(name,"every?")||!strcmp(name,"some?")
+         ||!strcmp(name,"filter")||!strcmp(name,"fold")||!strcmp(name,"every?")||!strcmp(name,"some?")
          ||!strcmp(name,"arrange")||!strcmp(name,"enumerate")
          ||!strcmp(name,"maximum")||!strcmp(name,"minimum")) && idx>=1) return 1;
     return 0;
@@ -4988,6 +5031,21 @@ static Value runBlockValue(Env *e, Value block) {
     return evalSeq(e, block.u.block.b->items, block.u.block.b->n);
 }
 
+static int isIRAction(Value action){return action.k==V_FUNC&&action.u.fn.is_action;}
+static int irActionSignal(Value action){
+    if(!isIRAction(action))return ACTION_NORMAL;
+    if(rt_ret_set)return ACTION_STOP;
+    if(rt_brk_set){rt_brk_set=0;return ACTION_STOP;}
+    if(rt_cont_set){rt_cont_set=0;return ACTION_CONTINUE;}
+    return ACTION_NORMAL;
+}
+static Value makeIRAction(Env *closure,IR *body){
+    Value action;action.k=V_FUNC;action.u.fn.params=NULL;action.u.fn.closure=closure;action.u.fn.constructor=0;action.u.fn.is_action=1;action.u.fn.exports=NULL;action.u.fn.nexports=0;
+    if(body&&body->op&&(body->opcode==OP___SEQ)){action.u.fn.body=body->args;action.u.fn.nbody=body->nargs;}
+    else{action.u.fn.body=(IR**)xmalloc(sizeof(IR*));action.u.fn.body[0]=body;action.u.fn.nbody=body?1:0;}
+    return action;
+}
+
 /* bind a single parameter to an element and run an action block in a child env */
 static void bindActionParam(Env *child, Value params, Value el) {
     if (params.k == V_STR || params.k == V_WORD || params.k == V_LITERAL)
@@ -5008,6 +5066,12 @@ static const char *actionParamName(Value param){
     if((param.k==V_PATH||param.k==V_PATHLITERAL)&&param.u.path.nsegs==1)return param.u.path.segs[0];
     return NULL;
 }
+static void bindActionValueAt(Env *child,Value params,int at,Value value){
+    if(params.k!=V_BLOCK){if(at==0){const char *name=actionParamName(params);if(name)env_define_local(child,name,value);}return;}
+    if(at>=params.u.block.b->n)return;
+    const char *name=actionParamName(*params.u.block.b->items[at]);
+    if(name)env_define_local(child,name,value);
+}
 static void bindActionChunk(Env *child,Value params,Value collection,int start,int count){
     int width=actionParamCount(params);
     for(int j=0;j<width;j++){
@@ -5021,12 +5085,13 @@ static void bindActionChunk(Env *child,Value params,Value collection,int start,i
 }
 static Value applyActionIndexed(Env *parent, Value params, Value action, Value el,
                                 const char *indexName, long index) {
-    Env *child = env_new(parent);
+    Env *child = env_new(isIRAction(action)?action.u.fn.closure:parent);
     /* params is a block of word-names, a single quoted word `'x` (a pathliteral
      * reference whose name is its only segment), or a bare passthrough word */
     bindActionParam(child,params,el);
     if(indexName&&*indexName)env_define_local(child,indexName,v_int(index));
-    Value r = evalSeq(child, action.u.block.b->items, action.u.block.b->n);
+    Value r;if(isIRAction(action)){child->rebind_parent=1;r=runSeq(child,action.u.fn.body,action.u.fn.nbody);}
+    else r=evalSeq(child,action.u.block.b->items,action.u.block.b->n);
     env_release(child);return r;
 }
 static Value applyAction(Env *parent, Value params, Value action, Value el, long index) {
@@ -5037,10 +5102,26 @@ static Value applyAction(Env *parent, Value params, Value action, Value el, long
     return result;
 }
 static Value applyActionAt(Env *parent,Value params,Value action,Value collection,int start,long index){
-    Env *child=env_new(parent);bindActionChunk(child,params,collection,start,iterator_count(collection));
+    Env *child=env_new(isIRAction(action)?action.u.fn.closure:parent);bindActionChunk(child,params,collection,start,iterator_count(collection));
     char *indexName=NULL;if(rt_has_attr("with"))indexName=val_str(rt_attr_value("with",v_null()));
     if(indexName&&*indexName)env_define_local(child,indexName,v_int(index));
-    Value result=evalSeq(child,action.u.block.b->items,action.u.block.b->n);free(indexName);env_release(child);return result;
+    Value result;if(isIRAction(action)){child->rebind_parent=1;result=runSeq(child,action.u.fn.body,action.u.fn.nbody);}
+    else result=evalSeq(child,action.u.block.b->items,action.u.block.b->n);free(indexName);env_release(child);return result;
+}
+static Value applyFoldAction(Env *parent,Value params,Value action,Value accumulator,
+                             Value collection,int start,int width,long index){
+    Env *child=env_new(isIRAction(action)?action.u.fn.closure:parent);
+    bindActionValueAt(child,params,0,accumulator);
+    if(collection.k==V_DICT){
+        bindActionValueAt(child,params,1,v_str(collection.u.dict->keys[start]));
+        bindActionValueAt(child,params,2,collection.u.dict->vals[start]);
+    }else for(int j=0;j<width&&start+j<iterator_count(collection);j++)
+        bindActionValueAt(child,params,j+1,iterator_item(collection,start+j));
+    char *indexName=NULL;if(rt_has_attr("with"))indexName=val_str(rt_attr_value("with",v_null()));
+    if(indexName&&*indexName)env_define_local(child,indexName,v_int(index));
+    Value result;if(isIRAction(action)){child->rebind_parent=1;result=runSeq(child,action.u.fn.body,action.u.fn.nbody);}
+    else result=evalSeq(child,action.u.block.b->items,action.u.block.b->n);
+    free(indexName);env_release(child);return result;
 }
 
 Value runSeq(Env *e, IR **seq, int n) {
@@ -5342,6 +5423,15 @@ static Value runNode0(Env *e, IR *node) {
     }
     case OP_BREAK: { rt_brk_set=1; return v_null(); }
     case OP_CONTINUE: { rt_cont_set=1; return v_null(); }
+    case OP_HIGHER: {
+        Value coll=runNode0(e,node->args[0]);Value params=runNode0(e,node->args[1]);Value action=makeIRAction(e,node->args[2]);
+        Value stackAttrs[4];Value *attrValues=node->nattrs<=4?stackAttrs:(Value*)xmalloc((size_t)(node->nattrs+1)*sizeof(Value));
+        for(int i=0;i<node->nattrs;i++)attrValues[i]=runNode0(e,node->attr_values[i]);
+        AttrContext previous=g_attrs;int replaceAttrs=node->nattrs>0;if(replaceAttrs){g_attrs.names=node->attr_names;g_attrs.values=attrValues;g_attrs.n=node->nattrs;}
+        Value args[3]={coll,params,action},result;
+        if(!rt_builtin_cached(node,e,args,3,&result)){if(replaceAttrs)g_attrs=previous;if(attrValues!=stackAttrs)free(attrValues);die("unknown higher-order intrinsic");}
+        if(replaceAttrs)g_attrs=previous;if(attrValues!=stackAttrs)free(attrValues);return result;
+    }
     case OP_WHILE: {
         rt_brk_set=0; rt_cont_set=0;
         while (1) {

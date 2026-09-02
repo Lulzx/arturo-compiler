@@ -476,7 +476,31 @@ collectionItems: function [coll][
     out
 ]
 
-higherGroup: function [env coll params action mode][
+higherAction: function [child action compiled][
+    if compiled -> return runSeq child action
+    evalSeq child (lowerBlock action)
+]
+
+bindHigherIndex: function [child index][
+    if key? ATTR_STATE\current "with" [
+        define child (to :string ATTR_STATE\current\with) index
+    ]
+]
+
+foldSeed: function [vals][
+    if empty? vals -> return @[]
+    firstValue: vals\0
+    if :block = type firstValue -> firstValue: firstValue\0
+    kind: type firstValue
+    if :string = kind -> return ""
+    if :block = kind -> return @[]
+    if :dictionary = kind -> return #[]
+    if :floating = kind -> return 0.0
+    if :logical = kind -> return false
+    0
+]
+
+higherGroup: function [env coll params action mode compiled][
     vals: collectionItems coll
     keys: @[]
     groups: @[]
@@ -486,7 +510,17 @@ higherGroup: function [env coll params action mode][
         iterVals: @[item]
         if :dictionary = type coll -> iterVals: item
         child: loopFrame env params iterVals
-        groupKey: evalSeq child (lowerBlock action)
+        bindHigherIndex child j
+        groupKey: higherAction child action compiled
+        if compiled [
+            if RET\set -> break
+            if LOOP_SIGNAL\break -> break
+            if LOOP_SIGNAL\continue [
+                LOOP_SIGNAL\continue: false
+                j: j + 1
+                continue
+            ]
+        ]
         found: neg 1
         if "chunk" = mode [
             if 0 < size keys [
@@ -512,11 +546,15 @@ higherGroup: function [env coll params action mode][
         if "gather" = mode -> set gathered groupKey group
         j: j + 1
     ]
+    if compiled [
+        LOOP_SIGNAL\break: false
+        if RET\set -> return RET\value
+    ]
     if "gather" = mode -> return gathered
     groups
 ]
 
-higherApply: function [env coll params action mode][
+higherApply: function [env coll params action mode compiled][
     vals: collectionItems coll
     out: @[]
     keys: @[]
@@ -524,19 +562,37 @@ higherApply: function [env coll params action mode][
     bestSet: false
     bestItem: null
     bestKey: null
+    accumulator: null
+    if "fold" = mode -> accumulator: foldSeed vals
     j: 0
     while [j < size vals][
         item: vals\[j]
         iterVals: @[item]
         if :dictionary = type coll -> iterVals: item
+        if "fold" = mode [
+            foldVals: @[accumulator]
+            loop iterVals [foldValue][ addItem foldVals foldValue ]
+            iterVals: foldVals
+        ]
         child: loopFrame env params iterVals
-        result: evalSeq child (lowerBlock action)
+        bindHigherIndex child j
+        result: higherAction child action compiled
+        if compiled [
+            if RET\set -> break
+            if LOOP_SIGNAL\break -> break
+            if LOOP_SIGNAL\continue [
+                LOOP_SIGNAL\continue: false
+                j: j + 1
+                continue
+            ]
+        ]
         if "map" = mode -> addItem out result
         if "select" = mode -> if truthy result -> addItem out item
         if "filter" = mode -> if not? truthy result -> addItem out item
         if "every?" = mode -> if not? truthy result -> return false
         if "some?" = mode -> if truthy result -> return true
         if "enumerate" = mode -> if truthy result -> count: count + 1
+        if "fold" = mode -> accumulator: result
         if or? ("maximum" = mode) ["minimum" = mode] [
             replaceBest: not? bestSet
             if bestSet [
@@ -565,9 +621,14 @@ higherApply: function [env coll params action mode][
         ]
         j: j + 1
     ]
+    if compiled [
+        LOOP_SIGNAL\break: false
+        if RET\set -> return RET\value
+    ]
     if "every?" = mode -> return true
     if "some?" = mode -> return false
     if "enumerate" = mode -> return count
+    if "fold" = mode -> return accumulator
     if or? ("maximum" = mode) ["minimum" = mode] -> return bestItem
     out
 ]
@@ -575,10 +636,12 @@ higherApply: function [env coll params action mode][
 evalHigher: function [env argv mode][
     if 3 > size argv [ panic ("not enough parameters: " ++ mode) ]
     coll: evalNode env argv\0 :interpret
+    params: evalNode env argv\1 :interpret
+    action: evalNode env argv\2 :interpret
     if or? ("chunk" = mode) [or? ("cluster" = mode) ["gather" = mode]] [
-        return higherGroup env coll argv\1 argv\2 mode
+        return higherGroup env coll params action mode false
     ]
-    higherApply env coll argv\1 argv\2 mode
+    higherApply env coll params action mode false
 ]
 
 runHigher: function [env argv mode][
@@ -587,9 +650,28 @@ runHigher: function [env argv mode][
     params: runNode env argv\1
     action: runNode env argv\2
     if or? ("chunk" = mode) [or? ("cluster" = mode) ["gather" = mode]] [
-        return higherGroup env coll params action mode
+        return higherGroup env coll params action mode false
     ]
-    higherApply env coll params action mode
+    higherApply env coll params action mode false
+]
+
+runHigherIR: function [env node][
+    coll: runNode env node\args\0
+    params: runNode env node\args\1
+    body: node\args\2
+    mode: node\name
+    previousAttributes: ATTR_STATE\current
+    ATTR_STATE\current: evalCallAttrs env node :run
+    result: null
+    grouped: or? ("chunk" = mode) [or? ("cluster" = mode) ["gather" = mode]]
+    if grouped [
+        result: higherGroup env coll params body mode true
+    ]
+    if not? grouped [
+        result: higherApply env coll params body mode true
+    ]
+    ATTR_STATE\current: previousAttributes
+    result
 ]
 
 emitHigher: function [env argv name][
@@ -598,6 +680,21 @@ emitHigher: function [env argv name][
         return #[op: "call" fn: #[op: "intrinsic" name: "panic"] args: @[#[op: "const" value: msg]]]
     ]
     collIR: emitNode env argv\0
+    compiledAction: :block = type argv\2
+    ; Thick-arrow shorthand synthesizes `[x1] [predicate x1]` after parsing.
+    ; Re-lowering that already-lowered body is not safe; keep its established
+    ; block-value call path. Explicit source action blocks use their own names.
+    if and? compiledAction [:block = type argv\1] [
+        if empty? argv\1 -> compiledAction: false
+        if 1 = size argv\1 [
+            if "x1" = to :string argv\1\0 -> compiledAction: false
+        ]
+    ]
+    if compiledAction [
+        paramsIR: argv\1
+        bodyIR: emitSeq env (lowerBlock argv\2)
+        return #[op: "higher" name: name args: @[collIR paramsIR bodyIR]]
+    ]
     paramsIR: emitNode env argv\1
     actionIR: emitNode env argv\2
     #[op: "call" fn: #[op: "intrinsic" name: name] args: @[collIR paramsIR actionIR]]
@@ -1443,12 +1540,20 @@ evalCall: function [env node][
 
     ; one row per construct, one lookup, one of its three
     ; behaviours picked by which dispatcher is asking
-    r: ruleFor (calleeName fnNode)
+    callName: calleeName fnNode
+    r: ruleFor callName
+    if and? (isLoadNode fnNode) [key? CALLABLE_SHADOWED callName] -> r: null
     if not? null? r [
         rowArgs: @[]
         addItem rowArgs env
         addItem rowArgs node\args
-        return call r\eval rowArgs
+        ruleAttributes: evalCallAttrs env node :interpret
+        if empty? ruleAttributes -> return call r\eval rowArgs
+        previousAttributes: ATTR_STATE\current
+        ATTR_STATE\current: ruleAttributes
+        result: call r\eval rowArgs
+        ATTR_STATE\current: previousAttributes
+        return result
     ]
 
     fnVal: evalNode env fnNode :interpret
@@ -1499,7 +1604,9 @@ emitNode: function [env node][
 
 emitCall: function [env node][
     fnNode: node\fn
-    r: ruleFor (calleeName fnNode)
+    callName: calleeName fnNode
+    r: ruleFor callName
+    if and? (isLoadNode fnNode) [key? CALLABLE_SHADOWED callName] -> r: null
     if not? null? r [
         rowArgs: @[]
         addItem rowArgs env
@@ -1643,6 +1750,7 @@ runNode: function [env node][
     if "while" = op -> return runWhile env node\args
     if "until" = op -> return runUntil env node\args
     if "loop" = op -> return runLoop env node\args
+    if "higher" = op -> return runHigherIR env node
     if "range" = op -> return runRange env node\args
     node
 ]
@@ -1830,7 +1938,9 @@ runCall: function [env node][
             return #[nodek: "error" msg: caughtThrow]
         ]
     ]
-    r: ruleFor (irCalleeName fnNode)
+    callName: irCalleeName fnNode
+    r: ruleFor callName
+    if and? (and? (isIR fnNode) ["load" = fnNode\op]) [key? CALLABLE_SHADOWED callName] -> r: null
     if not? null? r [
         rowArgs: @[]
         addItem rowArgs env
@@ -2578,6 +2688,12 @@ defRule "filter" #[
     eval: function [env argv][ evalHigher env argv "filter" ]
     emit: function [env argv][ emitHigher env argv "filter" ]
     run: function [env argv][ runHigher env argv "filter" ]
+]
+
+defRule "fold" #[
+    eval: function [env argv][ evalHigher env argv "fold" ]
+    emit: function [env argv][ emitHigher env argv "fold" ]
+    run: function [env argv][ runHigher env argv "fold" ]
 ]
 
 defRule "every?" #[

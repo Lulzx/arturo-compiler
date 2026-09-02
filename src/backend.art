@@ -22,7 +22,7 @@ renderProgram: function [src][
     ; the path-reference temporaries are numbered per program, so
     ; the output depends only on the source
     REF_SEQ\n: 0
-    ir2artSeq (fold (compileToIR src))
+    ir2artSeq (foldIR (compileToIR src))
 ]
 
 ; compile a source program to bytecode, return the .bcode path

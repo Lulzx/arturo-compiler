@@ -56,7 +56,7 @@ struct Value {
         struct { char **segs; int nsegs; Value *segv; } path;  /* V_PATH (segv=segment Values for to :block) */
         struct { Block *b; } block;    /* V_BLOCK — shared body, see Block above */
         Dict       *dict;       /* V_DICT */
-        struct { IR *params; IR **body; int nbody; Env *closure; int constructor; char **exports; int nexports; } fn; /* V_FUNC */
+        struct { IR *params; IR **body; int nbody; Env *closure; int constructor; int is_action; char **exports; int nexports; } fn; /* V_FUNC */
     } u;
 };
 
@@ -175,6 +175,8 @@ IR *ir_block(IR **items, int n);
 IR *ir_fn(IR *params, IR **body, int n);       /* function */
 IR *ir_op(const char *op, IR **args, int n);   /* if/do/return/while/until */
 IR *ir_op_attrs(const char *op, IR **args, int n, const char **names, IR **values, int nattrs);
+IR *ir_higher(const char *name, IR *collection, IR *params, IR *body,
+              const char **names, IR **values, int nattrs);
 IR *ir_seq(IR **items, int n);                 /* internal __seq of statements */
 
 /* ---- evaluation -------------------------------------------------------- */

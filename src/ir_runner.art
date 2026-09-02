@@ -6,7 +6,7 @@ import ./"modules.art"
 go: function [][
     if 0 < size args\values [
         src: resolveImportsFromFile args\values\0
-        ir: fold (compileToIR src)
+        ir: foldIR (compileToIR src)
         runIR ir
     ]
 ]
