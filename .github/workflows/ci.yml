@@ -9,42 +9,70 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  ARTURO_VERSION: "0.10.0"
+  # The bootstrapped native compiler only depends on these inputs. Hitting the
+  # cache skips the host-interpreted bootstrap, which costs minutes on Linux.
+  NCOMP_CACHE_PATHS: |
+    tmp/ncomp
+    tmp/ncomp_src.art
+    runtime/intrinsic_arity.inc
+    runtime/runtime.o
+    runtime/runtime.a
+
 jobs:
+  # Differential parity: host interpreter vs kernel vs compiled vs runIR, plus
+  # the self-hosting, upstream, compat, diagnostics, and randomized suites.
   parity:
+    name: parity (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Download prebuilt Arturo 0.10.0
-        run: |
-          case "${{ runner.os }}" in
-            Linux)
-              sudo apt-get update
-              sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libmpfr-dev
-              case "${{ runner.arch }}" in
-                ARM64) asset="arturo-0.10.0-linux-arm64.zip" ;;
-                *)     asset="arturo-0.10.0-linux-amd64.zip" ;;
-              esac
-              ;;
-            macOS)
-              case "${{ runner.arch }}" in
-                ARM64) asset="arturo-0.10.0-macos-arm64.zip" ;;
-                *)     asset="arturo-0.10.0-macos-amd64.zip" ;;
-              esac
-              ;;
-            *) exit 1 ;;
-          esac
-          curl -fsSL -o arturo.zip \
-            "https://github.com/arturo-lang/arturo/releases/download/v0.10.0/${asset}"
-          unzip -q arturo.zip -d arturo-bin
-          chmod +x arturo-bin/arturo
-          echo "$PWD/arturo-bin" >> "$GITHUB_PATH"
+      - name: Install Arturo ${{ env.ARTURO_VERSION }}
+        run: bash tools/ci_install_arturo.sh
+      - name: Restore bootstrapped compiler
+        id: ncomp-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NCOMP_CACHE_PATHS }}
+          key: ncomp-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/**', 'runtime/runtime.c', 'runtime/runtime.h', 'tools/cbnative.art', 'tools/gen_intrinsic_arity.sh', 'Makefile') }}
+      - name: Keep make from rebuilding a cached compiler
+        if: steps.ncomp-cache.outputs.cache-hit == 'true'
+        run: bash tools/ci_touch_ncomp.sh
+      - name: Bootstrap native compiler
+        run: make ncomp
       - name: Differential, native, and compatibility checks
         run: make check
-      - name: Address and undefined-behavior sanitizers
-        if: runner.os != 'Windows'
+
+  # ASan + UBSan (+ LSan on Linux) over the whole corpus. Runs beside parity
+  # rather than after it so the wall clock is max(), not sum().
+  sanitize:
+    name: sanitize (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Arturo ${{ env.ARTURO_VERSION }}
+        run: bash tools/ci_install_arturo.sh
+      - name: Restore bootstrapped compiler
+        id: ncomp-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NCOMP_CACHE_PATHS }}
+          key: ncomp-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/**', 'runtime/runtime.c', 'runtime/runtime.h', 'tools/cbnative.art', 'tools/gen_intrinsic_arity.sh', 'Makefile') }}
+      - name: Keep make from rebuilding a cached compiler
+        if: steps.ncomp-cache.outputs.cache-hit == 'true'
+        run: bash tools/ci_touch_ncomp.sh
+      - name: Bootstrap native compiler
+        run: make ncomp
+      - name: Address, undefined-behavior, and leak sanitizers
         run: make sanitize

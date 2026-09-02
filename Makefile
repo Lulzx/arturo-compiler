@@ -20,6 +20,7 @@ SOURCES  = src/intrinsics.art src/modules.art src/semantics.art src/front.art sr
 ncomp: $(NCCOMP)
 
 $(NCCOMP): tools/cbnative.art $(SOURCES) $(RUNTIME_A)
+	mkdir -p tmp
 	$(ARTURO) tools/cbnative.art
 
 runtime/intrinsic_arity.inc: src/intrinsics.art tools/gen_intrinsic_arity.sh

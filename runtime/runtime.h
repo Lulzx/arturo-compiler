@@ -132,6 +132,8 @@ struct IR {
     const char **attr_names; /* call attributes, in source order */
     IR         **attr_values;
     int          nattrs;
+    int          opcode;     /* interned `op` (runtime-private; 0 = other) */
+    int          flags;      /* intrinsic dispatch hints (runtime-private) */
 };
 
 IR *ir_const(Value v);
