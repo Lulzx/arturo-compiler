@@ -4,6 +4,12 @@
  * embedded in C and run here, behaves exactly as the donated VM runs it.
  * Compiled once to runtime.a; the per-program step is gcc + link.
  */
+/* strptime and friends are POSIX/XSI extensions; ask for them explicitly so
+ * glibc declares them (an implicit declaration truncated the returned
+ * pointer to int, and newer compilers reject it outright). */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "runtime.h"
 #include <stdio.h>
 #include <execinfo.h>
@@ -37,15 +43,53 @@ extern char **environ;
  * shutdown. Temporary frees remove entries early without needing reference
  * counts or recursive destruction. The bookkeeping nodes deliberately use the
  * system allocator directly; the macros below only affect runtime allocations. */
-typedef struct ArenaAllocation ArenaAllocation;
-struct ArenaAllocation { void *pointer; ArenaAllocation *next; };
-static ArenaAllocation *g_arena_allocations=NULL;
+/* Open-addressed pointer set: tracking, untracking, and realloc bookkeeping
+ * are O(1), so runtime allocation cost does not grow with the live heap.
+ * Slots hold a pointer, NULL (empty), or ARENA_TOMB (deleted). */
+#define ARENA_TOMB ((void*)1)
+static void **g_arena_slots=NULL;
+static size_t g_arena_cap=0,g_arena_used=0,g_arena_tomb=0;
 static int g_arena_cleanup_registered=0;
-static void arena_track(void *pointer){
-    ArenaAllocation *entry=(ArenaAllocation*)malloc(sizeof *entry);
-    if(!entry){fprintf(stderr,"runtime error: out of memory\n");exit(1);}
-    entry->pointer=pointer;entry->next=g_arena_allocations;g_arena_allocations=entry;
+static size_t arena_hash(const void *pointer){
+    uintptr_t x=(uintptr_t)pointer;x^=x>>17;x*=(uintptr_t)0x9E3779B97F4A7C15ull;x^=x>>29;return (size_t)x;
 }
+static void arena_insert_slot(void *pointer){
+    size_t mask=g_arena_cap-1,i=arena_hash(pointer)&mask;
+    while(g_arena_slots[i]&&g_arena_slots[i]!=ARENA_TOMB)i=(i+1)&mask;
+    if(g_arena_slots[i]==ARENA_TOMB)g_arena_tomb--;
+    g_arena_slots[i]=pointer;g_arena_used++;
+}
+static void arena_rehash(size_t capacity){
+    void **old=g_arena_slots;size_t old_capacity=g_arena_cap;
+    g_arena_slots=(void**)calloc(capacity,sizeof *g_arena_slots);
+    if(!g_arena_slots){fprintf(stderr,"runtime error: out of memory\n");exit(1);}
+    g_arena_cap=capacity;g_arena_used=0;g_arena_tomb=0;
+    for(size_t i=0;i<old_capacity;i++)if(old[i]&&old[i]!=ARENA_TOMB)arena_insert_slot(old[i]);
+    free(old);
+}
+static void arena_track(void *pointer){
+    if((g_arena_used+g_arena_tomb+1)*2>g_arena_cap){
+        size_t capacity=g_arena_cap?g_arena_cap:1024;
+        if(g_arena_used*4>=g_arena_cap)capacity*=2; /* otherwise just purge tombstones */
+        arena_rehash(capacity);
+    }
+    arena_insert_slot(pointer);
+}
+static void **arena_find(const void *pointer){
+    if(!g_arena_cap)return NULL;
+    size_t mask=g_arena_cap-1,i=arena_hash(pointer)&mask;
+    while(g_arena_slots[i]){if(g_arena_slots[i]==pointer)return &g_arena_slots[i];i=(i+1)&mask;}
+    return NULL;
+}
+static int arena_untrack(const void *pointer){
+    void **slot=arena_find(pointer);
+    if(!slot)return 0;
+    *slot=ARENA_TOMB;g_arena_used--;g_arena_tomb++;return 1;
+}
+/* Sequential-access cache for rune addressing (see rune_offset). Forget a
+ * buffer whenever it is freed, resized, or written in place. */
+static struct { const char *s; int index; const char *at; int count; } g_rune_cache;
+static void rune_cache_forget(const void *s){ if(s&&s==(const void*)g_rune_cache.s)g_rune_cache.s=NULL; }
 void *runtime_alloc(size_t size){
     if(!g_arena_cleanup_registered){if(atexit(runtime_cleanup)!=0){fprintf(stderr,"runtime error: cannot register cleanup\n");exit(1);}g_arena_cleanup_registered=1;}
     void *pointer=malloc(size?size:1);
@@ -54,11 +98,11 @@ void *runtime_alloc(size_t size){
 }
 static void *arena_realloc(void *pointer,size_t size){
     if(!pointer)return runtime_alloc(size);
-    ArenaAllocation *entry=g_arena_allocations;
-    while(entry&&entry->pointer!=pointer)entry=entry->next;
+    rune_cache_forget(pointer);
+    int tracked=arena_untrack(pointer);
     void *resized=realloc(pointer,size?size:1);
     if(!resized){fprintf(stderr,"runtime error: out of memory\n");exit(1);}
-    if(entry)entry->pointer=resized;else arena_track(resized);
+    (void)tracked;arena_track(resized);
     return resized;
 }
 static char *arena_strdup(const char *source){
@@ -66,13 +110,13 @@ static char *arena_strdup(const char *source){
 }
 static void arena_free(void *pointer){
     if(!pointer)return;
-    ArenaAllocation **link=&g_arena_allocations;
-    while(*link&&(*link)->pointer!=pointer)link=&(*link)->next;
-    if(*link){ArenaAllocation *entry=*link;*link=entry->next;free(entry);}
+    rune_cache_forget(pointer);
+    arena_untrack(pointer);
     free(pointer);
 }
 void runtime_cleanup(void){
-    while(g_arena_allocations){ArenaAllocation *entry=g_arena_allocations;g_arena_allocations=entry->next;free(entry->pointer);free(entry);}
+    for(size_t i=0;i<g_arena_cap;i++)if(g_arena_slots[i]&&g_arena_slots[i]!=ARENA_TOMB)free(g_arena_slots[i]);
+    free(g_arena_slots);g_arena_slots=NULL;g_arena_cap=g_arena_used=g_arena_tomb=0;
 }
 #define malloc runtime_alloc
 #define realloc arena_realloc
@@ -182,7 +226,7 @@ static double as_float(Value v);
 static long as_int(Value v);
 static void floating_fraction(double value,long *numerator,long *denominator);
 static int actionParamCount(Value params);
-static void bindActionChunk(Env *child,Value params,Value collection,int start);
+static void bindActionChunk(Env *child,Value params,Value collection,int start,int count);
 static Value eval_data_item(Env *e,Value v);
 static int path_is_dyn(Value v);
 static Value path_read(Env *e,Value p);
@@ -342,11 +386,59 @@ static struct {const char *name;int arity;} DECLARED_ARITIES[]={
 #include "intrinsic_arity.inc"
     {NULL,0}
 };
-static int declared_arity_of(const char *name){
-    for(int i=0;DECLARED_ARITIES[i].name;i++)if(!strcmp(DECLARED_ARITIES[i].name,name))return DECLARED_ARITIES[i].arity;
+/* ---- name indexes ------------------------------------------------------- */
+/* Static name tables (builtins, declared arities) are consulted on every
+ * intrinsic call. A lazily built open-addressed index turns the linear
+ * strcmp scan into a hash probe. */
+typedef struct { const char *name; int index; } NameIndexSlot;
+typedef struct { NameIndexSlot *slots; size_t cap; int built; } NameIndex;
+static size_t name_hash(const char *s){
+    size_t h=(size_t)1469598103934665603ull;
+    while(*s){h^=(unsigned char)*s++;h*=(size_t)1099511628211ull;}
+    return h;
+}
+static void name_index_build(NameIndex *ix,int count,const char *(*name_at)(int)){
+    size_t cap=16;while(cap<(size_t)count*2)cap*=2;
+    ix->slots=(NameIndexSlot*)calloc(cap,sizeof *ix->slots);
+    if(!ix->slots){fprintf(stderr,"runtime error: out of memory\n");exit(1);}
+    ix->cap=cap;
+    /* first definition wins, matching the linear scan's semantics */
+    for(int i=count-1;i>=0;i--){
+        const char *name=name_at(i);size_t j=name_hash(name)&(cap-1);
+        while(ix->slots[j].name&&strcmp(ix->slots[j].name,name))j=(j+1)&(cap-1);
+        ix->slots[j].name=name;ix->slots[j].index=i;
+    }
+    ix->built=1;
+}
+static int name_index_find(const NameIndex *ix,const char *name){
+    size_t j=name_hash(name)&(ix->cap-1);
+    while(ix->slots[j].name){if(!strcmp(ix->slots[j].name,name))return ix->slots[j].index;j=(j+1)&(ix->cap-1);}
     return -1;
 }
-static int function_param_count(Value fn){if(fn.k!=V_FUNC||!fn.u.fn.params)return 0;IR *p=fn.u.fn.params;if(p->op&&!strcmp(p->op,"block"))return p->nargs;return 1;}
+
+/* ---- IR opcodes --------------------------------------------------------- */
+/* Generated code names IR operations by string.  The interpreter used to
+ * re-compare that string against every operation it knew on each visit; intern
+ * it once at construction and dispatch on the integer instead. */
+typedef enum { OP_OTHER=0, OP___SEQ, OP_BLOCK, OP_BREAK, OP_CALL, OP_CASE, OP_CONST, OP_CONSTRUCTOR, OP_CONTINUE, OP_DEFINE, OP_DICTIONARY, OP_DO, OP_ENSURE, OP_FUNCTION, OP_IF, OP_INTRINSIC, OP_IS, OP_LET, OP_LOAD, OP_LOOP, OP_METHOD, OP_PASSTHROUGH, OP_RANGE, OP_RETURN, OP_SWITCH, OP_THROWS_Q, OP_TRY, OP_UNLESS, OP_UNTIL, OP_USING, OP_WHEN, OP_WHILE, OP_WORD } IROpcode;
+static const char *const OP_NAMES[]={"__seq", "block", "break", "call", "case", "const", "constructor", "continue", "define", "dictionary", "do", "ensure", "function", "if", "intrinsic", "is", "let", "load", "loop", "method", "passthrough", "range", "return", "switch", "throws?", "try", "unless", "until", "using", "when", "while", "word"};
+static NameIndex g_op_index;
+static const char *op_name_at(int i){return OP_NAMES[i];}
+static int opcode_of(const char *op){
+    if(!op)return OP_OTHER;
+    if(!g_op_index.built)name_index_build(&g_op_index,(int)(sizeof OP_NAMES/sizeof *OP_NAMES),op_name_at);
+    int i=name_index_find(&g_op_index,op);
+    return i<0?OP_OTHER:i+1;
+}
+enum { IRF_ARITH_REF=1, IRF_SHADOWABLE=2 };
+static NameIndex g_arity_index;
+static const char *declared_arity_name_at(int i){return DECLARED_ARITIES[i].name;}
+static int declared_arity_of(const char *name){
+    if(!g_arity_index.built){int count=0;while(DECLARED_ARITIES[count].name)count++;name_index_build(&g_arity_index,count,declared_arity_name_at);}
+    int i=name_index_find(&g_arity_index,name);
+    return i<0?-1:DECLARED_ARITIES[i].arity;
+}
+static int function_param_count(Value fn){if(fn.k!=V_FUNC||!fn.u.fn.params)return 0;IR *p=fn.u.fn.params;if(p->op&&(p->opcode==OP_BLOCK))return p->nargs;return 1;}
 static Value b_arity(Env*e,Value*a,int n){
     (void)a;(void)n;int count=0;while(DECLARED_ARITIES[count].name)count++;for(Env *frame=e;frame;frame=frame->parent)for(int i=0;i<frame->n;i++)if(frame->vals[i].k==V_FUNC)count++;
     char **keys=xmalloc((size_t)(count+1)*sizeof(char*));Value *vals=xmalloc((size_t)(count+1)*sizeof(Value));int used=0;
@@ -679,7 +771,11 @@ Value v_range(long lo, long hi) {
     Value v;memset(&v,0,sizeof v);v.k=V_RANGE;v.u.range.lo=lo;v.u.range.hi=hi;v.u.range.step=hi>=lo?1:-1;return v;
 }
 Value v_path(char **segs, int n) {
-    Value v; memset(&v,0,sizeof v); v.k=V_PATH; v.u.path.segs=segs; v.u.path.nsegs=n; v.u.path.segv=NULL; return v;
+    /* Generated code passes a compound literal; own the segment array so the
+     * value survives the builder function that created it. */
+    char **copy=(char**)xmalloc((size_t)(n>0?n:1)*sizeof(char*));
+    if(n>0&&segs)memcpy(copy,segs,(size_t)n*sizeof(char*));
+    Value v; memset(&v,0,sizeof v); v.k=V_PATH; v.u.path.segs=copy; v.u.path.nsegs=n; v.u.path.segv=NULL; return v;
 }
 Value v_pathv(Value *segv, int n) {
     /* build the string segs (for runtime path ops) from the segment Values
@@ -752,15 +848,25 @@ static int utf8_rune_len(const char *s){
     return 1;
 }
 /* number of runes in a UTF-8 string */
+/* Loops over strings address runes 0,1,2,... in order.  Rescanning from the
+ * start of the buffer on every lookup made character loops quadratic, which
+ * dominated the compiler's own front end on large sources.  Remember where the
+ * previous lookup on the same buffer ended and continue from there. */
 static int rune_count(const char *s){
-    int n = 0;
-    while (*s){ n++; s += utf8_rune_len(s); }
+    if(g_rune_cache.s==s&&g_rune_cache.count>=0)return g_rune_cache.count;
+    int n = 0;const char *p=s;
+    while (*p){ n++; p += utf8_rune_len(p); }
+    if(g_rune_cache.s!=s){g_rune_cache.s=s;g_rune_cache.index=0;g_rune_cache.at=s;}
+    g_rune_cache.count=n;
     return n;
 }
 /* pointer to the start of rune index i in s */
 static const char *rune_offset(const char *s, int i){
-    const char *p = s;
-    while (i-- > 0 && *p) p += utf8_rune_len(p);
+    const char *p = s;int from=0;
+    if(g_rune_cache.s==s&&g_rune_cache.index<=i){p=g_rune_cache.at;from=g_rune_cache.index;}
+    else if(g_rune_cache.s!=s){g_rune_cache.s=s;g_rune_cache.count=-1;}
+    while (from<i && *p){ p += utf8_rune_len(p); from++; }
+    g_rune_cache.index=from;g_rune_cache.at=p;
     return p;
 }
 /* the rune at byte position p of s, as a NUL-terminated UTF-8 buffer */
@@ -957,11 +1063,30 @@ static void env_let(Env *e, const char *name, Value v) {
 
 /* ---- IR builders --------------------------------------------------------- */
 static IR *ir_new(const char *op) {
-    IR *n=(IR*)xmalloc(sizeof *n); memset(n,0,sizeof *n); n->op=op; return n;
+    IR *n=(IR*)xmalloc(sizeof *n); memset(n,0,sizeof *n); n->op=op; n->opcode=opcode_of(op); return n;
+}
+/* Constructors own their argument arrays. Generated code passes compound
+ * literals, whose storage ends with the enclosing builder function, so the
+ * tree must not keep pointing into that frame. */
+static IR **ir_copy_nodes(IR **items,int n){
+    IR **copy=(IR**)xmalloc((size_t)(n>0?n:1)*sizeof(IR*));
+    if(n>0&&items)memcpy(copy,items,(size_t)n*sizeof(IR*));
+    return copy;
+}
+static const char **ir_copy_names(const char **names,int n){
+    const char **copy=(const char**)xmalloc((size_t)(n>0?n:1)*sizeof(char*));
+    if(n>0&&names)memcpy(copy,names,(size_t)n*sizeof(char*));
+    return copy;
 }
 IR *ir_const(Value v){ IR*n=ir_new("const"); n->v=v; return n; }
 IR *ir_load(const char *name){ IR*n=ir_new("load"); n->name=name; return n; }
-IR *ir_intrinsic(const char *name){ IR*n=ir_new("intrinsic"); n->name=name; return n; }
+IR *ir_intrinsic(const char *name){
+    IR*n=ir_new("intrinsic"); n->name=name;
+    static const char *const arith[]={"add","sub","mul","div","fdiv","mod","pow",NULL};
+    for(int i=0;arith[i];i++)if(!strcmp(arith[i],name))n->flags|=IRF_ARITH_REF;
+    if(is_shadowable(name))n->flags|=IRF_SHADOWABLE;
+    return n;
+}
 /* `ir_word` — a bare word in VALUE position (the IR's `[op:intrinsic name:X]`
  * node when it is NOT a call callee). On the host a bare word resolves var-first
  * (a bound parameter like `arity`/`env` loads its value), else a zero-arity
@@ -969,16 +1094,16 @@ IR *ir_intrinsic(const char *name){ IR*n=ir_new("intrinsic"); n->name=name; retu
 IR *ir_word(const char *name){ IR*n=ir_new("word"); n->name=name; return n; }
 IR *ir_define(const char *name, IR *expr){ IR*n=ir_new("define"); n->name=name; n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
 IR *ir_let(const char *name, IR *expr){ IR*n=ir_new("let"); n->name=name; n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
-IR *ir_call(IR *fn, IR **args, int n){ IR*x=ir_new("call"); x->fn=fn; x->args=args; x->nargs=n; return x; }
-IR *ir_call_attrs(IR *fn,IR **args,int n,const char **names,IR **values,int nattrs){IR*x=ir_call(fn,args,n);x->attr_names=names;x->attr_values=values;x->nattrs=nattrs;return x;}
-IR *ir_attrs(IR *node,const char **names,IR **values,int nattrs){node->attr_names=names;node->attr_values=values;node->nattrs=nattrs;return node;}
+IR *ir_call(IR *fn, IR **args, int n){ IR*x=ir_new("call"); x->fn=fn; x->args=ir_copy_nodes(args,n); x->nargs=n; return x; }
+IR *ir_call_attrs(IR *fn,IR **args,int n,const char **names,IR **values,int nattrs){IR*x=ir_call(fn,args,n);return ir_attrs(x,names,values,nattrs);}
+IR *ir_attrs(IR *node,const char **names,IR **values,int nattrs){node->attr_names=ir_copy_names(names,nattrs);node->attr_values=ir_copy_nodes(values,nattrs);node->nattrs=nattrs;return node;}
 IR *ir_passthrough(Value src){ IR*n=ir_new("passthrough"); n->v=src; return n; }
-IR *ir_block(IR **items, int n){ IR*x=ir_new("block"); x->args=items; x->nargs=n; return x; }
+IR *ir_block(IR **items, int n){ IR*x=ir_new("block"); x->args=ir_copy_nodes(items,n); x->nargs=n; return x; }
 IR *ir_fn(IR *params, IR **body, int n){ IR*x=ir_new("function"); x->args=(IR**)xmalloc((n+1)*sizeof(IR*)); x->args[0]=params; for(int i=0;i<n;i++)x->args[i+1]=body[i]; x->nargs=n+1; return x; }
-IR *ir_op(const char *op, IR **args, int n){ IR*x=ir_new(op); x->args=args; x->nargs=n; return x; }
-IR *ir_op_attrs(const char *op,IR **args,int n,const char **names,IR **values,int nattrs){IR*x=ir_op(op,args,n);x->attr_names=names;x->attr_values=values;x->nattrs=nattrs;return x;}
+IR *ir_op(const char *op, IR **args, int n){ IR*x=ir_new(op); x->args=ir_copy_nodes(args,n); x->nargs=n; return x; }
+IR *ir_op_attrs(const char *op,IR **args,int n,const char **names,IR **values,int nattrs){IR*x=ir_op(op,args,n);return ir_attrs(x,names,values,nattrs);}
 /* a seq: internal __seq node wrapping a list of statements */
-IR *ir_seq(IR **items, int n){ IR*x=ir_new("__seq"); x->args=items; x->nargs=n; return x; }
+IR *ir_seq(IR **items, int n){ IR*x=ir_new("__seq"); x->args=ir_copy_nodes(items,n); x->nargs=n; return x; }
 
 /* ---- return / break signals ------------------------------------------------------- */
 static int   rt_ret_set = 0;
@@ -991,7 +1116,7 @@ static int   rt_cont_set = 0;  /* `continue` inside a loop body */
 static int value_arity(Value fn){
     if (fn.k == V_FUNC) {
         IR *p = fn.u.fn.params;
-        if (p && p->op && !strcmp(p->op,"block")) return p->nargs;
+        if (p && p->op && (p->opcode==OP_BLOCK)) return p->nargs;
         return p ? 1 : 0;
     }
     /* every intrinsic has a declared arity (the same table the host's
@@ -1001,8 +1126,8 @@ static int value_arity(Value fn){
     return -1;
 }
 static int is_pathget_ir(IR *node){
-    return node && node->op && !strcmp(node->op,"call") && node->fn
-        && node->fn->op && !strcmp(node->fn->op,"intrinsic")
+    return node && node->op && (node->opcode==OP_CALL) && node->fn
+        && node->fn->op && (node->fn->opcode==OP_INTRINSIC)
         && !strcmp(node->fn->name,"pathGet");
 }
 /* A statement whose value is a function read through a path, followed by its
@@ -1039,7 +1164,7 @@ static int path_call_tail(Env *e, IR **seq, int n, int *ip, IR *ir, Value fn, Va
  * group into a call (a runtime-valued dict function): the returned value is a
  * function read through a path, and the host applies the following items to it. */
 static IR *ret_pathget(IR *node){
-    if (!node || !node->op || strcmp(node->op,"return")) return NULL;
+    if (!node || !node->op || (node->opcode!=OP_RETURN)) return NULL;
     if (node->nargs < 1) return NULL;
     return is_pathget_ir(node->args[0]) ? node->args[0] : NULL;
 }
@@ -1055,12 +1180,12 @@ static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
     if (fn.k!=V_FUNC) { die("cannot call non-function"); return v_null(); }
     Env *child = env_new(fn.u.fn.closure);
     IR *params = fn.u.fn.params;   /* a block of name words (IR) or NULL */
-    if (params && params->op && !strcmp(params->op,"block")) {
+    if (params && params->op && (params->opcode==OP_BLOCK)) {
         for (int i=0;i<params->nargs;i++){
             IR *p = params->args[i];
             const char *nm = NULL;
-            if (p->op && !strcmp(p->op,"load")) nm=p->name;
-            else if(p->op&&!strcmp(p->op,"const")&&(p->v.k==V_STR||p->v.k==V_WORD||p->v.k==V_LITERAL))nm=p->v.u.s;
+            if (p->op && (p->opcode==OP_LOAD)) nm=p->name;
+            else if(p->op&&(p->opcode==OP_CONST)&&(p->v.k==V_STR||p->v.k==V_WORD||p->v.k==V_LITERAL))nm=p->v.u.s;
             if (nm && i<n) env_define_local(child, nm, argv[i]);
         }
     }
@@ -2300,7 +2425,7 @@ static Value b_loop(Env*e,Value*a,int n){
     }
     int cnt=iterator_count(coll),width=actionParamCount(params),group=0;
     for(int i=0;i<cnt;i+=width,group++){
-        Env *child=env_new(e);bindActionChunk(child,params,coll,i);if(indexName&&*indexName)env_define_local(child,indexName,v_int(group));
+        Env *child=env_new(e);bindActionChunk(child,params,coll,i,cnt);if(indexName&&*indexName)env_define_local(child,indexName,v_int(group));
         evalSeq(child,body.u.block.b->items,body.u.block.b->n);
         if (rt_brk_set) break;
     }
@@ -2423,7 +2548,7 @@ static Value b_makeDict(Env*e,Value*a,int n){
 }
 static Value b_set(Env*e,Value*a,int n){
     Value d=a[0]; const char *k=key_text(a[1]); Value val=a[2];
-    if(d.k==V_STR&&a[1].k==V_INT){long index=a[1].u.i;size_t length=strlen(d.u.s);if(index<0||index>=(long)length)die("set: string index out of range");char *replacement=val_str(val);if(!replacement[0])die("set: empty replacement");d.u.s[index]=replacement[0];free(replacement);return d;}
+    if(d.k==V_STR&&a[1].k==V_INT){long index=a[1].u.i;size_t length=strlen(d.u.s);if(index<0||index>=(long)length)die("set: string index out of range");char *replacement=val_str(val);if(!replacement[0])die("set: empty replacement");rune_cache_forget(d.u.s);d.u.s[index]=replacement[0];free(replacement);return d;}
     if(d.k==V_BINARY&&a[1].k==V_INT){long index=a[1].u.i;if(index<0||index>=(long)d.u.binary.len)die("set: binary index out of range");d.u.binary.data[index]=(unsigned char)as_int(val);return d;}
     if((d.k==V_BLOCK||d.k==V_INLINE)&&a[1].k==V_INT){
         long index=a[1].u.i;if(index<0||index>=d.u.block.b->n)die("set: block index out of range");
@@ -2486,7 +2611,7 @@ static Value b_get(Env*e,Value*a,int n){
     int i=dict_find(d,k);
     if(i<0){char msg[256];snprintf(msg,sizeof msg,"get: key not found '%s'",k?k:"");die(msg);}return d.u.dict->vals[i];
 }
-static Value b_path_get(Env*e,Value*a,int n){Value result=b_get(e,a,n);if(object_type_name(a[0])&&result.k==V_FUNC&&result.u.fn.params&&result.u.fn.params->op&&!strcmp(result.u.fn.params->op,"block")&&result.u.fn.params->nargs==0)return applyFunc(e,result,NULL,0);return result;}
+static Value b_path_get(Env*e,Value*a,int n){Value result=b_get(e,a,n);if(object_type_name(a[0])&&result.k==V_FUNC&&result.u.fn.params&&result.u.fn.params->op&&(result.u.fn.params->opcode==OP_BLOCK)&&result.u.fn.params->nargs==0)return applyFunc(e,result,NULL,0);return result;}
 static Value b_empty(Env*e,Value*a,int n){
     Value v=a[0];
     if (v.k==V_BLOCK) return v_bool(v.u.block.b->n==0);
@@ -2791,8 +2916,8 @@ static Value runtime_construct(Env *e,const char *typeName,Value values){
     int init=-1;for(int i=0;i<instance.u.dict->n;i++)if(!strcmp(instance.u.dict->keys[i],"init")){init=i;break;}
     if(init>=0&&instance.u.dict->vals[init].k==V_FUNC&&instance.u.dict->vals[init].u.fn.constructor){
         IR *params=instance.u.dict->vals[init].u.fn.params;int at=0;
-        if(params&&params->op&&!strcmp(params->op,"block"))for(int i=0;i<params->nargs;i++){
-            IR *p=params->args[i];const char *name=p&&p->name?p->name:NULL;if(!name&&p&&p->op&&!strcmp(p->op,"const")&&IS_STRLIKE(p->v.k))name=p->v.u.s;if(!name||name[0]==':')continue;Value field=v_null();int have=0;
+        if(params&&params->op&&(params->opcode==OP_BLOCK))for(int i=0;i<params->nargs;i++){
+            IR *p=params->args[i];const char *name=p&&p->name?p->name:NULL;if(!name&&p&&p->op&&(p->opcode==OP_CONST)&&IS_STRLIKE(p->v.k))name=p->v.u.s;if(!name||name[0]==':')continue;Value field=v_null();int have=0;
             if(values.k==V_BLOCK&&at<values.u.block.b->n){field=*values.u.block.b->items[at++];have=1;}
             else if(values.k==V_DICT){int found=-1;for(int j=0;j<values.u.dict->n;j++)if(!strcmp(values.u.dict->keys[j],name)){found=j;break;}if(found>=0){field=values.u.dict->vals[found];have=1;}}
             if(have){Value key=v_str(name);Value av[3]={instance,key,field};b_set(e,av,3);}
@@ -4134,10 +4259,18 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {NULL,NULL}
 };
 
+static NameIndex g_builtin_index;
+static const char *builtin_name_at(int i){return BUILTINS[i].name;}
+static int builtin_index_of(const char *name){
+    if(!g_builtin_index.built){int count=0;while(BUILTINS[count].name)count++;name_index_build(&g_builtin_index,count,builtin_name_at);}
+    return name_index_find(&g_builtin_index,name);
+}
 int rt_builtin(const char *name, Env *e, Value *args, int n, Value *out) {
-    for (int i=0; BUILTINS[i].name; i++)
-        if (!strcmp(BUILTINS[i].name, name)) {int expected=declared_arity_of(name);if(expected>=0&&n<expected){char msg[256];snprintf(msg,sizeof msg,"%s: not enough arguments (expected %d, got %d)",name,expected,n);die(msg);}*out = BUILTINS[i].fn(e,args,n); return 1; }
-    return 0;
+    int i=builtin_index_of(name);
+    if(i<0)return 0;
+    int expected=declared_arity_of(name);
+    if(expected>=0&&n<expected){char msg[256];snprintf(msg,sizeof msg,"%s: not enough arguments (expected %d, got %d)",name,expected,n);die(msg);}
+    *out = BUILTINS[i].fn(e,args,n); return 1;
 }
 /* zero-arity builtins: when a bare word names one and it is NOT bound as a
  * variable, the host CALLS it (`args`, `break`) rather than yielding a value. */
@@ -4146,11 +4279,7 @@ static int rt_zero_arity(const char *name){
     for (int i=0; z[i]; i++) if (!strcmp(z[i], name)) return 1;
     return 0;
 }
-int rt_builtin_known(const char *name) {
-    for (int i=0; BUILTINS[i].name; i++)
-        if (!strcmp(BUILTINS[i].name, name)) return 1;
-    return 0;
-}
+int rt_builtin_known(const char *name) { return builtin_index_of(name)>=0; }
 
 /* ---- evaluation --------------------------------------------------------- */
 static Value runNode0(Env *e, IR *node);  /* forward */
@@ -4618,8 +4747,8 @@ static const char *actionParamName(Value param){
     if((param.k==V_PATH||param.k==V_PATHLITERAL)&&param.u.path.nsegs==1)return param.u.path.segs[0];
     return NULL;
 }
-static void bindActionChunk(Env *child,Value params,Value collection,int start){
-    int count=iterator_count(collection),width=actionParamCount(params);
+static void bindActionChunk(Env *child,Value params,Value collection,int start,int count){
+    int width=actionParamCount(params);
     for(int j=0;j<width;j++){
         /* An empty parameter block is Arturo's explicit "ignore the item"
          * form.  It still advances one collection element per iteration, but
@@ -4647,7 +4776,7 @@ static Value applyAction(Env *parent, Value params, Value action, Value el, long
     return result;
 }
 static Value applyActionAt(Env *parent,Value params,Value action,Value collection,int start,long index){
-    Env *child=env_new(parent);bindActionChunk(child,params,collection,start);
+    Env *child=env_new(parent);bindActionChunk(child,params,collection,start,iterator_count(collection));
     char *indexName=NULL;if(rt_has_attr("with"))indexName=val_str(rt_attr_value("with",v_null()));
     if(indexName&&*indexName)env_define_local(child,indexName,v_int(index));
     Value result=evalSeq(child,action.u.block.b->items,action.u.block.b->n);free(indexName);return result;
@@ -4693,9 +4822,9 @@ static Value callIntrinsic(Env *e, IR *node) {
     for (int i=node->nargs-1;i>=0;i--) argv[i] = runNode0(e, node->args[i]);
     AttrContext previous=g_attrs;int replaceAttrs=node->nattrs>0;if(replaceAttrs){g_attrs.names=node->attr_names;g_attrs.values=attrValues;g_attrs.n=node->nattrs;}
     Value out;
-    int arithmeticRef=node->nargs>0&&argv[0].k==V_PATH&&(!strcmp(name,"add")||!strcmp(name,"sub")||!strcmp(name,"mul")||!strcmp(name,"div")||!strcmp(name,"fdiv")||!strcmp(name,"mod")||!strcmp(name,"pow"));
+    int arithmeticRef=node->nargs>0&&argv[0].k==V_PATH&&(node->fn->flags&IRF_ARITH_REF);
     if(arithmeticRef){MutTarget target;argv[0]=mut_load(e,argv[0],&target);if(rt_builtin(name,e,argv,node->nargs,&out)){mut_store(e,&target,out);if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);return v_null();}}
-    if (is_shadowable(name) && env_bound(e, name)) {
+    if ((node->fn->flags&IRF_SHADOWABLE) && env_bound(e, name)) {
         Value bound = env_get(e, name);
         if (bound.k==V_FUNC || bound.k==V_BUILTIN) {
             Value r = applyFunc(e, bound, argv, node->nargs);
@@ -4723,10 +4852,10 @@ static Value callIntrinsic(Env *e, IR *node) {
  * only folds two trailing *value* expressions, not `[x: 5 f x]`. */
 static int node_is_stmt(IR *node){
     if (!node || !node->op) return 1;
-    return !strcmp(node->op,"define")||!strcmp(node->op,"let")||!strcmp(node->op,"if")||
-           !strcmp(node->op,"unless")||!strcmp(node->op,"while")||!strcmp(node->op,"until")||
-           !strcmp(node->op,"loop")||!strcmp(node->op,"return")||!strcmp(node->op,"break")||
-           !strcmp(node->op,"continue")||!strcmp(node->op,"switch")||!strcmp(node->op,"case");
+    return (node->opcode==OP_DEFINE)||(node->opcode==OP_LET)||(node->opcode==OP_IF)||
+           (node->opcode==OP_UNLESS)||(node->opcode==OP_WHILE)||(node->opcode==OP_UNTIL)||
+           (node->opcode==OP_LOOP)||(node->opcode==OP_RETURN)||(node->opcode==OP_BREAK)||
+           (node->opcode==OP_CONTINUE)||(node->opcode==OP_SWITCH)||(node->opcode==OP_CASE);
 }
 static Value apply_tail_two(Env *e, Value second, Value last){
     if (last.k == V_FUNC && second.k != V_FUNC) return applyFunc(e, last, &second, 1);
@@ -4773,7 +4902,7 @@ static Value runNode0(Env *e, IR *node) {
     if (!node) return v_null();
     if (!node->op) return node->v;   /* a raw constant */
 
-    if (!strcmp(node->op,"const")) return node->v;    if (!strcmp(node->op,"load")) {
+    if ((node->opcode==OP_CONST)) return node->v;    if ((node->opcode==OP_LOAD)) {
         /* the emitted IR loads the literal words `true`/`false`/`null` as
          * `ir_load("true")` (e.g. a dict field `infix?: true`). The host treats
          * those as literals; bind them here so they don't come back null. */
@@ -4789,8 +4918,8 @@ static Value runNode0(Env *e, IR *node) {
         if (!env_bound(e, node->name)) { char msg[256]; snprintf(msg,sizeof msg,"name error: identifier not found: %s",node->name); die(msg); }
         return v;
     }
-    if (!strcmp(node->op,"intrinsic")) return v_str(node->name); /* hostword marker */
-    if (!strcmp(node->op,"word")) {
+    if ((node->opcode==OP_INTRINSIC)) return v_str(node->name); /* hostword marker */
+    if ((node->opcode==OP_WORD)) {
         /* bare word in value position: load the binding if one exists, else call
          * a zero-arity builtin, else a builtin function value, else null. */
         if (!strcmp(node->name,"true"))  return v_bool(1);
@@ -4808,20 +4937,20 @@ static Value runNode0(Env *e, IR *node) {
         }
         return v_null();
     }
-    if (!strcmp(node->op,"passthrough")) return node->v;
-    if (!strcmp(node->op,"__seq")) return runSeq(e, node->args, node->nargs);
+    if ((node->opcode==OP_PASSTHROUGH)) return node->v;
+    if ((node->opcode==OP___SEQ)) return runSeq(e, node->args, node->nargs);
 
-    if (!strcmp(node->op,"define")) {
+    if ((node->opcode==OP_DEFINE)) {
         Value v = runNode0(e, node->args[0]);
         env_define_body(e, node->name, v);
         return v;
     }
-    if (!strcmp(node->op,"let")) {
+    if ((node->opcode==OP_LET)) {
         Value v = runNode0(e, node->args[0]);
         env_let(e, node->name, v);
         return v;
     }
-    if (!strcmp(node->op,"block")) {
+    if ((node->opcode==OP_BLOCK)) {
         Value **items=(Value**)xmalloc((node->nargs+1)*sizeof(Value*));
         int used=0;
         for (int i=0;i<node->nargs;i++){
@@ -4830,37 +4959,37 @@ static Value runNode0(Env *e, IR *node) {
         }
         return v_block(items,used);
     }
-    if (!strcmp(node->op,"function")) {
+    if ((node->opcode==OP_FUNCTION)) {
         IR *params = node->args[0];
         IR **body = (IR**)xmalloc((node->nargs)*sizeof(IR*));
         for (int i=1;i<node->nargs;i++) body[i-1]=node->args[i];
         Value fn=v_func(params,body,node->nargs-1,e);
         for(int ai=0;ai<node->nattrs;ai++)if(!strcmp(node->attr_names[ai],"export")){
-            IR *spec=node->attr_values[ai];if(spec&&spec->op&&!strcmp(spec->op,"block")){
+            IR *spec=node->attr_values[ai];if(spec&&spec->op&&(spec->opcode==OP_BLOCK)){
                 fn.u.fn.exports=xmalloc((size_t)(spec->nargs+1)*sizeof(char*));
-                for(int j=0;j<spec->nargs;j++){IR *item=spec->args[j];const char *name=NULL;if(item&&item->op&&!strcmp(item->op,"load"))name=item->name;else if(item&&item->op&&!strcmp(item->op,"const")&&(item->v.k==V_WORD||item->v.k==V_LITERAL||item->v.k==V_STR))name=item->v.u.s;if(name)fn.u.fn.exports[fn.u.fn.nexports++]=strdup(name);}
+                for(int j=0;j<spec->nargs;j++){IR *item=spec->args[j];const char *name=NULL;if(item&&item->op&&(item->opcode==OP_LOAD))name=item->name;else if(item&&item->op&&(item->opcode==OP_CONST)&&(item->v.k==V_WORD||item->v.k==V_LITERAL||item->v.k==V_STR))name=item->v.u.s;if(name)fn.u.fn.exports[fn.u.fn.nexports++]=strdup(name);}
             }
         }
         return fn;
     }
-    if (!strcmp(node->op,"method")) {
+    if ((node->opcode==OP_METHOD)) {
         IR *params = node->args[0];
         IR **body = (IR**)xmalloc((node->nargs)*sizeof(IR*));
         for (int i=1;i<node->nargs;i++) body[i-1]=node->args[i];
         return v_func(params, body, node->nargs-1, e);
     }
-    if (!strcmp(node->op,"constructor")) {
+    if ((node->opcode==OP_CONSTRUCTOR)) {
         IR *params=node->nargs?node->args[0]:ir_block(NULL,0);Value v=v_func(params,NULL,0,e);v.u.fn.constructor=1;return v;
     }
-    if (!strcmp(node->op,"is")) {
+    if ((node->opcode==OP_IS)) {
         Value base=runNode0(e,node->args[0]);Value extra=runNode0(e,node->args[1]);return runtime_inherit(e,base.u.s,extra);
     }
-    if (!strcmp(node->op,"dictionary")) {
+    if ((node->opcode==OP_DICTIONARY)) {
         IR *body=node->nargs ? node->args[0] : NULL;
-        if(body&&body->op&&!strcmp(body->op,"__seq")&&body->nargs>0){int stringData=1;size_t length=0;for(int i=0;i<body->nargs;i++){IR *part=body->args[i];if(!part||!part->op||strcmp(part->op,"const")||part->v.k!=V_CHAR){stringData=0;break;}length+=strlen(part->v.u.c);}if(stringData){char *path=xmalloc(length+1);size_t at=0;for(int i=0;i<body->nargs;i++){size_t n=strlen(body->args[i]->v.u.c);memcpy(path+at,body->args[i]->v.u.c,n);at+=n;}path[at]=0;FILE*f=fopen(path,"rb");if(!f){char msg[512];snprintf(msg,sizeof msg,"dictionary: file not found '%s'",path);free(path);die(msg);}fclose(f);free(path);}}
+        if(body&&body->op&&(body->opcode==OP___SEQ)&&body->nargs>0){int stringData=1;size_t length=0;for(int i=0;i<body->nargs;i++){IR *part=body->args[i];if(!part||!part->op||(part->opcode!=OP_CONST)||part->v.k!=V_CHAR){stringData=0;break;}length+=strlen(part->v.u.c);}if(stringData){char *path=xmalloc(length+1);size_t at=0;for(int i=0;i<body->nargs;i++){size_t n=strlen(body->args[i]->v.u.c);memcpy(path+at,body->args[i]->v.u.c,n);at+=n;}path[at]=0;FILE*f=fopen(path,"rb");if(!f){char msg[512];snprintf(msg,sizeof msg,"dictionary: file not found '%s'",path);free(path);die(msg);}fclose(f);free(path);}}
         Env *child=env_new(e);
-        if(body&&body->op&&!strcmp(body->op,"__seq"))for(int i=0;i<body->nargs;i++){IR *field=body->args[i];if(field&&field->op&&!strcmp(field->op,"load")&&field->name&&!env_bound(child,field->name))env_define_local(child,field->name,v_null());}
-        if(body && body->op && !strcmp(body->op,"__seq"))
+        if(body&&body->op&&(body->opcode==OP___SEQ))for(int i=0;i<body->nargs;i++){IR *field=body->args[i];if(field&&field->op&&(field->opcode==OP_LOAD)&&field->name&&!env_bound(child,field->name))env_define_local(child,field->name,v_null());}
+        if(body && body->op && (body->opcode==OP___SEQ))
             (void)runSeq(child,body->args,body->nargs);
         else if(body)
             (void)runNode0(child,body);
@@ -4872,7 +5001,7 @@ static Value runNode0(Env *e, IR *node) {
         }
         return v_dict(keys,vals,child->n);
     }
-    if (!strcmp(node->op,"if")) {
+    if ((node->opcode==OP_IF)) {
         Value cond = runNode0(e, node->args[0]);
         if (v_truthy(cond)) {
             Value rv = node->nargs>1 ? runNode0(e, node->args[1]) : v_null();
@@ -4881,34 +5010,34 @@ static Value runNode0(Env *e, IR *node) {
         if (node->nargs>2 && node->args[2]) return runNode0(e, node->args[2]);
         return v_null();
     }
-    if (!strcmp(node->op,"unless")) {
+    if ((node->opcode==OP_UNLESS)) {
         Value cond=runNode0(e,node->args[0]);
         if(!v_truthy(cond)) return runNode0(e,node->args[1]);
         return v_null();
     }
-    if (!strcmp(node->op,"switch")) {
+    if ((node->opcode==OP_SWITCH)) {
         Value cond=runNode0(e,node->args[0]);
         return runNode0(e,node->args[v_truthy(cond)?1:2]);
     }
-    if (!strcmp(node->op,"when")) {
+    if ((node->opcode==OP_WHEN)) {
         for(int i=0;i+1<node->nargs;i+=2){
             Value cond=runNode0(e,node->args[i]);
             if(v_truthy(cond)) return runNode0(e,node->args[i+1]);
         }
         return v_null();
     }
-    if (!strcmp(node->op,"using")) {
+    if ((node->opcode==OP_USING)) {
         Value value=runNode0(e,node->args[0]);
         Env *child=env_new(e);
         env_define_local(child,"this",value);
         child->rebind_parent=1;
         IR *body=node->args[1];
-        if(body && body->op && !strcmp(body->op,"__seq"))
+        if(body && body->op && (body->opcode==OP___SEQ))
             return runSeq(child,body->args,body->nargs);
         return body?runNode0(child,body):v_null();
     }
-    if (!strcmp(node->op,"try") || !strcmp(node->op,"throws?")) {
-        int predicate=!strcmp(node->op,"throws?");
+    if ((node->opcode==OP_TRY) || (node->opcode==OP_THROWS_Q)) {
+        int predicate=(node->opcode==OP_THROWS_Q);
         jmp_buf jb;jmp_buf *prev=g_try_jmp;AttrContext savedAttrs=g_attrs;g_try_jmp=&jb;
         if(setjmp(jb)==0){
             (void)runNode0(e,node->args[0]);g_try_jmp=prev;
@@ -4917,23 +5046,23 @@ static Value runNode0(Env *e, IR *node) {
         g_try_jmp=prev;g_attrs=savedAttrs;
         return predicate?v_bool(1):v_error(g_last_error);
     }
-    if (!strcmp(node->op,"ensure")) {
+    if ((node->opcode==OP_ENSURE)) {
         Value condition=runNode0(e,node->args[0]);
         if(!v_truthy(condition))die("assertion failed");
         return v_null();
     }
-    if (!strcmp(node->op,"do")) {
+    if ((node->opcode==OP_DO)) {
         IR *body = node->args[0];
         /* a __seq body is already the block's statements; running it yields
          * the last value (a block result there is data, e.g. `do [[1 2][3 4]]`).
          * Use the expression runner so a leading infix symbol is a prefix call. */
-        if (body && body->op && !strcmp(body->op,"__seq")) return runDoSeq(e, body->args, body->nargs);
+        if (body && body->op && (body->opcode==OP___SEQ)) return runDoSeq(e, body->args, body->nargs);
         /* a stored block value (e.g. `do b` where b = [10 * 3]) runs as code */
         Value v = runNode0(e, body);
         if (v.k == V_BLOCK) return runBlockValue(e, v);
         return v;
     }
-    if (!strcmp(node->op,"return")) {
+    if ((node->opcode==OP_RETURN)) {
         /* Evaluate the argument FIRST: `return <call f>` must run f (whose
          * applyFunc resets rt_ret_set at entry) without clobbering the return
          * flag this op is about to raise. Setting the flag before evaluating
@@ -4944,9 +5073,9 @@ static Value runNode0(Env *e, IR *node) {
         rt_ret_set = 1;
         return rt_ret_val;
     }
-    if (!strcmp(node->op,"break")) { rt_brk_set=1; return v_null(); }
-    if (!strcmp(node->op,"continue")) { rt_cont_set=1; return v_null(); }
-    if (!strcmp(node->op,"while")) {
+    if ((node->opcode==OP_BREAK)) { rt_brk_set=1; return v_null(); }
+    if ((node->opcode==OP_CONTINUE)) { rt_cont_set=1; return v_null(); }
+    if ((node->opcode==OP_WHILE)) {
         rt_brk_set=0; rt_cont_set=0;
         while (1) {
             Value cond = runNode0(e, node->args[0]); if (rt_ret_set) break;
@@ -4958,7 +5087,7 @@ static Value runNode0(Env *e, IR *node) {
         if (rt_ret_set) return rt_ret_val;
         return v_null();
     }
-    if (!strcmp(node->op,"until")) {
+    if ((node->opcode==OP_UNTIL)) {
         rt_brk_set=0; rt_cont_set=0;
         while (1) {
             runNode0(e, node->args[0]); if (rt_ret_set || rt_brk_set) break;
@@ -4970,7 +5099,7 @@ static Value runNode0(Env *e, IR *node) {
         if (rt_ret_set) return rt_ret_val;
         return v_null();
     }
-    if (!strcmp(node->op,"loop")) {
+    if ((node->opcode==OP_LOOP)) {
         Value coll = runNode0(e, node->args[0]);
         Value params = runNode0(e, node->args[1]);
         char *indexName=NULL;
@@ -4980,8 +5109,8 @@ static Value runNode0(Env *e, IR *node) {
             break;
         }
         IR *body = node->args[2];
-        IR **body_items = body && body->op && !strcmp(body->op,"__seq") ? body->args : &body;
-        int body_n = body && body->op && !strcmp(body->op,"__seq") ? body->nargs : 1;
+        IR **body_items = body && body->op && (body->opcode==OP___SEQ) ? body->args : &body;
+        int body_n = body && body->op && (body->opcode==OP___SEQ) ? body->nargs : 1;
         rt_brk_set=0; rt_cont_set=0;
         if (coll.k==V_DICT) {
             Dict *dd=coll.u.dict;
@@ -5002,7 +5131,7 @@ static Value runNode0(Env *e, IR *node) {
         } else if (coll.k==V_BLOCK || coll.k==V_RANGE || coll.k==V_STR) {
             int count=iterator_count(coll),width=actionParamCount(params),group=0;
             for (int i=0;i<count;i+=width,group++) {
-                Env *child=env_new(e);bindActionChunk(child,params,coll,i);
+                Env *child=env_new(e);bindActionChunk(child,params,coll,i,count);
                 if(indexName&&*indexName)env_define_local(child,indexName,v_int(group));
                 child->rebind_parent=1;
                 runSeq(child, body_items, body_n);
@@ -5015,7 +5144,7 @@ static Value runNode0(Env *e, IR *node) {
         if (rt_ret_set) return rt_ret_val;
         return v_null();
     }
-    if (!strcmp(node->op,"range")) {
+    if ((node->opcode==OP_RANGE)) {
         Value from = runNode0(e, node->args[0]);
         Value to = runNode0(e, node->args[1]);
         Value *attrValues=(Value*)xmalloc((size_t)(node->nattrs+1)*sizeof(Value));
@@ -5027,8 +5156,8 @@ static Value runNode0(Env *e, IR *node) {
         free(attrValues);
         return result;
     }
-    if (!strcmp(node->op,"call")) {
-        if (node->fn && node->fn->op && !strcmp(node->fn->op,"intrinsic")){
+    if ((node->opcode==OP_CALL)) {
+        if (node->fn && node->fn->op && (node->fn->opcode==OP_INTRINSIC)){
             Value r = callIntrinsic(e, node);
             return r;
         }
@@ -5046,7 +5175,7 @@ static Value runNode0(Env *e, IR *node) {
         free(attrValues);free(argv);
         die("cannot call non-function");
     }
-    die("unknown IR op"); return v_null();
+    {char msg[160];snprintf(msg,sizeof msg,"unknown IR op: %s",node->op?node->op:"(null)");die(msg);}; return v_null();
 }
 
 Value runNode(Env *e, IR *node) { return runNode0(e, node); }
