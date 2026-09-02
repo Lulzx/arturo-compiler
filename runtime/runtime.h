@@ -134,6 +134,9 @@ struct IR {
     int          nattrs;
     int          opcode;     /* interned `op` (runtime-private; 0 = other) */
     int          flags;      /* intrinsic dispatch hints (runtime-private) */
+    int          builtin;    /* intrinsic: BUILTINS index, -1 if unknown (runtime-private) */
+    int          arity;      /* intrinsic: declared arity, -1 if none (runtime-private) */
+    int          literal;    /* load/word: 1 true, 2 false, 3 null, 4 runtimeError (runtime-private) */
 };
 
 IR *ir_const(Value v);

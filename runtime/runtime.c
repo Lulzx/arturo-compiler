@@ -431,6 +431,21 @@ static int opcode_of(const char *op){
     return i<0?OP_OTHER:i+1;
 }
 enum { IRF_ARITH_REF=1, IRF_SHADOWABLE=2 };
+/* index of `name` in a NULL-terminated static list, hashed on first use */
+typedef struct { const char *const *list; NameIndex ix; } NameList;
+static int name_list_find(NameList *nl,const char *name){
+    if(!nl->ix.built){
+        int count=0;while(nl->list[count])count++;
+        size_t cap=16;while(cap<(size_t)count*2)cap*=2;
+        nl->ix.slots=(NameIndexSlot*)calloc(cap,sizeof *nl->ix.slots);
+        if(!nl->ix.slots){fprintf(stderr,"runtime error: out of memory\n");exit(1);}
+        nl->ix.cap=cap;
+        for(int i=count-1;i>=0;i--){size_t j=name_hash(nl->list[i])&(cap-1);while(nl->ix.slots[j].name&&strcmp(nl->ix.slots[j].name,nl->list[i]))j=(j+1)&(cap-1);nl->ix.slots[j].name=nl->list[i];nl->ix.slots[j].index=i;}
+        nl->ix.built=1;
+    }
+    return name_index_find(&nl->ix,name);
+}
+static int builtin_index_of(const char *name);
 static NameIndex g_arity_index;
 static const char *declared_arity_name_at(int i){return DECLARED_ARITIES[i].name;}
 static int declared_arity_of(const char *name){
@@ -1062,6 +1077,17 @@ static void env_let(Env *e, const char *name, Value v) {
 }
 
 /* ---- IR builders --------------------------------------------------------- */
+static int literal_code(const char *name){
+    if(!name)return 0;
+    if(!strcmp(name,"true"))return 1;
+    if(!strcmp(name,"false"))return 2;
+    if(!strcmp(name,"null"))return 3;
+    if(!strcmp(name,"runtimeError"))return 4;
+    return 0;
+}
+static Value literal_value(int code){
+    switch(code){case 1:return v_bool(1);case 2:return v_bool(0);case 3:return v_null();default:return v_errorkind("Runtime Error");}
+}
 static IR *ir_new(const char *op) {
     IR *n=(IR*)xmalloc(sizeof *n); memset(n,0,sizeof *n); n->op=op; n->opcode=opcode_of(op); return n;
 }
@@ -1079,19 +1105,21 @@ static const char **ir_copy_names(const char **names,int n){
     return copy;
 }
 IR *ir_const(Value v){ IR*n=ir_new("const"); n->v=v; return n; }
-IR *ir_load(const char *name){ IR*n=ir_new("load"); n->name=name; return n; }
+IR *ir_load(const char *name){ IR*n=ir_new("load"); n->name=name; n->literal=literal_code(name); return n; }
 IR *ir_intrinsic(const char *name){
     IR*n=ir_new("intrinsic"); n->name=name;
     static const char *const arith[]={"add","sub","mul","div","fdiv","mod","pow",NULL};
     for(int i=0;arith[i];i++)if(!strcmp(arith[i],name))n->flags|=IRF_ARITH_REF;
     if(is_shadowable(name))n->flags|=IRF_SHADOWABLE;
+    n->builtin=builtin_index_of(name);
+    n->arity=declared_arity_of(name);
     return n;
 }
 /* `ir_word` — a bare word in VALUE position (the IR's `[op:intrinsic name:X]`
  * node when it is NOT a call callee). On the host a bare word resolves var-first
  * (a bound parameter like `arity`/`env` loads its value), else a zero-arity
  * builtin (`args`, `break`) is called. */
-IR *ir_word(const char *name){ IR*n=ir_new("word"); n->name=name; return n; }
+IR *ir_word(const char *name){ IR*n=ir_new("word"); n->name=name; n->literal=literal_code(name); return n; }
 IR *ir_define(const char *name, IR *expr){ IR*n=ir_new("define"); n->name=name; n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
 IR *ir_let(const char *name, IR *expr){ IR*n=ir_new("let"); n->name=name; n->args=(IR**)xmalloc(sizeof(IR*)); n->args[0]=expr; n->nargs=1; return n; }
 IR *ir_call(IR *fn, IR **args, int n){ IR*x=ir_new("call"); x->fn=fn; x->args=ir_copy_nodes(args,n); x->nargs=n; return x; }
@@ -1435,6 +1463,15 @@ static Value int_mul(long a, long b){
     return v_int((long)r);
 }
 static Value int_pow(long base, long exp){
+    if (exp >= 0 && exp <= 64){
+        __int128 r = 1; int ok = 1;
+        for (long i=0;i<exp;i++){ r *= base; if (r > INT64_MAX || r < INT64_MIN){ ok=0; break; } }
+        if (ok) return v_int((long)r);
+    } else if (exp > 64 && base >= -1 && base <= 1){
+        if (base == 0) return v_int(0);
+        if (base == 1) return v_int(1);
+        return v_int((exp & 1) ? -1 : 1);
+    }
     char bb[32]; snprintf(bb, sizeof bb, "%ld", base);
     char *r = big_pow(bb, exp);
     if (big_fits_i64(r)){ long v = atoll(r); free(r); return v_int(v); }
@@ -1442,18 +1479,19 @@ static Value int_pow(long base, long exp){
 }
 /* arbitrary int arithmetic where either side may be a bigint: returns a new
  * value (never dies on magnitude). operands are known numeric. */
-static Value int_op(const char *op, Value a, Value b){
+enum { IOP_ADD, IOP_SUB, IOP_MUL };
+static Value int_op(int op, Value a, Value b){
     if (a.k != V_INT && a.k != V_BIGINT){ die("expected number"); return v_null(); }
     if (b.k != V_INT && b.k != V_BIGINT){ die("expected number"); return v_null(); }
     if (a.k == V_INT && b.k == V_INT){
-        if (!strcmp(op, "add")) return int_add(a.u.i, b.u.i);
-        if (!strcmp(op, "sub")) return int_sub(a.u.i, b.u.i);
-        if (!strcmp(op, "mul")) return int_mul(a.u.i, b.u.i);
+        if (op==IOP_ADD) return int_add(a.u.i, b.u.i);
+        if (op==IOP_SUB) return int_sub(a.u.i, b.u.i);
+        return int_mul(a.u.i, b.u.i);
     }
     char *x = val_str(a), *y = val_str(b);
     char *r;
-    if (!strcmp(op, "add")) r = big_add(x, y);
-    else if (!strcmp(op, "sub")) r = big_sub(x, y);
+    if (op==IOP_ADD) r = big_add(x, y);
+    else if (op==IOP_SUB) r = big_sub(x, y);
     else r = big_mul(x, y);
     free(x); free(y);
     Value out = v_bigint_text(r); free(r); return out;
@@ -1606,6 +1644,7 @@ static double quantity_convert_amount(Value q,const char *target){
     return result;
 }
 static Value b_add(Env*e,Value*a,int n){
+    if(a[0].k==V_INT&&a[1].k==V_INT)return int_add(a[0].u.i,a[1].u.i);
     if(a[0].k==V_COLOR&&a[1].k==V_COLOR)return color_rgba(fmin(255,color_chan(a[0],24)+color_chan(a[1],24)),fmin(255,color_chan(a[0],16)+color_chan(a[1],16)),fmin(255,color_chan(a[0],8)+color_chan(a[1],8)),fmin(255,color_chan(a[0],0)+color_chan(a[1],0)));
     if(a[0].k==V_QUANTITY&&a[1].k==V_QUANTITY){double x=a[0].u.quantity.amount+quantity_convert_amount(a[1],a[0].u.quantity.unit);return a[0].u.quantity.integral&&a[1].u.quantity.integral&&floor(x)==x?v_quantity_int((long)x,a[0].u.quantity.unit):v_quantity(x,a[0].u.quantity.unit);}
     if(a[0].k==V_QUANTITY&&a[1].k==V_COMPLEX){die("add: quantity cannot receive complex");return v_null();}
@@ -1617,9 +1656,10 @@ static Value b_add(Env*e,Value*a,int n){
     if(a[0].k==V_FLOAT||a[1].k==V_FLOAT)return numf(as_float(a[0])+as_float(a[1]));
     if(a[0].k==V_RATIONAL||a[1].k==V_RATIONAL){long an,ad,bn,bd;rational_parts(a[0],&an,&ad);rational_parts(a[1],&bn,&bd);return v_rational(an*bd+bn*ad,ad*bd);}
     if(!is_numeric_kind(a[0])||!is_numeric_kind(a[1])){die("add: expected number");return v_null();}
-    return int_op("add", a[0], a[1]);
+    return int_op(IOP_ADD, a[0], a[1]);
 }
 static Value b_sub(Env*e,Value*a,int n){
+    if(a[0].k==V_INT&&a[1].k==V_INT)return int_sub(a[0].u.i,a[1].u.i);
     if(a[0].k==V_COLOR&&a[1].k==V_COLOR)return color_rgba(fmax(0,color_chan(a[0],24)-color_chan(a[1],24)),fmax(0,color_chan(a[0],16)-color_chan(a[1],16)),fmax(0,color_chan(a[0],8)-color_chan(a[1],8)),fmax(0,color_chan(a[0],0)-color_chan(a[1],0)));
     if(a[0].k==V_QUANTITY&&a[1].k==V_QUANTITY){double x=a[0].u.quantity.amount-quantity_convert_amount(a[1],a[0].u.quantity.unit);return a[0].u.quantity.integral&&a[1].u.quantity.integral&&floor(x)==x?v_quantity_int((long)x,a[0].u.quantity.unit):v_quantity(x,a[0].u.quantity.unit);}
     if(a[0].k==V_QUANTITY&&(a[1].k==V_INT||a[1].k==V_FLOAT||a[1].k==V_RATIONAL)){double x=a[0].u.quantity.amount-as_float(a[1]);return a[0].u.quantity.integral&&a[1].k==V_INT?v_quantity_int((long)x,a[0].u.quantity.unit):v_quantity(x,a[0].u.quantity.unit);}
@@ -1628,7 +1668,7 @@ static Value b_sub(Env*e,Value*a,int n){
     if(a[0].k==V_RATIONAL||a[1].k==V_RATIONAL){long an,ad,bn,bd;rational_parts(a[0],&an,&ad);rational_parts(a[1],&bn,&bd);return v_rational(an*bd-bn*ad,ad*bd);}
     if(a[0].k==V_FLOAT||a[1].k==V_FLOAT)return numf(as_float(a[0])-as_float(a[1]));
     if(!is_numeric_kind(a[0])||!is_numeric_kind(a[1])){die("sub: expected number");return v_null();}
-    return int_op("sub", a[0], a[1]);
+    return int_op(IOP_SUB, a[0], a[1]);
 }
 static void simple_unit_power(const char *unit,char *base,size_t cap,int *power){
     size_t z=strlen(unit);*power=1;
@@ -1655,6 +1695,7 @@ static void normalize_simple_unit(const char *unit,char *out,size_t cap){
     if(!strcmp(lb,rb)&&lp>rp){int power=lp-rp;if(power==1)snprintf(out,cap,"%s",lb);else snprintf(out,cap,"%s%d",lb,power);return;}snprintf(out,cap,"%s",unit);
 }
 static Value b_mul(Env*e,Value*a,int n){
+    if(a[0].k==V_INT&&a[1].k==V_INT)return int_mul(a[0].u.i,a[1].u.i);
     if((a[0].k==V_QUANTITY&&a[1].k==V_COMPLEX)||(a[0].k==V_COMPLEX&&a[1].k==V_QUANTITY)){die("mul: complex quantity unsupported");return v_null();}
     if(a[0].k==V_QUANTITY&&a[1].k==V_QUANTITY){
         const char *leftUnit=a[0].u.quantity.unit,*rightUnit=a[1].u.quantity.unit;const UnitDef *ld=unit_def(leftUnit),*rd=unit_def(rightUnit);double rightAmount=a[1].u.quantity.amount;
@@ -1670,9 +1711,10 @@ static Value b_mul(Env*e,Value*a,int n){
     if(a[0].k==V_FLOAT||a[1].k==V_FLOAT)return numf(as_float(a[0])*as_float(a[1]));
     if(a[0].k==V_RATIONAL||a[1].k==V_RATIONAL){long an,ad,bn,bd;rational_parts(a[0],&an,&ad);rational_parts(a[1],&bn,&bd);return v_rational(an*bn,ad*bd);}
     if(!is_numeric_kind(a[0])||!is_numeric_kind(a[1])){die("mul: expected number");return v_null();}
-    return int_op("mul", a[0], a[1]);
+    return int_op(IOP_MUL, a[0], a[1]);
 }
 static Value b_div(Env*e,Value*a,int n){
+    if(a[0].k==V_INT&&a[1].k==V_INT){long d=a[1].u.i;if(d==0)die("division by zero");return num2(a[0].u.i/d);}
     if(a[0].k==V_QUANTITY&&(a[1].k==V_INT||a[1].k==V_FLOAT||a[1].k==V_RATIONAL)){double denominator=as_float(a[1]);if(denominator==0.0)die("division by zero");return v_quantity(a[0].u.quantity.amount/denominator,a[0].u.quantity.unit);}
     if(a[0].k==V_QUANTITY&&a[1].k==V_QUANTITY){
         const char *leftProperty=unit_property(a[0].u.quantity.unit),*rightProperty=unit_property(a[1].u.quantity.unit);
@@ -1705,6 +1747,7 @@ static Value b_fdiv(Env*e,Value*a,int n){
     return numf(as_float(a[0])/denominator);
 }
 static Value b_mod(Env*e,Value*a,int n){
+    if(a[0].k==V_INT&&a[1].k==V_INT){long d=a[1].u.i;if(d==0)die("division by zero");return v_int(a[0].u.i%d);}
     int mutate=a[0].k==V_PATH;Value left=a[0];if(mutate&&a[0].u.path.nsegs==1)left=env_get(e,a[0].u.path.segs[0]);if(left.k==V_COMPLEX||a[1].k==V_COMPLEX){die("mod: complex unsupported");return v_null();}Value result;
     if(left.k==V_FLOAT||a[1].k==V_FLOAT||left.k==V_RATIONAL||a[1].k==V_RATIONAL){double denominator=as_float(a[1]);if(denominator==0.0)die("division by zero");result=v_float(fmod(as_float(left),denominator));}
     else if(left.k==V_BIGINT||a[1].k==V_BIGINT){
@@ -1859,6 +1902,7 @@ static int version_compare(const char *left,const char *right){
     return 0;
 }
 static Value b_equal(Env*e,Value*a,int n){
+    if(a[0].k==V_INT&&a[1].k==V_INT)return v_bool(a[0].u.i==a[1].u.i);
     if(a[0].k==V_NULL||a[1].k==V_NULL)return v_bool(a[0].k==V_NULL&&a[1].k==V_NULL);
     if((a[0].k==V_BLOCK&&a[1].k==V_BLOCK)||(a[0].k==V_DICT&&a[1].k==V_DICT))return v_bool(value_eq(a[0],a[1]));
     if(a[0].k==V_UNIT&&a[1].k==V_UNIT){const char *left=canonical_unit(a[0].u.s),*right=canonical_unit(a[1].u.s);if((!strcmp(left,"in2")&&!strcmp(right,"sqin"))||(!strcmp(right,"in2")&&!strcmp(left,"sqin"))||(!strcmp(left,"ft2")&&!strcmp(right,"sqft"))||(!strcmp(right,"ft2")&&!strcmp(left,"sqft"))||(!strcmp(left,"metre2")&&!strcmp(right,"m2"))||(!strcmp(right,"metre2")&&!strcmp(left,"m2")))return v_bool(1);return v_bool(!strcmp(left,right));}
@@ -1889,6 +1933,7 @@ static Value b_equal(Env*e,Value*a,int n){
     return v_bool(0);
 }
 static Value b_notEqual(Env*e,Value*a,int n){
+    if(a[0].k==V_INT&&a[1].k==V_INT)return v_bool(a[0].u.i!=a[1].u.i);
     if(a[0].k==V_NULL||a[1].k==V_NULL)return v_bool(a[0].k!=a[1].k);
     if((a[0].k==V_BLOCK&&a[1].k==V_BLOCK)||(a[0].k==V_DICT&&a[1].k==V_DICT))return v_bool(!value_eq(a[0],a[1]));
     if((a[0].k==V_QUANTITY||a[1].k==V_QUANTITY)||(a[0].k==V_UNIT&&a[1].k==V_UNIT)){Value r=b_equal(e,a,n);return v_bool(!r.u.b);}
@@ -1936,8 +1981,8 @@ static int order_values(Value left,Value right){
     }
     char *x=val_str(left),*y=val_str(right);int cmp=strcmp(x,y);free(x);free(y);return (cmp>0)-(cmp<0);
 }
-static Value b_greater(Env*e,Value*a,int n){if(object_member_index(a[0],"compare")>=0){Value r=object_magic(e,a[0],"compare",&a[1],1);return v_bool(as_int(r)>0);}return v_bool(order_values(a[0],a[1])>0);}
-static Value b_less(Env*e,Value*a,int n){if(object_member_index(a[0],"compare")>=0){Value r=object_magic(e,a[0],"compare",&a[1],1);return v_bool(as_int(r)<0);}return v_bool(order_values(a[0],a[1])<0);}
+static Value b_greater(Env*e,Value*a,int n){if(a[0].k==V_INT&&a[1].k==V_INT)return v_bool(a[0].u.i>a[1].u.i);if(object_member_index(a[0],"compare")>=0){Value r=object_magic(e,a[0],"compare",&a[1],1);return v_bool(as_int(r)>0);}return v_bool(order_values(a[0],a[1])>0);}
+static Value b_less(Env*e,Value*a,int n){if(a[0].k==V_INT&&a[1].k==V_INT)return v_bool(a[0].u.i<a[1].u.i);if(object_member_index(a[0],"compare")>=0){Value r=object_magic(e,a[0],"compare",&a[1],1);return v_bool(as_int(r)<0);}return v_bool(order_values(a[0],a[1])<0);}
 static Value runBlockValue(Env *e, Value block);   /* forward (defined later) */
 /* Arturo's `and? a [b]` / `or? a [b]` evaluate the SECOND arg lazily: a block
  * arg is run as code (so `and? (c\i<n-1) [isInfixSymbol ...]` actually calls
@@ -2455,11 +2500,13 @@ static Value b_contains(Env*e,Value*a,int n){
 }
 /* `greaterOrEqual? a b` — a >= b (numeric or string compare) */
 static Value b_ge(Env*e,Value*a,int n){
+    if(a[0].k==V_INT&&a[1].k==V_INT)return v_bool(a[0].u.i>=a[1].u.i);
     if(object_member_index(a[0],"compare")>=0){Value r=object_magic(e,a[0],"compare",&a[1],1);return v_bool(as_int(r)>=0);}
     return v_bool(order_values(a[0],a[1])>=0);
 }
 /* `lessOrEqual? a b` — a <= b (`=<` is the infix spelling) */
 static Value b_le(Env*e,Value*a,int n){
+    if(a[0].k==V_INT&&a[1].k==V_INT)return v_bool(a[0].u.i<=a[1].u.i);
     if(object_member_index(a[0],"compare")>=0){Value r=object_magic(e,a[0],"compare",&a[1],1);return v_bool(as_int(r)<=0);}
     return v_bool(order_values(a[0],a[1])<=0);
 }
@@ -4275,9 +4322,9 @@ int rt_builtin(const char *name, Env *e, Value *args, int n, Value *out) {
 /* zero-arity builtins: when a bare word names one and it is NOT bound as a
  * variable, the host CALLS it (`args`, `break`) rather than yielding a value. */
 static int rt_zero_arity(const char *name){
-    static const char *z[] = {"arg","args","arity","attrs","symbols","break","continue","now","env","exit","clear","path","process","script","sys",NULL};
-    for (int i=0; z[i]; i++) if (!strcmp(z[i], name)) return 1;
-    return 0;
+    static const char *const z[] = {"arg","args","arity","attrs","symbols","break","continue","now","env","exit","clear","path","process","script","sys",NULL};
+    static NameList nl={z,{0}};
+    return name_list_find(&nl,name)>=0;
 }
 int rt_builtin_known(const char *name) { return builtin_index_of(name)>=0; }
 
@@ -4286,32 +4333,11 @@ static Value runNode0(Env *e, IR *node);  /* forward */
 
 /* map an infix operator symbol (a block-data word) to a binary builtin name */
 static const char *binop_name(const char *s) {
-    if (!strcmp(s,"*")) return "mul";
-    if (!strcmp(s,"+")) return "add";
-    if (!strcmp(s,"-")) return "sub";
-    if (!strcmp(s,"/")) return "div";
-    if (!strcmp(s,"%")) return "mod";
-    if (!strcmp(s,"^")) return "pow";
-    if (!strcmp(s,">")) return "greater?";
-    if (!strcmp(s,"<")) return "less?";
-    if (!strcmp(s,"="))  return "equal?";
-    if (!strcmp(s,"==")) return "equal?";
-    if (!strcmp(s,"<>")) return "notEqual?";
-    if (!strcmp(s,">=")) return "greaterOrEqual?";
-    if (!strcmp(s,"=<")) return "lessOrEqual?";
-    if (!strcmp(s,"--")) return "remove";
-    if (!strcmp(s,"//")) return "fdiv";
-    if (!strcmp(s,"-->")) return "convert";
-    if (!strcmp(s,"/%")) return "divmod";
-    if (!strcmp(s,"<=>")) return "between?";
-    if (!strcmp(s,"??")) return "coalesce";
-    if (!strcmp(s,"..")) return "range";
-    if (!strcmp(s,"∧")) return "and?";
-    if (!strcmp(s,">>")) return "write";
-    if (!strcmp(s,"++")) return "concat";
-    if (!strcmp(s,"&&")) return "and?";
-    if (!strcmp(s,"||")) return "or?";
-    return NULL;
+    static const char *const syms[]={"*","+","-","/","%","^",">","<","=","==","<>",">=","=<","--","//","-->","/%","<=>","??","..","∧",">>","++","&&","||",NULL};
+    static const char *const names[]={"mul","add","sub","div","mod","pow","greater?","less?","equal?","equal?","notEqual?","greaterOrEqual?","lessOrEqual?","remove","fdiv","convert","divmod","between?","coalesce","range","and?","write","concat","and?","or?"};
+    static NameList nl={syms,{0}};
+    int i=name_list_find(&nl,s);
+    return i<0?NULL:names[i];
 }
 static int is_binop(Value v) {
     return (v.k==V_STR||v.k==V_SYMBOL) && binop_name(v.u.s) != NULL;
@@ -4363,18 +4389,13 @@ static Value path_read(Env *e, Value p);
  * `if` branch, while `loop spec\muts [m][body]` must feed `loop` its two block
  * args. -1 means "scan to the boundary" (the old behaviour). */
 static int fn_arity(const char *name){
-    if (!strcmp(name,"loop")||!strcmp(name,"map")||!strcmp(name,"select")
-        ||!strcmp(name,"filter")||!strcmp(name,"every?")||!strcmp(name,"some?")
-        ||!strcmp(name,"arrange")||!strcmp(name,"enumerate")
-        ||!strcmp(name,"maximum")||!strcmp(name,"minimum")) return 3;
-    if (!strcmp(name,"not?")||!strcmp(name,"first")||!strcmp(name,"last")
-        ||!strcmp(name,"do")
-        ||!strcmp(name,"size")||!strcmp(name,"type")||!strcmp(name,"pop")
-        ||!strcmp(name,"keys")||!strcmp(name,"values")) return 1;
-    if (!strcmp(name,"key?")||!strcmp(name,"get")||!strcmp(name,"set")
-        ||!strcmp(name,"equal?")||!strcmp(name,"add")||!strcmp(name,"sub")
-        ||!strcmp(name,"mul")||!strcmp(name,"div")||!strcmp(name,"mod")
-        ||!strcmp(name,"to")||!strcmp(name,"append")||!strcmp(name,"contains?")) return 2;
+    static const char *const three[]={"loop","map","select","filter","every?","some?","arrange","enumerate","maximum","minimum",NULL};
+    static const char *const one[]={"not?","first","last","do","size","type","pop","keys","values",NULL};
+    static const char *const two[]={"key?","get","set","equal?","add","sub","mul","div","mod","to","append","contains?",NULL};
+    static NameList l3={three,{0}},l1={one,{0}},l2={two,{0}};
+    if(name_list_find(&l3,name)>=0)return 3;
+    if(name_list_find(&l1,name)>=0)return 1;
+    if(name_list_find(&l2,name)>=0)return 2;
     return -1;
 }
 /* is the idx-th (0-based) arg of this head a BLOCK handed to the function as-is
@@ -4794,18 +4815,25 @@ Value runSeq(Env *e, IR **seq, int n) {
 /* host stdlib words are dispatch-through-the-symbol-table functions, so a user
  * binding shadows them; compiled opcodes always win (empirically classified). */
 static int is_shadowable(const char *name){
-    static const char *words[] = {
+    static const char *const words[] = {
         "sum","first","last","max","min","upper","lower","sort","filter","fold",
         "until","abs","floor","ceil","round","sqrt","trim","strip","repeat",
         "contains?","key?","values","keys","push","pop","remove","insert",
         "type","empty","index",
         NULL
     };
-    for (int i=0;words[i];i++) if(!strcmp(words[i],name)) return 1;
-    return 0;
+    static NameList nl={words,{0}};
+    return name_list_find(&nl,name)>=0;
 }
 
 /* a call whose callee is intrinsic: dispatch to a builtin */
+static int rt_builtin_cached(IR *fn, Env *e, Value *args, int n, Value *out){
+    int i=fn->builtin;
+    if(i<0)return 0;
+    int expected=fn->arity;
+    if(expected>=0&&n<expected){char msg[256];snprintf(msg,sizeof msg,"%s: not enough arguments (expected %d, got %d)",fn->name,expected,n);die(msg);}
+    *out=BUILTINS[i].fn(e,args,n);return 1;
+}
 static Value callIntrinsic(Env *e, IR *node) {
     const char *name = node->fn->name;
     /* The frontend emits `ir_intrinsic` ONLY for a real builtin CALL HEAD
@@ -4816,23 +4844,26 @@ static Value callIntrinsic(Env *e, IR *node) {
      * intrinsic table wrongly lists as a builtin) dispatch to itself; that name
      * is now absent from the intrinsic table so the emitted code loads it, and
      * an intrinsic here is always the primitive. */
-    Value *attrValues=(Value*)xmalloc((size_t)(node->nattrs+1)*sizeof(Value));
+    Value stackAttrs[4], stackArgs[8];
+    Value *attrValues=node->nattrs<=4?stackAttrs:(Value*)xmalloc((size_t)(node->nattrs+1)*sizeof(Value));
     for(int i=0;i<node->nattrs;i++)attrValues[i]=runNode0(e,node->attr_values[i]);
-    Value *argv = (Value*)xmalloc((node->nargs+1)*sizeof(Value));
+    Value *argv = node->nargs<=8?stackArgs:(Value*)xmalloc((node->nargs+1)*sizeof(Value));
     for (int i=node->nargs-1;i>=0;i--) argv[i] = runNode0(e, node->args[i]);
+#define CI_RELEASE() do{ if(attrValues!=stackAttrs)free(attrValues); if(argv!=stackArgs)free(argv); }while(0)
     AttrContext previous=g_attrs;int replaceAttrs=node->nattrs>0;if(replaceAttrs){g_attrs.names=node->attr_names;g_attrs.values=attrValues;g_attrs.n=node->nattrs;}
     Value out;
     int arithmeticRef=node->nargs>0&&argv[0].k==V_PATH&&(node->fn->flags&IRF_ARITH_REF);
-    if(arithmeticRef){MutTarget target;argv[0]=mut_load(e,argv[0],&target);if(rt_builtin(name,e,argv,node->nargs,&out)){mut_store(e,&target,out);if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);return v_null();}}
+    if(arithmeticRef){MutTarget target;argv[0]=mut_load(e,argv[0],&target);if(rt_builtin_cached(node->fn,e,argv,node->nargs,&out)){mut_store(e,&target,out);if(replaceAttrs)g_attrs=previous;CI_RELEASE();return v_null();}}
     if ((node->fn->flags&IRF_SHADOWABLE) && env_bound(e, name)) {
         Value bound = env_get(e, name);
         if (bound.k==V_FUNC || bound.k==V_BUILTIN) {
             Value r = applyFunc(e, bound, argv, node->nargs);
-            if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);return r;
+            if(replaceAttrs)g_attrs=previous;CI_RELEASE();return r;
         }
     }
-    if (rt_builtin(name, e, argv, node->nargs, &out)) { if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);return out; }
-    if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);
+    if (rt_builtin_cached(node->fn, e, argv, node->nargs, &out)) { if(replaceAttrs)g_attrs=previous;CI_RELEASE();return out; }
+    if(replaceAttrs)g_attrs=previous;CI_RELEASE();
+#undef CI_RELEASE
     fprintf(stderr,"[unknown intrinsic: %s]\n", name);
     die("unknown intrinsic"); return v_null();
 }
@@ -4902,14 +4933,13 @@ static Value runNode0(Env *e, IR *node) {
     if (!node) return v_null();
     if (!node->op) return node->v;   /* a raw constant */
 
-    if ((node->opcode==OP_CONST)) return node->v;    if ((node->opcode==OP_LOAD)) {
+    switch (node->opcode) {
+    case OP_CONST: return node->v;
+    case OP_LOAD: {
         /* the emitted IR loads the literal words `true`/`false`/`null` as
          * `ir_load("true")` (e.g. a dict field `infix?: true`). The host treats
          * those as literals; bind them here so they don't come back null. */
-        if (!strcmp(node->name,"true"))  return v_bool(1);
-        if (!strcmp(node->name,"false")) return v_bool(0);
-        if (!strcmp(node->name,"null"))  return v_null();
-        if (!strcmp(node->name,"runtimeError")) return v_errorkind("Runtime Error");
+        if (node->literal) return literal_value(node->literal);
         Value v = env_get(e, node->name);
         if (v.k != V_NULL) return v;
         if (rt_builtin_known(node->name)) {
@@ -4918,14 +4948,11 @@ static Value runNode0(Env *e, IR *node) {
         if (!env_bound(e, node->name)) { char msg[256]; snprintf(msg,sizeof msg,"name error: identifier not found: %s",node->name); die(msg); }
         return v;
     }
-    if ((node->opcode==OP_INTRINSIC)) return v_str(node->name); /* hostword marker */
-    if ((node->opcode==OP_WORD)) {
+    case OP_INTRINSIC: return v_str(node->name); /* hostword marker */
+    case OP_WORD: {
         /* bare word in value position: load the binding if one exists, else call
          * a zero-arity builtin, else a builtin function value, else null. */
-        if (!strcmp(node->name,"true"))  return v_bool(1);
-        if (!strcmp(node->name,"false")) return v_bool(0);
-        if (!strcmp(node->name,"null"))  return v_null();
-        if (!strcmp(node->name,"runtimeError")) return v_errorkind("Runtime Error");
+        if (node->literal) return literal_value(node->literal);
         Value v = env_get(e, node->name);
         if (v.k != V_NULL) return v;
         if (rt_builtin_known(node->name)) {
@@ -4937,20 +4964,20 @@ static Value runNode0(Env *e, IR *node) {
         }
         return v_null();
     }
-    if ((node->opcode==OP_PASSTHROUGH)) return node->v;
-    if ((node->opcode==OP___SEQ)) return runSeq(e, node->args, node->nargs);
+    case OP_PASSTHROUGH: return node->v;
+    case OP___SEQ: return runSeq(e, node->args, node->nargs);
 
-    if ((node->opcode==OP_DEFINE)) {
+    case OP_DEFINE: {
         Value v = runNode0(e, node->args[0]);
         env_define_body(e, node->name, v);
         return v;
     }
-    if ((node->opcode==OP_LET)) {
+    case OP_LET: {
         Value v = runNode0(e, node->args[0]);
         env_let(e, node->name, v);
         return v;
     }
-    if ((node->opcode==OP_BLOCK)) {
+    case OP_BLOCK: {
         Value **items=(Value**)xmalloc((node->nargs+1)*sizeof(Value*));
         int used=0;
         for (int i=0;i<node->nargs;i++){
@@ -4959,7 +4986,7 @@ static Value runNode0(Env *e, IR *node) {
         }
         return v_block(items,used);
     }
-    if ((node->opcode==OP_FUNCTION)) {
+    case OP_FUNCTION: {
         IR *params = node->args[0];
         IR **body = (IR**)xmalloc((node->nargs)*sizeof(IR*));
         for (int i=1;i<node->nargs;i++) body[i-1]=node->args[i];
@@ -4972,19 +4999,19 @@ static Value runNode0(Env *e, IR *node) {
         }
         return fn;
     }
-    if ((node->opcode==OP_METHOD)) {
+    case OP_METHOD: {
         IR *params = node->args[0];
         IR **body = (IR**)xmalloc((node->nargs)*sizeof(IR*));
         for (int i=1;i<node->nargs;i++) body[i-1]=node->args[i];
         return v_func(params, body, node->nargs-1, e);
     }
-    if ((node->opcode==OP_CONSTRUCTOR)) {
+    case OP_CONSTRUCTOR: {
         IR *params=node->nargs?node->args[0]:ir_block(NULL,0);Value v=v_func(params,NULL,0,e);v.u.fn.constructor=1;return v;
     }
-    if ((node->opcode==OP_IS)) {
+    case OP_IS: {
         Value base=runNode0(e,node->args[0]);Value extra=runNode0(e,node->args[1]);return runtime_inherit(e,base.u.s,extra);
     }
-    if ((node->opcode==OP_DICTIONARY)) {
+    case OP_DICTIONARY: {
         IR *body=node->nargs ? node->args[0] : NULL;
         if(body&&body->op&&(body->opcode==OP___SEQ)&&body->nargs>0){int stringData=1;size_t length=0;for(int i=0;i<body->nargs;i++){IR *part=body->args[i];if(!part||!part->op||(part->opcode!=OP_CONST)||part->v.k!=V_CHAR){stringData=0;break;}length+=strlen(part->v.u.c);}if(stringData){char *path=xmalloc(length+1);size_t at=0;for(int i=0;i<body->nargs;i++){size_t n=strlen(body->args[i]->v.u.c);memcpy(path+at,body->args[i]->v.u.c,n);at+=n;}path[at]=0;FILE*f=fopen(path,"rb");if(!f){char msg[512];snprintf(msg,sizeof msg,"dictionary: file not found '%s'",path);free(path);die(msg);}fclose(f);free(path);}}
         Env *child=env_new(e);
@@ -5001,7 +5028,7 @@ static Value runNode0(Env *e, IR *node) {
         }
         return v_dict(keys,vals,child->n);
     }
-    if ((node->opcode==OP_IF)) {
+    case OP_IF: {
         Value cond = runNode0(e, node->args[0]);
         if (v_truthy(cond)) {
             Value rv = node->nargs>1 ? runNode0(e, node->args[1]) : v_null();
@@ -5010,23 +5037,23 @@ static Value runNode0(Env *e, IR *node) {
         if (node->nargs>2 && node->args[2]) return runNode0(e, node->args[2]);
         return v_null();
     }
-    if ((node->opcode==OP_UNLESS)) {
+    case OP_UNLESS: {
         Value cond=runNode0(e,node->args[0]);
         if(!v_truthy(cond)) return runNode0(e,node->args[1]);
         return v_null();
     }
-    if ((node->opcode==OP_SWITCH)) {
+    case OP_SWITCH: {
         Value cond=runNode0(e,node->args[0]);
         return runNode0(e,node->args[v_truthy(cond)?1:2]);
     }
-    if ((node->opcode==OP_WHEN)) {
+    case OP_WHEN: {
         for(int i=0;i+1<node->nargs;i+=2){
             Value cond=runNode0(e,node->args[i]);
             if(v_truthy(cond)) return runNode0(e,node->args[i+1]);
         }
         return v_null();
     }
-    if ((node->opcode==OP_USING)) {
+    case OP_USING: {
         Value value=runNode0(e,node->args[0]);
         Env *child=env_new(e);
         env_define_local(child,"this",value);
@@ -5036,7 +5063,7 @@ static Value runNode0(Env *e, IR *node) {
             return runSeq(child,body->args,body->nargs);
         return body?runNode0(child,body):v_null();
     }
-    if ((node->opcode==OP_TRY) || (node->opcode==OP_THROWS_Q)) {
+    case OP_TRY: case OP_THROWS_Q: {
         int predicate=(node->opcode==OP_THROWS_Q);
         jmp_buf jb;jmp_buf *prev=g_try_jmp;AttrContext savedAttrs=g_attrs;g_try_jmp=&jb;
         if(setjmp(jb)==0){
@@ -5046,12 +5073,12 @@ static Value runNode0(Env *e, IR *node) {
         g_try_jmp=prev;g_attrs=savedAttrs;
         return predicate?v_bool(1):v_error(g_last_error);
     }
-    if ((node->opcode==OP_ENSURE)) {
+    case OP_ENSURE: {
         Value condition=runNode0(e,node->args[0]);
         if(!v_truthy(condition))die("assertion failed");
         return v_null();
     }
-    if ((node->opcode==OP_DO)) {
+    case OP_DO: {
         IR *body = node->args[0];
         /* a __seq body is already the block's statements; running it yields
          * the last value (a block result there is data, e.g. `do [[1 2][3 4]]`).
@@ -5062,7 +5089,7 @@ static Value runNode0(Env *e, IR *node) {
         if (v.k == V_BLOCK) return runBlockValue(e, v);
         return v;
     }
-    if ((node->opcode==OP_RETURN)) {
+    case OP_RETURN: {
         /* Evaluate the argument FIRST: `return <call f>` must run f (whose
          * applyFunc resets rt_ret_set at entry) without clobbering the return
          * flag this op is about to raise. Setting the flag before evaluating
@@ -5073,9 +5100,9 @@ static Value runNode0(Env *e, IR *node) {
         rt_ret_set = 1;
         return rt_ret_val;
     }
-    if ((node->opcode==OP_BREAK)) { rt_brk_set=1; return v_null(); }
-    if ((node->opcode==OP_CONTINUE)) { rt_cont_set=1; return v_null(); }
-    if ((node->opcode==OP_WHILE)) {
+    case OP_BREAK: { rt_brk_set=1; return v_null(); }
+    case OP_CONTINUE: { rt_cont_set=1; return v_null(); }
+    case OP_WHILE: {
         rt_brk_set=0; rt_cont_set=0;
         while (1) {
             Value cond = runNode0(e, node->args[0]); if (rt_ret_set) break;
@@ -5087,7 +5114,7 @@ static Value runNode0(Env *e, IR *node) {
         if (rt_ret_set) return rt_ret_val;
         return v_null();
     }
-    if ((node->opcode==OP_UNTIL)) {
+    case OP_UNTIL: {
         rt_brk_set=0; rt_cont_set=0;
         while (1) {
             runNode0(e, node->args[0]); if (rt_ret_set || rt_brk_set) break;
@@ -5099,7 +5126,7 @@ static Value runNode0(Env *e, IR *node) {
         if (rt_ret_set) return rt_ret_val;
         return v_null();
     }
-    if ((node->opcode==OP_LOOP)) {
+    case OP_LOOP: {
         Value coll = runNode0(e, node->args[0]);
         Value params = runNode0(e, node->args[1]);
         char *indexName=NULL;
@@ -5144,7 +5171,7 @@ static Value runNode0(Env *e, IR *node) {
         if (rt_ret_set) return rt_ret_val;
         return v_null();
     }
-    if ((node->opcode==OP_RANGE)) {
+    case OP_RANGE: {
         Value from = runNode0(e, node->args[0]);
         Value to = runNode0(e, node->args[1]);
         Value *attrValues=(Value*)xmalloc((size_t)(node->nattrs+1)*sizeof(Value));
@@ -5156,7 +5183,7 @@ static Value runNode0(Env *e, IR *node) {
         free(attrValues);
         return result;
     }
-    if ((node->opcode==OP_CALL)) {
+    case OP_CALL: {
         if (node->fn && node->fn->op && (node->fn->opcode==OP_INTRINSIC)){
             Value r = callIntrinsic(e, node);
             return r;
@@ -5174,6 +5201,9 @@ static Value runNode0(Env *e, IR *node) {
         if (fn.k==V_FUNC || fn.k==V_BUILTIN){AttrContext previous=g_attrs;int replaceAttrs=node->nattrs>0;if(replaceAttrs){g_attrs.names=node->attr_names;g_attrs.values=attrValues;g_attrs.n=node->nattrs;}Value out=applyFunc(e,fn,argv,node->nargs);if(replaceAttrs)g_attrs=previous;free(attrValues);free(argv);return out;}
         free(attrValues);free(argv);
         die("cannot call non-function");
+        return v_null();
+    }
+    default: break;
     }
     {char msg[160];snprintf(msg,sizeof msg,"unknown IR op: %s",node->op?node->op:"(null)");die(msg);}; return v_null();
 }
