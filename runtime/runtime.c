@@ -862,6 +862,7 @@ Value v_str(const char *s) {
     v.u.s = (char*)xmalloc(strlen(s)+1); strcpy(v.u.s, s);
     return v;
 }
+static Value v_str_owned(char *s){Value v;v.k=V_STR;v.u.s=s;return v;}
 static Value v_error_kind(const char *message,const char *kind){Value v;v.k=V_ERROR;v.u.error.message=strdup(message?message:"");v.u.error.kind=strdup(kind?kind:"Runtime Error");return v;}
 Value v_error(const char *s) { return v_error_kind(s,g_last_error_kind); }
 Value v_version(const char *s) { return v_token(V_VERSION,s?s:""); }
@@ -2366,9 +2367,10 @@ static Value b_append(Env*e,Value*a,int n){
         else if (x.k==V_BOOL){ app=x.u.b?"true":"false"; }
         else if (x.k==V_CHAR){ app=x.u.c; }
         else die("append: unsupported");
-        char *out=(char*)xmalloc(strlen(s)+strlen(app)+1);
-        strcpy(out,s); strcat(out,app);
-        Value r=v_str(out); free(out); return r;
+        size_t left=strlen(s),right=strlen(app);
+        char *out=(char*)xmalloc(checked_add_size(checked_add_size(left,right,"append: string too large"),1,"append: string too large"));
+        memcpy(out,s,left);memcpy(out+left,app,right+1);
+        return v_str_owned(out);
     }
     {char msg[256];snprintf(msg,sizeof msg,"append: unsupported %s ++ %s '%s'",type_name(v),type_name(a[1]),a[1].k==V_STR?a[1].u.s:"");die(msg);} return v_null();
 }

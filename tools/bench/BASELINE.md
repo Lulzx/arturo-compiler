@@ -97,3 +97,23 @@ were 67 ms and 68 ms native with output parity.
     sort                   185        61   3.03x        25
     string_append           42       110   0.38x       465
     while_counter          403       159   2.53x         1
+
+## Phase 5: single-copy string append
+
+String append now computes both lengths once, allocates the final buffer once,
+copies with `memcpy`, and transfers that buffer directly into the result value.
+This removes the previous `v_str` copy. The immutable-value arena still retains
+prior growing-string values until process exit, so peak RSS is unchanged; an
+alias-safe in-place growth scheme requires ownership tracking.
+
+    program            host_ms native_ms   ratio native_MB
+    closures                86        48   1.79x        14
+    dict_insert             63        52   1.21x        14
+    dict_iter               85        48   1.77x        11
+    fib                    249        91   2.74x         1
+    loop_sum                96        50   1.92x         1
+    map_select             117        67   1.75x        44
+    nested_loops            91        29   3.14x         1
+    sort                   181        61   2.97x        26
+    string_append           40        77   0.52x       465
+    while_counter          406       158   2.57x         1
