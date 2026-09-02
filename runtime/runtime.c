@@ -745,13 +745,14 @@ static char *date_text(Value v){
     char base[32],zone[16];strftime(base,sizeof base,"%Y-%m-%dT%H:%M:%S",&tmv);strftime(zone,sizeof zone,"%z",&tmv);
     char *out=(char*)xmalloc(40);if(strlen(zone)==5)snprintf(out,40,"%s%c%c%c:%c%c",base,zone[0],zone[1],zone[2],zone[3],zone[4]);else snprintf(out,40,"%s%s",base,zone);return out;
 }
+static void dict_invalidate_object(Dict *d){if(d){d->object_name=NULL;d->object_checked=0;}}
 static const char *object_type_name(Value v){
-    if(v.k!=V_DICT||!v.u.dict)return NULL;int marked=0;const char *name=NULL;
+    if(v.k!=V_DICT||!v.u.dict)return NULL;Dict *d=v.u.dict;if(d->object_checked)return d->object_name;int marked=0;const char *name=NULL;
     for(int i=0;i<v.u.dict->n;i++){
         if(!strcmp(v.u.dict->keys[i],"__object")&&v.u.dict->vals[i].k==V_BOOL&&v.u.dict->vals[i].u.b)marked=1;
         if(!strcmp(v.u.dict->keys[i],"__type")&&v.u.dict->vals[i].k==V_STR)name=v.u.dict->vals[i].u.s;
     }
-    return marked?name:NULL;
+    d->object_name=marked?name:NULL;d->object_checked=1;return d->object_name;
 }
 Value v_bool(int b) { Value v; memset(&v,0,sizeof v); v.k=V_BOOL;  v.u.b=b; return v; }
 Value v_char(char c){ Value v; memset(&v,0,sizeof v); v.k=V_CHAR; v.u.c[0]=c; v.u.c[1]=0; return v; }
@@ -774,7 +775,7 @@ Value v_block(Value **items, int n) {
 Value v_dict(char **keys, Value *vals, int n) {
     Value v; memset(&v,0,sizeof v); v.k=V_DICT;
     Dict *d=(Dict*)xmalloc(sizeof *d);
-    d->keys=keys; d->vals=vals; d->n=n;
+    d->keys=keys; d->vals=vals; d->n=n; d->cap=n; d->index=NULL; d->index_cap=0; d->index_n=0; d->object_name=NULL; d->object_checked=0;
     v.u.dict=d; return v;
 }
 Value v_func(IR *params, IR **body, int nbody, Env *closure) {
@@ -2186,7 +2187,7 @@ static int path_target(Env *e, Value p, Value *cont, int *idx) {
 }
 /* write a mutated value back into the container a path_target resolved */
 static void path_store(Value cont, int idx, Value val){
-    if (cont.k==V_DICT) cont.u.dict->vals[idx]=val;
+    if (cont.k==V_DICT){cont.u.dict->vals[idx]=val;dict_invalidate_object(cont.u.dict);}
     else if (cont.k==V_BLOCK && idx>=0 && idx<cont.u.block.b->n) *cont.u.block.b->items[idx]=val;
 }
 static Value block_append(Value v, Value el){
@@ -2571,16 +2572,76 @@ static Value b_do(Env*e,Value*a,int n){
 }
 
 /* dict helpers */
+/* Discard a dictionary's key index. Every mutation that reorders, removes or
+ * renames keys must call this; plain appends go through dict_index_add. */
+static void dict_reindex(Dict *dd){
+    if(!dd)return;
+    if(dd->index)free(dd->index);
+    dd->index=NULL;dd->index_cap=0;dd->index_n=0;
+    dict_invalidate_object(dd);
+}
+#define DICT_INDEX_MIN 12
+static void dict_index_build(Dict *dd){
+    /* The linear scan stops at the first NULL key, so entries behind one are
+     * unreachable; index only the reachable prefix to keep that exactly. */
+    int limit=dd->n;
+    for(int i=0;i<dd->n;i++)if(!dd->keys[i]){limit=i;break;}
+    size_t cap=16;while(cap<(size_t)limit*2)cap*=2;
+    int *slots=(int*)xmalloc(cap*sizeof(int));
+    for(size_t i=0;i<cap;i++)slots[i]=-1;
+    /* insert backwards so the FIRST occurrence of a duplicate key wins, as
+     * the linear scan did */
+    for(int i=limit-1;i>=0;i--){
+        size_t j=name_hash(dd->keys[i])&(cap-1);
+        while(slots[j]>=0&&strcmp(dd->keys[slots[j]],dd->keys[i]))j=(j+1)&(cap-1);
+        slots[j]=i;
+    }
+    if(dd->index)free(dd->index);
+    dd->index=slots;dd->index_cap=(int)cap;dd->index_n=limit;
+}
+/* record a key appended at the end; rebuilds when the table gets full */
+static void dict_index_add(Dict *dd,int at){
+    if(!dd->index)return;
+    if(at!=dd->index_n||(size_t)(dd->index_n+1)*2>(size_t)dd->index_cap){dict_reindex(dd);return;}
+    size_t mask=(size_t)dd->index_cap-1,j=name_hash(dd->keys[at])&mask;
+    while(dd->index[j]>=0&&strcmp(dd->keys[dd->index[j]],dd->keys[at]))j=(j+1)&mask;
+    if(dd->index[j]<0)dd->index[j]=at;   /* an existing key keeps its first slot */
+    dd->index_n=at+1;
+}
+static void dict_reserve(Dict *dd,int need){
+    if(need<=dd->cap)return;
+    int cap=dd->cap>0?dd->cap:4;
+    while(cap<need){if(cap>INT_MAX/2){cap=need;break;}cap*=2;}
+    dd->keys=(char**)xrealloc(dd->keys,(size_t)cap*sizeof(char*));
+    dd->vals=(Value*)xrealloc(dd->vals,(size_t)cap*sizeof(Value));
+    dd->cap=cap;
+}
+static int dict_find_linear(Dict *dd,const char *k){
+    for(int i=0;i<dd->n;i++){
+        if(!dd->keys[i])return -1;
+        if(!strcmp(dd->keys[i],k))return i;
+    }
+    return -1;
+}
+static int dictcheck_enabled(void){
+    static int initialized=0,enabled=0;
+    if(!initialized){const char *s=getenv("ARTURO_NATIVE_DICTCHECK");enabled=s&&*s&&strcmp(s,"0");initialized=1;}
+    return enabled;
+}
 static int dict_find(Value d, const char *k){
     /* a non-dict (a word's u.dict aliases its string pointer) must never be
      * walked as a Dict — that reads garbage and `key?`/`isIR` spuriously
      * succeed. `key? x 'k` on a non-dict is just false. */
     if(d.k!=V_DICT || !d.u.dict) return -1;
-    for(int i=0;i<d.u.dict->n;i++){
-        if(!d.u.dict->keys[i]) return -1;
-        if(!strcmp(d.u.dict->keys[i],k)) return i;
+    Dict *dd=d.u.dict;
+    if(dd->n>=DICT_INDEX_MIN){
+        if(!dd->index||dd->index_n!=dd->n)dict_index_build(dd);
+        size_t mask=(size_t)dd->index_cap-1,j=name_hash(k)&mask;
+        int found=-1;while(dd->index[j]>=0){if(!strcmp(dd->keys[dd->index[j]],k)){found=dd->index[j];break;}j=(j+1)&mask;}
+        if(dictcheck_enabled()&&found!=dict_find_linear(dd,k))die("internal dictionary index mismatch");
+        return found;
     }
-    return -1;
+    return dict_find_linear(dd,k);
 }
 static Value b_makeDict(Env*e,Value*a,int n){
     char **keys=(char**)xmalloc((n/2+1)*sizeof(char*));
@@ -2604,11 +2665,12 @@ static Value b_set(Env*e,Value*a,int n){
     if (d.k!=V_DICT) die("set: expected dict");
     Dict *dd=d.u.dict;
     int i=dict_find(d,k);
-    if (i>=0){ dd->vals[i]=val; return d; }
-    dd->keys=(char**)xrealloc(dd->keys,(dd->n+1)*sizeof(char*));
-    dd->vals=(Value*)xrealloc(dd->vals,(dd->n+1)*sizeof(Value));
+    if (i>=0){ dd->vals[i]=val; dict_invalidate_object(dd); return d; }
+    dict_reserve(dd,dd->n+1);
     dd->keys[dd->n]=(char*)xmalloc(strlen(k)+1); strcpy(dd->keys[dd->n],k);
     dd->vals[dd->n]=val; dd->n++;
+    dict_invalidate_object(dd);
+    dict_index_add(dd,dd->n-1);
     return d;
 }
 /* the emitter passes a dict KEY as a v_path single-segment value (`get c 'stack`
@@ -2950,11 +3012,11 @@ static Value runtime_construct(Env *e,const char *typeName,Value values){
     char **keys=xmalloc(2*sizeof(char*));Value *vals=xmalloc(2*sizeof(Value));keys[0]=strdup("__object");vals[0]=v_bool(1);keys[1]=strdup("__type");vals[1]=v_str(typeName);
     Value instance=v_dict(keys,vals,2);
     for(int i=0;i<proto.u.dict->n;i++){
-        Dict *d=instance.u.dict;d->keys=xrealloc(d->keys,(size_t)(d->n+1)*sizeof(char*));d->vals=xrealloc(d->vals,(size_t)(d->n+1)*sizeof(Value));
+        Dict *d=instance.u.dict;dict_reserve(d,d->n+1);
         d->keys[d->n]=strdup(proto.u.dict->keys[i]);Value member=proto.u.dict->vals[i];
         if(member.k==V_FUNC){Env *receiver=env_new(member.u.fn.closure);env_define_local(receiver,"this",instance);member.u.fn.closure=receiver;}
         else member=clone_value(member);
-        d->vals[d->n]=member;d->n++;
+        d->vals[d->n]=member;d->n++;dict_reindex(d);
     }
     for(int i=0;i<instance.u.dict->n;i++)if(instance.u.dict->vals[i].k==V_FUNC&&strncmp(instance.u.dict->keys[i],"__",2)){
         size_t sn=strlen(instance.u.dict->keys[i])+9;char *superName=xmalloc(sn);snprintf(superName,sn,"__super_%s",instance.u.dict->keys[i]);
@@ -2973,7 +3035,7 @@ static Value runtime_construct(Env *e,const char *typeName,Value values){
         Value *argv=NULL;int argc=0;
         if(values.k==V_BLOCK){argc=values.u.block.b->n;argv=xmalloc((size_t)(argc?argc:1)*sizeof(Value));for(int i=0;i<argc;i++)argv[i]=*values.u.block.b->items[i];}
         (void)applyFunc(e,instance.u.dict->vals[init],argv,argc);free(argv);
-    }else if(values.k==V_BLOCK){int at=0;for(int i=0;i<instance.u.dict->n&&at<values.u.block.b->n;i++)if(strncmp(instance.u.dict->keys[i],"__",2)&&instance.u.dict->vals[i].k!=V_FUNC)instance.u.dict->vals[i]=*values.u.block.b->items[at++];
+    }else if(values.k==V_BLOCK){int at=0;for(int i=0;i<instance.u.dict->n&&at<values.u.block.b->n;i++)if(strncmp(instance.u.dict->keys[i],"__",2)&&instance.u.dict->vals[i].k!=V_FUNC)instance.u.dict->vals[i]=*values.u.block.b->items[at++];dict_invalidate_object(instance.u.dict);
     }
     return instance;
 }
@@ -3611,7 +3673,7 @@ static Value b_empty_value(Env*e,Value*a,int n){
     MutTarget t; Value v=mut_load(e,a[0],&t);
     if(v.k==V_STR){ Value r=v_str(""); mut_store(e,&t,r); return v_null(); }
     if(v.k==V_BLOCK){ v.u.block.b->n=0; return v_null(); }
-    if(v.k==V_DICT){ v.u.dict->n=0; return v_null(); }
+    if(v.k==V_DICT){ v.u.dict->n=0; dict_reindex(v.u.dict); return v_null(); }
     die("empty: unsupported value"); return v_null();
 }
 static void flatten_into(Block *src, Value ***out, int *n, int *cap, int once){
@@ -3658,7 +3720,7 @@ static Value b_prepend(Env*e,Value*a,int n){
 static Value b_remove(Env*e,Value*a,int n){
     MutTarget t; Value v=mut_load(e,a[0],&t);
     if(v.k==V_BLOCK){Block*b=v.u.block.b;int at=0,once=rt_has_attr("once"),removed=0;if(rt_has_attr("index")){long index=as_int(a[1]);for(int i=0;i<b->n;i++)if(i!=index)b->items[at++]=b->items[i];}else if(a[1].k==V_BLOCK&&!rt_has_attr("instance")){Block*needle=a[1].u.block.b;if(needle->n>0){for(int i=0;i<b->n;){int match=i+needle->n<=b->n;for(int j=0;match&&j<needle->n;j++)if(!value_eq(*b->items[i+j],*needle->items[j]))match=0;if(match&&(!once||!removed)){i+=needle->n;removed=1;}else b->items[at++]=b->items[i++];}}else for(int i=0;i<b->n;i++)b->items[at++]=b->items[i];}else for(int i=0;i<b->n;i++){int match=value_eq(*b->items[i],a[1]);if(match&&(!once||!removed))removed=1;else b->items[at++]=b->items[i];}b->n=at;return t.kind?v_null():v;}
-    if(v.k==V_DICT){int at=0,keyMode=rt_has_attr("key");for(int i=0;i<v.u.dict->n;i++){int match=keyMode?!strcmp(v.u.dict->keys[i],key_text(a[1])):value_eq(v.u.dict->vals[i],a[1]);if(!match){v.u.dict->keys[at]=v.u.dict->keys[i];v.u.dict->vals[at++]=v.u.dict->vals[i];}}v.u.dict->n=at;return t.kind?v_null():v;}
+    if(v.k==V_DICT){int at=0,keyMode=rt_has_attr("key");for(int i=0;i<v.u.dict->n;i++){int match=keyMode?!strcmp(v.u.dict->keys[i],key_text(a[1])):value_eq(v.u.dict->vals[i],a[1]);if(!match){v.u.dict->keys[at]=v.u.dict->keys[i];v.u.dict->vals[at++]=v.u.dict->vals[i];}}v.u.dict->n=at;dict_reindex(v.u.dict);return t.kind?v_null():v;}
     if(v.k==V_STR){ char*needle=(a[1].k==V_CHAR&&a[1].u.c[0]==39&&strchr(v.u.s,'+'))?strdup("+"):val_str(a[1]); size_t nl=strlen(needle); if(!nl){free(needle);return t.kind?v_null():v;} const char*p=v.u.s;size_t cap=strlen(p)+1,at=0;char*out=(char*)xmalloc(cap);int once=rt_has_attr("once"),prefix=rt_has_attr("prefix"),suffix=rt_has_attr("suffix"),removed=0;while(*p){size_t remaining=strlen(p);int match=!strncmp(p,needle,nl)&&(!prefix||p==v.u.s)&&(!suffix||remaining==nl);if(match&&(!once||!removed)){p+=nl;removed=1;}else out[at++]=*p++;}out[at]=0;Value r=v_str(out);free(out);free(needle);if(t.kind){mut_store(e,&t,r);return v_null();}return r; }
     die("remove: unsupported value"); return v_null();
 }
@@ -3679,10 +3741,78 @@ static Env *g_sort_env=NULL;static int g_sort_descending=0,g_sort_sensitive=0,g_
 static void collation_key(const char*source,char*out,size_t cap){size_t used=0;for(size_t i=0;source[i]&&used+1<cap;i++){unsigned char c=(unsigned char)source[i];if(c==0xc3&&source[i+1]){unsigned char next=(unsigned char)source[++i];if(next==0xa1||next==0x81)c='a';else if(next==0xa9||next==0x89)c='e';else if(next==0xad||next==0x8d)c='i';else if(next==0xb3||next==0x93)c='o';else if(next==0xba||next==0x9a)c='u';else c=next;}out[used++]=(char)tolower(c);}out[used]=0;}
 static int sort_order(Value left,Value right){if(IS_STRLIKE(left.k)&&IS_STRLIKE(right.k)){int result;if(g_sort_locale){char a[512],b[512];collation_key(left.u.s,a,sizeof a);collation_key(right.u.s,b,sizeof b);result=strcmp(a,b);}else if(!g_sort_sensitive)result=strcasecmp(left.u.s,right.u.s);else result=strcmp(left.u.s,right.u.s);return (result>0)-(result<0);}return order_values(left,right);}
 static int value_ptr_cmp(const void*pa,const void*pb){Value*a=*(Value*const*)pa,*b=*(Value*const*)pb;int result;if(g_sort_env&&object_member_index(*a,"compare")>=0){Value compared=object_magic(g_sort_env,*a,"compare",b,1);result=(as_int(compared)>0)-(as_int(compared)<0);}else result=sort_order(*a,*b);return g_sort_descending?-result:result;}
+/* Stable merge sort, replacing the insertion sorts these used to be — sorting
+ * a 100k-element block was quadratic. Merging takes from the left run whenever
+ * the left element does not compare greater, which is exactly the order the
+ * insertion sort produced.
+ *
+ * A block whose elements carry a user-defined `compare` method keeps the
+ * insertion sort: its comparator runs Arturo code, and merge sort would call
+ * it a different number of times in a different order. */
+static int sort_uses_object_compare(Block *b){
+    if(!g_sort_env)return 0;
+    for(int i=0;i<b->n;i++)if(object_member_index(*b->items[i],"compare")>=0)return 1;
+    return 0;
+}
+static void sort_block_items(Block *b){
+    int n=b->n;
+    if(n<2)return;
+    if(sort_uses_object_compare(b)){
+        for(int i=1;i<n;i++){
+            Value*item=b->items[i];int j=i-1;
+            while(j>=0&&value_ptr_cmp(&b->items[j],&item)>0){b->items[j+1]=b->items[j];j--;}
+            b->items[j+1]=item;
+        }
+        return;
+    }
+    Value **scratch=(Value**)xmalloc((size_t)n*sizeof(Value*));
+    Value **src=b->items,**dst=scratch;
+    for(int width=1;width<n;){
+        for(int lo=0;lo<n;lo+=2*width){
+            int mid=lo+width<n?lo+width:n,hi=lo+2*width<n?lo+2*width:n;
+            int i=lo,j=mid,at=lo;
+            while(i<mid&&j<hi)dst[at++]=value_ptr_cmp(&src[i],&src[j])>0?src[j++]:src[i++];
+            while(i<mid)dst[at++]=src[i++];
+            while(j<hi)dst[at++]=src[j++];
+        }
+        Value **swap=src;src=dst;dst=swap;
+        if(width>n/2)break;width*=2;
+    }
+    if(src!=b->items)memcpy(b->items,src,(size_t)n*sizeof(Value*));
+    free(scratch);
+}
+static void sort_dict_entries(Dict *d){
+    int n=d->n;
+    if(n<2)return;
+    char **ks=(char**)xmalloc((size_t)n*sizeof(char*));
+    Value *vs=(Value*)xmalloc((size_t)n*sizeof(Value));
+    char **ksrc=d->keys,**kdst=ks;
+    Value *vsrc=d->vals,*vdst=vs;
+    for(int width=1;width<n;){
+        for(int lo=0;lo<n;lo+=2*width){
+            int mid=lo+width<n?lo+width:n,hi=lo+2*width<n?lo+2*width:n;
+            int i=lo,j=mid,at=lo;
+            while(i<mid&&j<hi){
+                int comparison=strcasecmp(ksrc[i],ksrc[j]);
+                int takeRight=g_sort_descending?comparison<0:comparison>0;
+                if(takeRight){kdst[at]=ksrc[j];vdst[at++]=vsrc[j++];}
+                else {kdst[at]=ksrc[i];vdst[at++]=vsrc[i++];}
+            }
+            while(i<mid){kdst[at]=ksrc[i];vdst[at++]=vsrc[i++];}
+            while(j<hi){kdst[at]=ksrc[j];vdst[at++]=vsrc[j++];}
+        }
+        char **kswap=ksrc;ksrc=kdst;kdst=kswap;
+        Value *vswap=vsrc;vsrc=vdst;vdst=vswap;
+        if(width>n/2)break;width*=2;
+    }
+    if(ksrc!=d->keys){memcpy(d->keys,ksrc,(size_t)n*sizeof(char*));memcpy(d->vals,vsrc,(size_t)n*sizeof(Value));}
+    free(ks);free(vs);
+    dict_reindex(d);
+}
 static Value b_sort(Env*e,Value*a,int n){
     (void)n;MutTarget t;Value source=mut_load(e,a[0],&t);Env *previousEnv=g_sort_env;int previousDescending=g_sort_descending,previousSensitive=g_sort_sensitive,previousLocale=g_sort_locale;g_sort_env=e;g_sort_descending=rt_has_attr("descending");g_sort_sensitive=rt_has_attr("sensitive");g_sort_locale=rt_has_attr("as");Value out;
-    if(source.k==V_BLOCK){out=t.kind?source:clone_value(source);Block*b=out.u.block.b;for(int i=1;i<b->n;i++){Value*item=b->items[i];int j=i-1;while(j>=0&&(g_sort_descending?value_ptr_cmp(&b->items[j],&item)>0:value_ptr_cmp(&b->items[j],&item)>0)){b->items[j+1]=b->items[j];j--;}b->items[j+1]=item;}}
-    else if(source.k==V_DICT){out=t.kind?source:clone_value(source);Dict*d=out.u.dict;for(int i=1;i<d->n;i++){char*key=d->keys[i];Value value=d->vals[i];int j=i-1;int comparison;while(j>=0&&(comparison=strcasecmp(d->keys[j],key),g_sort_descending?comparison<0:comparison>0)){d->keys[j+1]=d->keys[j];d->vals[j+1]=d->vals[j];j--;}d->keys[j+1]=key;d->vals[j+1]=value;}}
+    if(source.k==V_BLOCK){out=t.kind?source:clone_value(source);sort_block_items(out.u.block.b);}
+    else if(source.k==V_DICT){out=t.kind?source:clone_value(source);sort_dict_entries(out.u.dict);}
     else die("sort: expected collection");g_sort_env=previousEnv;g_sort_descending=previousDescending;g_sort_sensitive=previousSensitive;g_sort_locale=previousLocale;if(t.kind){mut_store(e,&t,out);return v_null();}return out;
 }
 static Value b_squeeze(Env*e,Value*a,int n){
@@ -4632,11 +4762,10 @@ static void path_write(Env *e, Value p, Value val){
     const char *last = seg_key(e, p.u.path.segs[p.u.path.nsegs-1]);
     if (cur.k==V_DICT){
         Dict *dd=cur.u.dict; int i=dict_find(cur,last);
-        if (i>=0){ dd->vals[i]=val; return; }
-        dd->keys=(char**)xrealloc(dd->keys,(dd->n+1)*sizeof(char*));
-        dd->vals=(Value*)xrealloc(dd->vals,(dd->n+1)*sizeof(Value));
+        if (i>=0){ dd->vals[i]=val; dict_invalidate_object(dd); return; }
+        dict_reserve(dd,dd->n+1);
         dd->keys[dd->n]=(char*)xmalloc(strlen(last)+1); strcpy(dd->keys[dd->n],last);
-        dd->vals[dd->n]=val; dd->n++; return;
+        dd->vals[dd->n]=val; dd->n++; dict_invalidate_object(dd); dict_index_add(dd,dd->n-1); return;
     }
     if (cur.k==V_BLOCK){ long idx=atol(last); if(idx>=0&&idx<cur.u.block.b->n) *cur.u.block.b->items[idx]=val; }
 }

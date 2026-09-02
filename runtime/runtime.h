@@ -66,6 +66,16 @@ struct Dict {
     char **keys;
     Value *vals;
     int n;
+    int cap;
+    /* Lazily built open-addressed key index (runtime-private). Dictionaries
+     * are looked up by name on every field read, and a linear strcmp scan
+     * makes a large dictionary quadratic to fill. NULL means "not built";
+     * every structural mutation clears it. */
+    int *index;
+    int index_cap;
+    int index_n;
+    const char *object_name;
+    unsigned char object_checked;
 };
 
 /* value constructors */
