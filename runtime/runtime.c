@@ -858,9 +858,34 @@ Value v_bool(int b) { Value v;v.k=V_BOOL;v.u.b=b;return v; }
 Value v_char(char c){ Value v;v.k=V_CHAR;v.u.c[0]=c;v.u.c[1]=0;return v; }
 Value v_char_text(const char *s){ Value v;v.k=V_CHAR;size_t n=strlen(s);if(n>4)n=4;memcpy(v.u.c,s,n);v.u.c[n]=0;return v; }
 Value v_str(const char *s) {
-    Value v;v.k=V_STR;
-    v.u.s = (char*)xmalloc(strlen(s)+1); strcpy(v.u.s, s);
+    if(!s) s="";
+    size_t len=strlen(s);
+    /* Growable-string header: len/cap avoid O(n) strlen on append; owned/shared
+     * give alias-safe in-place growth for `s: s ++ x` loops. Data stays
+     * null-terminated so all existing strlen/strcmp users keep working. */
+    typedef struct { size_t len; size_t cap; int owned; int shared; } StrHead;
+    StrHead *h=(StrHead*)xmalloc(sizeof(StrHead)+len+1);
+    h->len=len; h->cap=len; h->owned=0; h->shared=0;
+    char *data=(char*)(h+1);
+    memcpy(data,s,len+1);
+    Value v;v.k=V_STR;v.u.s=data;
     return v;
+}
+/* header accessors without exposing the layout to every caller */
+static size_t str_len_of(const char *s){ typedef struct { size_t len; size_t cap; int owned; int shared; } StrHead; return ((StrHead*)s)[-1].len; }
+static size_t str_cap_of(const char *s){ typedef struct { size_t len; size_t cap; int owned; int shared; } StrHead; return ((StrHead*)s)[-1].cap; }
+static int str_shared_of(const char *s){ typedef struct { size_t len; size_t cap; int owned; int shared; } StrHead; return ((StrHead*)s)[-1].shared; }
+static void str_mark_literal(const char *s){ typedef struct { size_t len; size_t cap; int owned; int shared; } StrHead; if(s){((StrHead*)s)[-1].shared=1; ((StrHead*)s)[-1].owned=1;} }
+/* A heap slot (env/block/dict) now owns a reference. Sticky shared: once a
+ * growable buffer gains a second owner it stays copy-on-append forever. This
+ * over-approximates (safe) and needs no release tracking since we never free
+ * string buffers early; the arena still reclaims everything at exit. */
+static void str_heap_mark(Value v){
+    if(v.k!=V_STR||!v.u.s) return;
+    typedef struct { size_t len; size_t cap; int owned; int shared; } StrHead;
+    StrHead *h=&((StrHead*)v.u.s)[-1];
+    if(!h->owned) h->owned=1;
+    else h->shared=1;
 }
 static Value v_str_owned(char *s){Value v;v.k=V_STR;v.u.s=s;return v;}
 static Value v_error_kind(const char *message,const char *kind){Value v;v.k=V_ERROR;v.u.error.message=strdup(message?message:"");v.u.error.kind=strdup(kind?kind:"Runtime Error");return v;}
@@ -871,12 +896,14 @@ Value v_block(Value **items, int n) {
     Value v;v.k=V_BLOCK;
     Block *b=(Block*)xmalloc(sizeof *b);
     b->items=items; b->n=n; b->cap=n;   /* takes ownership of the caller's array */
+    for(int i=0;i<n;i++) if(items[i]) str_heap_mark(items[i][0]);
     v.u.block.b=b; return v;
 }
 Value v_dict(char **keys, Value *vals, int n) {
     Value v;v.k=V_DICT;
     Dict *d=(Dict*)xmalloc(sizeof *d);
     d->keys=keys; d->vals=vals; d->n=n; d->cap=n; d->index=NULL; d->index_cap=0; d->index_n=0; d->object_name=NULL; d->object_checked=0;
+    for(int i=0;i<n;i++) str_heap_mark(vals[i]);
     v.u.dict=d; return v;
 }
 Value v_func(IR *params, IR **body, int nbody, Env *closure) {
@@ -904,8 +931,9 @@ Value v_pathv(Value *segv, int n) {
     return v;
 }
 Value v_token(VKind k, const char *s) {
+    if(k==V_STR) return v_str(s?s:"");
     Value v;v.k=k;
-    v.u.s=(char*)xmalloc(strlen(s)+1); strcpy(v.u.s,s);
+    v.u.s=(char*)xmalloc(strlen(s?s:"")+1); strcpy(v.u.s,s?s:"");
     return v;
 }
 static Value clone_value(Value v){
@@ -1153,10 +1181,16 @@ void env_set(Env *e, const char *name, Value v) {
     const char *key=intern(name);
     for (Env *f=e; f; f=f->parent) {
         int i = env_find_interned(f,key);
-        if (i>=0) { f->vals[i]=v; return; }
+        if (i>=0) {
+            Value old=f->vals[i];
+            f->vals[i]=v;
+            if(!(old.k==V_STR&&v.k==V_STR&&old.u.s==v.u.s)) str_heap_mark(v);
+            return;
+        }
     }
     env_grow(e);e->names[e->n]=(char*)key;
     e->vals[e->n] = v; e->n++;
+    str_heap_mark(v);
 }
 
 /* `x: value` at FUNCTION scope and parameter binding — LOCAL only. The host
@@ -1167,9 +1201,15 @@ void env_set(Env *e, const char *name, Value v) {
  * `c` and the crash was `get <stack> "stack"`). */
 static void env_define_local(Env *e, const char *name, Value v) {
     const char *key=intern(name);int i=env_find_interned(e,key);
-    if (i>=0) { e->vals[i]=v; return; }
+    if (i>=0) {
+        Value old=e->vals[i];
+        e->vals[i]=v;
+        if(!(old.k==V_STR&&v.k==V_STR&&old.u.s==v.u.s)) str_heap_mark(v);
+        return;
+    }
     env_grow(e);e->names[e->n]=(char*)key;
     e->vals[e->n] = v; e->n++;
+    str_heap_mark(v);
 }
 
 /* A kernel-owned loop body uses action-block scope: parameters are local, but
@@ -1186,7 +1226,12 @@ static void env_let(Env *e, const char *name, Value v) {
     const char *key=intern(name);
     for (Env *f=e; f; f=f->parent) {
         int i=env_find_interned(f,key);
-        if(i>=0){ f->vals[i]=v; return; }
+        if(i>=0){
+            Value old=f->vals[i];
+            f->vals[i]=v;
+            if(!(old.k==V_STR&&v.k==V_STR&&old.u.s==v.u.s)) str_heap_mark(v);
+            return;
+        }
     }
     env_define_local(e,name,v);
 }
@@ -1219,7 +1264,7 @@ static const char **ir_copy_names(const char **names,int n){
     for(int i=0;i<n;i++)copy[i]=intern(names[i]);
     return copy;
 }
-IR *ir_const(Value v){ IR*n=ir_new("const"); n->v=v; return n; }
+IR *ir_const(Value v){ IR*n=ir_new("const"); n->v=v; if(v.k==V_STR&&v.u.s) str_mark_literal(v.u.s); return n; }
 IR *ir_load(const char *name){ IR*n=ir_new("load"); n->name=intern(name); n->literal=literal_code(name); return n; }
 IR *ir_intrinsic(const char *name){
     IR*n=ir_new("intrinsic"); n->name=intern(name);
@@ -1240,7 +1285,7 @@ IR *ir_let(const char *name, IR *expr){ IR*n=ir_new("let"); n->name=intern(name)
 IR *ir_call(IR *fn, IR **args, int n){ IR*x=ir_new("call"); x->fn=fn; x->args=ir_copy_nodes(args,n); x->nargs=n; return x; }
 IR *ir_call_attrs(IR *fn,IR **args,int n,const char **names,IR **values,int nattrs){IR*x=ir_call(fn,args,n);return ir_attrs(x,names,values,nattrs);}
 IR *ir_attrs(IR *node,const char **names,IR **values,int nattrs){node->attr_names=ir_copy_names(names,nattrs);node->attr_values=ir_copy_nodes(values,nattrs);node->nattrs=nattrs;return node;}
-IR *ir_passthrough(Value src){ IR*n=ir_new("passthrough"); n->v=src; return n; }
+IR *ir_passthrough(Value src){ IR*n=ir_new("passthrough"); n->v=src; if(src.k==V_STR&&src.u.s) str_mark_literal(src.u.s); return n; }
 IR *ir_block(IR **items, int n){ IR*x=ir_new("block"); x->args=ir_copy_nodes(items,n); x->nargs=n; return x; }
 IR *ir_fn(IR *params, IR **body, int n){ IR*x=ir_new("function"); x->args=(IR**)xmalloc((n+1)*sizeof(IR*)); x->args[0]=params; for(int i=0;i<n;i++)x->args[i+1]=body[i]; x->nargs=n+1; return x; }
 IR *ir_op(const char *op, IR **args, int n){ IR*x=ir_new(op); x->args=ir_copy_nodes(args,n); x->nargs=n; return x; }
@@ -2306,8 +2351,16 @@ static int path_target(Env *e, Value p, Value *cont, int *idx) {
 }
 /* write a mutated value back into the container a path_target resolved */
 static void path_store(Value cont, int idx, Value val){
-    if (cont.k==V_DICT){cont.u.dict->vals[idx]=val;dict_invalidate_object(cont.u.dict);}
-    else if (cont.k==V_BLOCK && idx>=0 && idx<cont.u.block.b->n) *cont.u.block.b->items[idx]=val;
+    if (cont.k==V_DICT){
+        Value old=cont.u.dict->vals[idx];
+        cont.u.dict->vals[idx]=val;dict_invalidate_object(cont.u.dict);
+        if(!(old.k==V_STR&&val.k==V_STR&&old.u.s==val.u.s)) str_heap_mark(val);
+    }
+    else if (cont.k==V_BLOCK && idx>=0 && idx<cont.u.block.b->n){
+        Value old=*cont.u.block.b->items[idx];
+        *cont.u.block.b->items[idx]=val;
+        if(!(old.k==V_STR&&val.k==V_STR&&old.u.s==val.u.s)) str_heap_mark(val);
+    }
 }
 static Value block_append(Value v, Value el){
     /* mutate the shared body in place so all copies see the append */
@@ -2315,6 +2368,7 @@ static Value block_append(Value v, Value el){
     block_grow(b, b->n+1);
     b->items[b->n]=(Value*)xmalloc(sizeof(Value)); b->items[b->n][0]=el;
     b->n++;
+    str_heap_mark(el);
     return v;
 }
 static Value b_append(Env*e,Value*a,int n){
@@ -2350,6 +2404,7 @@ static Value b_append(Env*e,Value*a,int n){
             block_grow(b, b->n+src->n);
             for (int i=0;i<src->n;i++){
                 b->items[b->n]=(Value*)xmalloc(sizeof(Value)); b->items[b->n][0]=*src->items[i];
+                str_heap_mark(*src->items[i]);
                 b->n++;
             }
             return v;
@@ -2357,20 +2412,57 @@ static Value b_append(Env*e,Value*a,int n){
         return block_append(v,a[1]);
     }
     if (v.k==V_STR){
-        /* string append: concatenate the second arg (as text) onto the string */
+        /* Value-path append always copies to preserve LHS value semantics
+         * (`a: b ++ c` must not mutate `b`). In-place growth happens only for
+         * unowned temporaries (owned==0, e.g. chained appends) or via the
+         * OP_DEFINE self-assign fast path (`s: s ++ x`). Stored lengths avoid
+         * O(n) strlen; new buffers carry geometric capacity. */
+        typedef struct { size_t len; size_t cap; int owned; int shared; } StrHead;
         const char *s = v.u.s;
+        StrHead *h=&((StrHead*)s)[-1];
         char buf[64];
         const char *app = NULL;
+        size_t right = 0;
         Value x = a[1];
-        if (x.k==V_STR) app=x.u.s;
-        else if (x.k==V_INT){ snprintf(buf,sizeof buf,"%ld",x.u.i); app=buf; }
-        else if (x.k==V_BOOL){ app=x.u.b?"true":"false"; }
-        else if (x.k==V_CHAR){ app=x.u.c; }
+        if (x.k==V_STR){ app=x.u.s; right=str_len_of(app); }
+        else if (x.k==V_INT){ snprintf(buf,sizeof buf,"%ld",x.u.i); app=buf; right=strlen(buf); }
+        else if (x.k==V_BOOL){ app=x.u.b?"true":"false"; right=app[0]=='t'?4:5; }
+        else if (x.k==V_CHAR){ app=x.u.c; right=strlen(app); }
         else die("append: unsupported");
-        size_t left=strlen(s),right=strlen(app);
-        char *out=(char*)xmalloc(checked_add_size(checked_add_size(left,right,"append: string too large"),1,"append: string too large"));
-        memcpy(out,s,left);memcpy(out+left,app,right+1);
-        return v_str_owned(out);
+        size_t left=h->len;
+        size_t need=checked_add_size(left,right,"append: string too large");
+        if(h->owned==0&&!h->shared){
+            if(h->cap>=need){
+                rune_cache_forget(s);
+                memmove((char*)s+left,app,right+1);
+                h->len=need;
+                return v;
+            }
+            size_t new_cap=h->cap?h->cap:16;
+            while(new_cap<need){
+                if(new_cap>SIZE_MAX/2){ new_cap=need; break; }
+                new_cap*=2;
+            }
+            checked_add_size(new_cap,1,"append: string too large");
+            StrHead *nh=(StrHead*)xmalloc(sizeof(StrHead)+new_cap+1);
+            nh->len=need; nh->cap=new_cap; nh->owned=0; nh->shared=0;
+            char *nd=(char*)(nh+1);
+            memcpy(nd,s,left);
+            memcpy(nd+left,app,right+1);
+            rune_cache_forget(s);
+            Value r; r.k=V_STR; r.u.s=nd;
+            return r;
+        }
+        size_t new_cap=need?need*2:16;
+        if(new_cap<need) new_cap=need;
+        checked_add_size(new_cap,1,"append: string too large");
+        StrHead *nh=(StrHead*)xmalloc(sizeof(StrHead)+new_cap+1);
+        nh->len=need; nh->cap=new_cap; nh->owned=0; nh->shared=0;
+        char *nd=(char*)(nh+1);
+        memcpy(nd,s,left);
+        memcpy(nd+left,app,right+1);
+        Value r; r.k=V_STR; r.u.s=nd;
+        return r;
     }
     {char msg[256];snprintf(msg,sizeof msg,"append: unsupported %s ++ %s '%s'",type_name(v),type_name(a[1]),a[1].k==V_STR?a[1].u.s:"");die(msg);} return v_null();
 }
@@ -2408,6 +2500,7 @@ static Value b_insert(Env*e,Value*a,int n){
     for(int i=b->n;i>at;i--) b->items[i]=b->items[i-1];
     b->items[at]=(Value*)xmalloc(sizeof(Value)); b->items[at][0]=a[2];
     b->n++;
+    str_heap_mark(a[2]);
     return v;
 }
 static Value b_pop(Env*e,Value*a,int n){
@@ -2816,15 +2909,24 @@ static Value b_set(Env*e,Value*a,int n){
     if(d.k==V_BINARY&&a[1].k==V_INT){long index=a[1].u.i;if(index<0||index>=(long)d.u.binary.len)die("set: binary index out of range");d.u.binary.data[index]=(unsigned char)as_int(val);return d;}
     if((d.k==V_BLOCK||d.k==V_INLINE)&&a[1].k==V_INT){
         long index=a[1].u.i;if(index<0||index>=d.u.block.b->n)die("set: block index out of range");
-        *d.u.block.b->items[index]=val;return d;
+        Value old=*d.u.block.b->items[index];
+        *d.u.block.b->items[index]=val;
+        if(!(old.k==V_STR&&val.k==V_STR&&old.u.s==val.u.s)) str_heap_mark(val);
+        return d;
     }
     if (d.k!=V_DICT) die("set: expected dict");
     Dict *dd=d.u.dict;
     int i=dict_find(d,k);
-    if (i>=0){ dd->vals[i]=val; dict_invalidate_object(dd); return d; }
+    if (i>=0){
+        Value old=dd->vals[i];
+        dd->vals[i]=val; dict_invalidate_object(dd);
+        if(!(old.k==V_STR&&val.k==V_STR&&old.u.s==val.u.s)) str_heap_mark(val);
+        return d;
+    }
     dict_reserve(dd,dd->n+1);
     dd->keys[dd->n]=(char*)xmalloc(strlen(k)+1); strcpy(dd->keys[dd->n],k);
     dd->vals[dd->n]=val; dd->n++;
+    str_heap_mark(val);
     dict_invalidate_object(dd);
     dict_index_add(dd,dd->n-1);
     return d;
@@ -5252,6 +5354,69 @@ static Value runDoSeq(Env *e, IR **seq, int n){
     return r;
 }
 
+/* Self-assign string append (`s: s ++ x`): grow `s` in place when it is an
+ * exclusive V_STR, giving amortized O(1) without ever mutating an alias.
+ * The value-path b_append always copies (it cannot know the destination), so
+ * `a: b ++ c` still preserves `b`. Returns 1 when handled (result in *out). */
+static int define_self_append(Env *e, const char *name, IR *rhs, int is_let, Value *out){
+    if(!rhs||!name||!out) return 0;
+    IR *call=NULL,*fn=NULL;
+    if(rhs->opcode==OP_CALL){ call=rhs; fn=rhs->fn; }
+    else if(rhs->opcode==OP_INTRINSIC){ call=rhs; fn=rhs; }
+    else return 0;
+    if(!call||!fn||call->nattrs!=0) return 0;
+    const char *fn_name=NULL;
+    if(fn->opcode==OP_INTRINSIC) fn_name=fn->name;
+    else return 0;
+    if(!fn_name||(strcmp(fn_name,"concat")&&strcmp(fn_name,"append"))) return 0;
+    if(call->nargs!=2||!call->args[0]||!call->args[1]) return 0;
+    IR *lhs=call->args[0];
+    if(lhs->opcode!=OP_LOAD&&lhs->opcode!=OP_WORD) return 0;
+    if(lhs->name!=name&&(!lhs->name||!name||strcmp(lhs->name,name))) return 0;
+    /* evaluate the appendage first (preserves side-effect order), then re-read
+     * dest in case evaluation reassigned it */
+    Value ap=runNode0(e,call->args[1]);
+    char buf[64];
+    const char *app=NULL;
+    size_t right=0;
+    if(ap.k==V_STR){ app=ap.u.s; right=str_len_of(app); }
+    else if(ap.k==V_INT){ snprintf(buf,sizeof buf,"%ld",ap.u.i); app=buf; right=strlen(buf); }
+    else if(ap.k==V_BOOL){ app=ap.u.b?"true":"false"; right=app[0]=='t'?4:5; }
+    else if(ap.k==V_CHAR){ app=ap.u.c; right=strlen(app); }
+    else return 0;
+    Value cur=env_get(e,name);
+    if(cur.k!=V_STR||!cur.u.s) return 0;
+    typedef struct { size_t len; size_t cap; int owned; int shared; } StrHead;
+    StrHead *h=&((StrHead*)cur.u.s)[-1];
+    if(h->shared) return 0;
+    size_t left=h->len;
+    size_t need=checked_add_size(left,right,"append: string too large");
+    if(h->cap>=need){
+        rune_cache_forget(cur.u.s);
+        memmove((char*)cur.u.s+left,app,right+1);
+        h->len=need;
+        *out=cur;
+        return 1;
+    }
+    size_t new_cap=h->cap?h->cap:16;
+    while(new_cap<need){
+        if(new_cap>SIZE_MAX/2){ new_cap=need; break; }
+        new_cap*=2;
+    }
+    checked_add_size(new_cap,1,"append: string too large");
+    StrHead *nh=(StrHead*)xmalloc(sizeof(StrHead)+new_cap+1);
+    nh->len=need; nh->cap=new_cap; nh->owned=0; nh->shared=0;
+    char *nd=(char*)(nh+1);
+    memcpy(nd,cur.u.s,left);
+    memcpy(nd+left,app,right+1);
+    rune_cache_forget(cur.u.s);
+    Value nv; nv.k=V_STR; nv.u.s=nd;
+    if(is_let) env_let(e,name,nv);
+    else env_define_body(e,name,nv);
+    *out=nv;
+    return 1;
+}
+
 static Value runNode0(Env *e, IR *node) {
     if (!node) return v_null();
     if (!node->op) return node->v;   /* a raw constant */
@@ -5291,12 +5456,16 @@ static Value runNode0(Env *e, IR *node) {
     case OP___SEQ: return runSeq(e, node->args, node->nargs);
 
     case OP_DEFINE: {
-        Value v = runNode0(e, node->args[0]);
+        Value v;
+        if(node->nargs>0&&define_self_append(e,node->name,node->args[0],0,&v)) return v;
+        v = runNode0(e, node->args[0]);
         env_define_body(e, node->name, v);
         return v;
     }
     case OP_LET: {
-        Value v = runNode0(e, node->args[0]);
+        Value v;
+        if(node->nargs>0&&define_self_append(e,node->name,node->args[0],1,&v)) return v;
+        v = runNode0(e, node->args[0]);
         env_let(e, node->name, v);
         return v;
     }

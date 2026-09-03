@@ -117,3 +117,25 @@ alias-safe in-place growth scheme requires ownership tracking.
     sort                   181        61   2.97x        26
     string_append           40        77   0.52x       465
     while_counter          406       158   2.57x         1
+
+## Phase 6: alias-safe string growth
+
+Strings carry a header (len/cap/owned/shared) so appends avoid `strlen` and new
+buffers carry geometric capacity. Heap stores (env/block/dict) mark a second
+owner as shared (sticky, no release tracking; the arena still reclaims at
+exit); IR literals start shared. The value-path append always copies to
+preserve `a: b ++ c`, while `OP_DEFINE`/`OP_LET` detect `s: s ++ x` and grow an
+exclusive `s` in place (amortized O(1)). Peak RSS on string_append falls from
+465 MB to ~4 MB; all ten benchmarks are now faster than the host.
+
+    program            host_ms native_ms   ratio native_MB
+    closures                87        47   1.85x        14
+    dict_insert             66        50   1.32x        16
+    dict_iter               86        48   1.79x        14
+    fib                    240        92   2.61x         1
+    loop_sum                97        54   1.80x         1
+    map_select             118        66   1.79x        44
+    nested_loops            90        27   3.33x         1
+    sort                   182        63   2.89x        27
+    string_append           42        39   1.08x         4
+    while_counter          414       173   2.39x         1
