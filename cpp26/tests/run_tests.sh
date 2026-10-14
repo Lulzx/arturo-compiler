@@ -1,0 +1,97 @@
+#!/bin/bash
+# Differential test suite for arturoc (C++26) against the pinned Arturo host
+# and, where available, the original self-hosting compiler's native output.
+#
+#   1. fast backend == host, byte for byte (owned corpus + owned upstream)
+#   2. optimizer equivalence: -O1 output == -O0 output (owned corpus)
+#   3. C and direct backends == host (representative subset)
+#   4. unsupported capabilities are rejected at compile time, no executable
+#   5. invalid programs fail nonzero in both engines
+#   6. AIR emission is deterministic
+set -u
+cd "$(dirname "$0")/.." || exit 1
+CPP=$PWD
+ROOT=$(cd .. && pwd)
+ARTURO=${ARTURO:-arturo}
+command -v "$ARTURO" >/dev/null 2>&1 || ARTURO="$ROOT/arturo-bin/arturo"
+if ! command -v "$ARTURO" >/dev/null 2>&1 && [ ! -x "$ARTURO" ]; then
+    echo "error: pinned arturo host not found (set ARTURO=...)" >&2
+    exit 1
+fi
+WORK=$(mktemp -d /tmp/arturoc-tests.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+pass=0; fail=0
+ok() { pass=$((pass+1)); }
+bad() { fail=$((fail+1)); echo "FAIL: $*"; }
+
+run3() { # run3 <file> <bin> : compare host vs bin on stdout/stderr/status
+    local src=$1 bin=$2
+    (cd "$WORK" && "$ARTURO" --no-color "$src" >host.out 2>host.err); local hs=$?
+    (cd "$WORK" && env ARTURO_NO_COLOR=1 "$bin" >new.out 2>new.err); local ns=$?
+    cmp -s "$WORK/host.out" "$WORK/new.out" && cmp -s "$WORK/host.err" "$WORK/new.err" && [ "$hs" = "$ns" ]
+}
+
+echo "== fast backend vs host: owned corpus =="
+while read -r name; do
+    [ -n "$name" ] || continue
+    src="$ROOT/corpus/$name.art"
+    if ! ./bin/arturoc "$src" "$WORK/p" >"$WORK/c.log" 2>&1; then bad "compile $name: $(cat "$WORK/c.log")"; continue; fi
+    if run3 "$src" "$WORK/p"; then ok; else bad "parity $name"; fi
+done < tests/owned-corpus.txt
+
+echo "== optimizer equivalence (-O0 vs -O1) =="
+while read -r name; do
+    [ -n "$name" ] || continue
+    src="$ROOT/corpus/$name.art"
+    ./bin/arturoc -O0 "$src" "$WORK/p0" >/dev/null 2>&1 || { bad "compile -O0 $name"; continue; }
+    ./bin/arturoc -O1 "$src" "$WORK/p1" >/dev/null 2>&1 || { bad "compile -O1 $name"; continue; }
+    (cd "$WORK" && ./p0 >o0.out 2>o0.err); s0=$?
+    (cd "$WORK" && ./p1 >o1.out 2>o1.err); s1=$?
+    if cmp -s "$WORK/o0.out" "$WORK/o1.out" && cmp -s "$WORK/o0.err" "$WORK/o1.err" && [ "$s0" = "$s1" ]; then ok; else bad "optimizer divergence $name"; fi
+done < tests/owned-corpus.txt
+
+echo "== fast backend vs host: owned upstream =="
+while read -r rel; do
+    [ -n "$rel" ] || continue
+    src="$ROOT/$rel"
+    if ! ./bin/arturoc "$src" "$WORK/p" >"$WORK/c.log" 2>&1; then bad "compile $rel: $(cat "$WORK/c.log")"; continue; fi
+    if run3 "$src" "$WORK/p"; then ok; else bad "upstream parity $rel"; fi
+done < tests/owned-upstream.txt
+
+echo "== C and direct backends vs host (subset) =="
+while read -r name; do
+    [ -n "$name" ] || continue
+    src="$ROOT/corpus/$name.art"
+    for backend in c direct; do
+        if ! ./bin/arturoc --backend=$backend "$src" "$WORK/p" >"$WORK/c.log" 2>&1; then
+            bad "compile ($backend) $name: $(cat "$WORK/c.log")"; continue
+        fi
+        if run3 "$src" "$WORK/p"; then ok; else bad "parity ($backend) $name"; fi
+    done
+done < tests/backend-subset.txt
+
+echo "== unsupported capabilities rejected at compile time =="
+printf 'print eval "1 + 2"\n' > "$WORK/unsupported.art"
+if ./bin/arturoc "$WORK/unsupported.art" "$WORK/should-not-exist" >"$WORK/c.log" 2>&1; then
+    bad "unsupported capability compiled successfully"
+elif [ -e "$WORK/should-not-exist" ]; then
+    bad "unsupported capability produced an executable"
+elif grep -q "unsupported standalone capability" "$WORK/c.log"; then ok
+else bad "unsupported capability gave an unclear diagnostic: $(cat "$WORK/c.log")"; fi
+
+echo "== invalid programs fail in both engines =="
+printf 'print definitelyUnboundName123\n' > "$WORK/invalid.art"
+"$ARTURO" --no-color "$WORK/invalid.art" >/dev/null 2>&1; hs=$?
+./bin/arturoc "$WORK/invalid.art" "$WORK/invalid-bin" >/dev/null 2>&1 || { bad "invalid program did not compile"; hs=0; }
+if [ "${hs:-0}" != "0" ]; then
+    (cd "$WORK" && ./invalid-bin >/dev/null 2>&1); ns=$?
+    if [ "$ns" != "0" ] && [ "$ns" -lt 128 ]; then ok; else bad "invalid program exit status $ns"; fi
+fi
+
+echo "== AIR determinism =="
+./bin/arturoc "$ROOT/corpus/05_functions.art" "$WORK/d0" --emit-ir "$WORK/d0.air" >/dev/null 2>&1
+./bin/arturoc "$ROOT/corpus/05_functions.art" "$WORK/d1" --emit-ir "$WORK/d1.air" >/dev/null 2>&1
+if cmp -s "$WORK/d0.air" "$WORK/d1.air"; then ok; else bad "AIR emission is not deterministic"; fi
+
+echo "== arturoc tests: pass=$pass fail=$fail =="
+[ "$fail" -eq 0 ]

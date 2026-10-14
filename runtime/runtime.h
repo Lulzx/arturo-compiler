@@ -194,6 +194,11 @@ Value runNode(Env *e, IR *node);
 int rt_builtin(const char *name, Env *e, Value *args, int n, Value *out);
 /* returns 1 if name names a builtin (without evaluating it) */
 int rt_builtin_known(const char *name);
+/* stable ABI for directly generated code: apply a function value, bind a
+ * name in the current frame only, or rebind the nearest existing binding */
+Value rt_apply(Env *e, Value fn, Value *args, int n);
+void rt_define_local(Env *e, const char *name, Value v);
+void rt_let(Env *e, const char *name, Value v);
 
 /* ---- errors / diagnostics ---------------------------------------------- */
 void rt_error(const char *msg);

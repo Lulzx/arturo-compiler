@@ -7,3 +7,5 @@ native_compiler
 demo/getbuiltins
 demo/getbuiltins.c
 demo/getbuiltins.o
+
+arturo-bin/

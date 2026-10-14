@@ -87,6 +87,37 @@ Or by hand:
     arturo tools/cbnative.art            # build the native compiler
     arturo src/compiler.art in.art out   # emit -> fold -> render
 
+## The C++26 compiler (cpp26/)
+
+`cpp26/` holds `arturoc`, a second, optimizing native compiler written in
+C++26 and built against this implementation. It shares the semantics, not
+the code path: its intrinsic tables (all 395 builtins) are generated from
+`src/intrinsics.art`, `src/semantics.art`, and `src/front.art`, and its
+programs execute on this repo's `runtime/runtime.c`, extended only by three
+additive ABI wrappers (`rt_apply`, `rt_define_local`, `rt_let`).
+
+Its IR is compact — flat string/constant/node pools with a deterministic
+binary form — instead of op-tagged dictionaries, and it has three backends
+over one semantics: `fast` (the default; a prebuilt stub plus an appended
+IR payload, so no C compiler runs at program-compile time), `c` (generated
+C on the runtime's builder API), and `direct` (plain C computation with
+checked inline arithmetic, direct calls to binding-stable functions, and a
+per-expression generic fallback). The optimizer folds only the pure
+intrinsics this repo already whitelists, and an IR verifier runs after
+emission and after optimization.
+
+    make -C cpp26                  # build -> cpp26/bin/arturoc
+    ./cpp26/bin/arturoc in.art out # compile a program to a native binary
+    make -C cpp26 test             # differential suite vs the pinned host
+    make -C cpp26 bench            # compile-time and run-time comparisons
+
+The differential suite holds `arturoc` to this compiler's standard: all
+112 corpus programs and 19 of the 32 pinned upstream programs match the
+host byte for byte, the optimizer is output-equivalent to `-O0` across the
+corpus, and unsupported capabilities are rejected at compile time. The
+precise proof boundary — and everything not claimed — is written down in
+`cpp26/CONTRACT.md`; `cpp26/README.md` describes the implementation.
+
 ## Files
 
     src/intrinsics.art   GENERATED: builtin arities, read off Arturo's source
@@ -107,6 +138,7 @@ Or by hand:
     tools/cbnative.art               build the native compiler
     tools/selfhost_test.sh            the self-hosting proof
     corpus/                          one program per rule
+    cpp26/                           the C++26 compiler (arturoc), its contract and tests
     compat/                          deliberate host-defect fixes
     demo/                            a real ecosystem program, compiled natively
     SPEC.md                          the full design

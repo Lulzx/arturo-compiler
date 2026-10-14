@@ -1411,6 +1411,15 @@ static Value applyFunc(Env *caller, Value fn, Value *argv, int n) {
     env_release(child);return result;
 }
 
+/* ---- public ABI for directly generated code (arturoc --backend=direct) ----
+ * These wrappers are the stable boundary between generated C and the
+ * runtime: generated code performs its own control flow and arithmetic, and
+ * crosses into the runtime only to apply a function value, bind a local, or
+ * rebind the nearest binding -- with exactly the semantics above. */
+Value rt_apply(Env *e, Value fn, Value *args, int n) { return applyFunc(e, fn, args, n); }
+void rt_define_local(Env *e, const char *name, Value v) { env_define_local(e, name, v); }
+void rt_let(Env *e, const char *name, Value v) { env_let(e, name, v); }
+
 /* ---- builtins ------------------------------------------------------------- */
 
 /* numeric/string/char coercion helpers */

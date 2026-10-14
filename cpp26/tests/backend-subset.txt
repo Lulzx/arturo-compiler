@@ -1,0 +1,14 @@
+01_literals
+03_arithmetic
+04_grouping
+05_functions
+06_if
+07_do
+09_application
+12_loops
+13_while
+16_closures
+18_strings
+19_return
+22_dicts
+28_loop
