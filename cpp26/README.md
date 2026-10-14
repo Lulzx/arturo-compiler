@@ -94,10 +94,12 @@ the other backends are held to it by the differential tests.
 
 ## Status
 
-112/112 local corpus programs and 19/32 pinned upstream programs match the
-pinned host byte for byte on the fast backend; the C and direct backends
-match on the tested subset; the optimizer is output-equivalent to `-O0`
-across the corpus. See CONTRACT.md §9 for the precise proof boundary.
+112/112 local corpus programs and 32/32 pinned upstream programs match
+the pinned host byte for byte on the fast backend, and all of the
+original's compat cases match their golden outputs; the C and direct
+backends match on the tested subset; the optimizer is output-equivalent
+to `-O0` across the corpus. See CONTRACT.md §9 for the precise proof
+boundary.
 
 Measured speed (`make bench`, medians on the development machine): the
 fast backend compiles in ~4–5 ms per program against 39–238 ms for the

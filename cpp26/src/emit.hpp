@@ -57,8 +57,19 @@ class Emitter {
                 auto sub = g_.parseSeq(g->token.kids);
                 return p_.make(air::Op::Do, {emitSeq(sub.roots)});
             }
-            case GNode::Kind::Body:
+            case GNode::Kind::Body: {
+                // in value position a `->` body is a raw block value (a
+                // thunk the receiver may run later, e.g. throws?); as a
+                // control-flow body it is lowered via bodyOf instead
+                if (!g->raw.empty()) {
+                    std::vector<std::uint32_t> kids;
+                    for (const auto& t : g->raw) kids.push_back(dataNode(t));
+                    auto id = p_.make(air::Op::Block, std::move(kids));
+                    p_.nodes[id].aux = 1;
+                    return id;
+                }
                 return p_.make(air::Op::Do, {emitSeq(g->args)});
+            }
             case GNode::Kind::DictLit: {
                 std::vector<std::uint32_t> kids;
                 kids.push_back(p_.makeNamed(air::Op::Load, "makeDict"));
@@ -110,6 +121,17 @@ class Emitter {
                 return c;
             case TK::Quantity: {
                 c.kind = air::CKind::Quantity; c.s = t.unit;
+                auto slash = t.text.find('/');
+                if (slash != std::string::npos) {  // rational amount
+                    try {
+                        double num = std::stod(t.text.substr(0, slash));
+                        double den = std::stod(t.text.substr(slash + 1));
+                        c.f = den == 0 ? 0 : num / den;
+                        c.i = static_cast<std::int64_t>(c.f);
+                        c.b = den == 1;
+                    } catch (...) { c.f = 0; }
+                    return c;
+                }
                 bool integral = t.text.find('.') == std::string::npos &&
                                 t.text.find('e') == std::string::npos && t.text.find('E') == std::string::npos;
                 c.b = integral;
@@ -121,6 +143,7 @@ class Emitter {
             case TK::VersionTok: c.kind = air::CKind::Version; c.s = t.text; return c;
             case TK::ColorTok: c.kind = air::CKind::Color; c.s = t.text; return c;
             case TK::RegexTok: c.kind = air::CKind::Regex; c.s = t.text; return c;
+            case TK::RationalTok: c.kind = air::CKind::Rational; c.s = t.text; return c;
             case TK::SymbolLit: c.kind = air::CKind::SymbolLiteral; c.s = t.text; return c;
             case TK::Symbol: c.kind = air::CKind::Symbol; c.s = t.text; return c;
             case TK::Attr: c.kind = air::CKind::Attribute; c.s = t.text; return c;
@@ -152,9 +175,9 @@ class Emitter {
         return c;
     }
     std::uint32_t dataNode(const Token& t) {
-        // a path inside block data stays an unresolved path-shaped block,
-        // matching the original's raw-items block representation closely
-        // enough for value positions; evaluated paths never reach here.
+        // a path inside block data is evaluated, as in the original's
+        // block-item emitter; every other token stays data
+        if (t.kind == TK::Path) return emit(g_.pathGetFor(t));
         return p_.makeConst(constOf(t));
     }
     std::uint32_t emitLeaf(const GPtr& g) {
@@ -187,8 +210,10 @@ class Emitter {
     std::uint32_t paramsOf(const GPtr& g) {
         air::Node n; n.op = air::Op::Params;
         if (g->kind == GNode::Kind::BlockRaw) {
-            for (const auto& t : g->token.kids)
+            for (const auto& t : g->token.kids) {
                 if (t.kind == TK::Word) n.names.push_back(p_.intern(t.text));
+                else if (t.kind == TK::Symbol && t.text == "_") n.names.push_back(p_.intern(t.text));
+            }
         } else if (g->kind == GNode::Kind::Leaf && !g->name.empty()) {
             n.names.push_back(p_.intern(g->name));
         } else if (g->kind == GNode::Kind::Leaf &&
@@ -285,13 +310,31 @@ class Emitter {
                                      a[2]->kind == GNode::Kind::Body;
                 bool literalParams = a[1]->kind == GNode::Kind::BlockRaw ||
                                      (a[1]->kind == GNode::Kind::Leaf && a[1]->token.kind == TK::Literal);
-                if (literalAction && literalParams) {
+                // a synthesized single [x1] parameter (from =>) is not a
+                // compiled action in the kernel either: it stays a generic
+                // call carrying block values, whose evaluator resolves
+                // dynamic names (e.g. dimension predicates) at run time
+                bool synthX1 = false;
+                if (a[1]->kind == GNode::Kind::BlockRaw) {
+                    int words = 0;
+                    std::string only;
+                    for (const auto& t : a[1]->token.kids)
+                        if (t.kind == TK::Word) { ++words; only = t.text; }
+                    synthX1 = words == 1 && only == "x1";
+                }
+                if (literalAction && literalParams && !synthX1) {
                     auto id = p_.makeNamed(air::Op::Higher, name, {emit(a[0]), paramsOf(a[1]), bodyOf(a[2])});
                     attachAttrs(id, g);
                     return id;
                 }
             }
             if (name == "dictionary") { need(1); return p_.make(air::Op::Dictionary, {bodyOf(a[0])}); }
+            if (name == "module") {
+                need(1);
+                if (a[0]->kind == GNode::Kind::BlockRaw && !a[0]->evaluated)
+                    return p_.make(air::Op::Dictionary, {bodyOf(a[0])});
+                return emit(a[0]);
+            }
             if (name == "is") {
                 need(2);
                 auto dict = p_.make(air::Op::Dictionary, {bodyOf(a[1])});

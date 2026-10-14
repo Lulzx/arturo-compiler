@@ -8,10 +8,9 @@
 ROOT    := $(abspath ..)
 CXX     ?= clang++
 CC      ?= cc
-STD     := -std=c++2c
-ifeq ($(shell uname -s),Darwin)
-STD     := -std=c++2c
-endif
+# C++26 where the compiler offers it (clang, GCC 14+), C++23 otherwise --
+# the sources use no C++26-only library facilities
+STD     := $(shell echo 'int main(){}' | $(CXX) -std=c++2c -x c++ -fsyntax-only - 2>/dev/null && echo -std=c++2c || echo -std=c++2b)
 CXXFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
 CFLAGS   ?= -O2 -fvisibility=hidden
 BIN      := bin

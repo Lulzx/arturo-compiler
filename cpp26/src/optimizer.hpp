@@ -89,8 +89,18 @@ class Optimizer {
         switch (a.kind) {
             case air::CKind::Null: return true;
             case air::CKind::Str: case air::CKind::Char: case air::CKind::Word:
-            case air::CKind::Literal: case air::CKind::Symbol: case air::CKind::Type:
+            case air::CKind::Literal: case air::CKind::Symbol: case air::CKind::SymbolLiteral:
+            case air::CKind::Type: case air::CKind::Label:
+            case air::CKind::Color: case air::CKind::Regex: case air::CKind::Unit:
+            case air::CKind::BigInt: case air::CKind::Attribute: case air::CKind::AttributeLabel:
                 return a.s == b.s;
+            case air::CKind::Version: {
+                // build metadata (+...) does not affect version equality
+                auto core = [](const std::string& s) { return s.substr(0, s.find('+')); };
+                return core(a.s) == core(b.s);
+            }
+            case air::CKind::Quantity:
+                return a.s == b.s && a.i == b.i && a.f == b.f;
             case air::CKind::Bool: return a.b == b.b;
             case air::CKind::Block: case air::CKind::Inline: case air::CKind::PathLiteral:
                 return a.items == b.items;
@@ -154,6 +164,14 @@ class Optimizer {
         if (name == "equal?" || name == "notEqual?" || name == "less?" || name == "greater?" ||
             name == "lessOrEqual?" || name == "greaterOrEqual?") {
             if (a.size() != 2) return std::nullopt;
+            // quantity, rational, unit, and color equality is
+            // conversion/canonicalization-based in the runtime (converted
+            // amounts, unit synonyms, color values): never fold it
+            if (a[0].kind == air::CKind::Quantity || a[1].kind == air::CKind::Quantity ||
+                a[0].kind == air::CKind::Rational || a[1].kind == air::CKind::Rational ||
+                a[0].kind == air::CKind::Unit || a[1].kind == air::CKind::Unit ||
+                a[0].kind == air::CKind::Color || a[1].kind == air::CKind::Color)
+                return std::nullopt;
             if (name == "equal?") return makeBool(equalConst(a[0], a[1]));
             if (name == "notEqual?") return makeBool(!equalConst(a[0], a[1]));
             auto c = cmpConst(a[0], a[1]);

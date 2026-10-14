@@ -86,7 +86,7 @@ class CEmitter {
             case K::Symbol: return "v_token(V_SYMBOL, " + quoteC(c.s) + ")";
             case K::SymbolLiteral: return "v_token(V_SYMBOLLITERAL, " + quoteC(c.s) + ")";
             case K::Type: return "v_token(V_TYPE, " + quoteC(":" + c.s) + ")";
-            case K::Label: return "v_str(" + quoteC(c.s) + ")";
+            case K::Label: return "v_str(" + quoteC("@LBL:" + c.s) + ")";
             case K::Quantity: {
                 char buf[64];
                 std::snprintf(buf, sizeof(buf), "%.17g", c.f);
@@ -96,6 +96,11 @@ class CEmitter {
             case K::Unit: return "v_unit(" + quoteC(c.s) + ")";
             case K::Version: return "v_version(" + quoteC(c.s) + ")";
             case K::Color: return "v_color_hex(" + quoteC(c.s) + ")";
+            case K::Rational: {
+                auto slash = c.s.find('/');
+                return "v_rational(" + c.s.substr(0, slash) + "LL, " +
+                       (slash == std::string::npos ? std::string("1") : c.s.substr(slash + 1)) + "LL)";
+            }
             case K::Regex: return "v_token(V_REGEX, " + quoteC(c.s) + ")";
             case K::Attribute: return "v_token(V_ATTRIBUTE, " + quoteC(c.s) + ")";
             case K::AttributeLabel: return "v_token(V_ATTRIBUTELABEL, " + quoteC(c.s) + ")";

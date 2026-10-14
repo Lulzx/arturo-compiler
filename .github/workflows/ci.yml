@@ -76,3 +76,22 @@ jobs:
         run: make ncomp
       - name: Address, undefined-behavior, and leak sanitizers
         run: make sanitize
+
+  # The C++26 compiler: build, then differential tests against the pinned
+  # host (corpus, upstream, compat, optimizer equivalence, three backends).
+  cpp26:
+    name: cpp26 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Arturo ${{ env.ARTURO_VERSION }}
+        run: bash tools/ci_install_arturo.sh
+      - name: Build arturoc
+        run: make -C cpp26 all
+      - name: Differential tests
+        run: make -C cpp26 test

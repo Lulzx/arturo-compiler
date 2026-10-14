@@ -28,6 +28,7 @@ struct GNode {
     bool evaluated = false;            // BlockRaw: @[...] (vs raw [...])
     std::string name;                  // Leaf / Define name
     std::shared_ptr<GNode> fn;         // Call callee
+    std::vector<Token> raw;            // Body: the raw tokens after `->`
     std::vector<std::shared_ptr<GNode>> args;
     std::vector<std::pair<std::string, std::shared_ptr<GNode>>> attrs;
     std::vector<std::pair<std::string, std::shared_ptr<GNode>>> pairs;  // DictLit
@@ -92,6 +93,8 @@ class Grouper {
     static std::string calleeName(const GPtr& fn) {
         return fn && fn->kind == GNode::Kind::Leaf ? fn->name : std::string();
     }
+    // a path token as an evaluated get chain (used for paths in data blocks)
+    GPtr pathGetFor(const Token& el) { return pathGet(el); }
 
     struct Result {
         std::vector<GPtr> roots;
@@ -230,17 +233,23 @@ class Grouper {
     std::unordered_map<std::string, int> arity_;
     std::unordered_map<std::string, std::string> infix_, prefix_;
     std::unordered_set<std::string> mutates_, pure_, unsupported_, shadowable_;
-    std::unordered_set<std::string> shadowed_, callableShadowed_;
+    std::unordered_set<std::string> shadowed_, callableShadowed_, definedNames_;
 
     int arityOf(const std::string& n) const {
         auto it = arity_.find(n);
-        return it == arity_.end() ? -1 : it->second;
+        if (it != arity_.end()) return it->second;
+        // the host generates a unary predicate for every type and quantity
+        // dimension (currency?, length?, ...): an unknown word ending in
+        // '?' that the program never defined is such a predicate
+        if (!definedNames_.count(n) && n.size() > 1 && n.back() == '?') return 1;
+        return -1;
     }
     GPtr aliasTarget(const std::string& name) {
         return builtins_.count(name) ? gName(name, true) : gName(name, false);
     }
     void onDefine(const GPtr& d) {
         const std::string name = d->name;
+        definedNames_.insert(name);
         bool callable = false;
         if (!d->args.empty() && d->args[0]->kind == GNode::Kind::Call) {
             std::string cn = calleeName(d->args[0]->fn);
@@ -428,6 +437,9 @@ class Grouper {
             auto sub = parseRange(toks, i + 1, true);
             auto body = std::make_shared<GNode>();
             body->kind = GNode::Kind::Body; body->args = sub.roots;
+            if (sub.next > i + 1)
+                body->raw.assign(toks.begin() + static_cast<long>(i + 1),
+                                 toks.begin() + static_cast<long>(sub.next));
             appendInfixAware(body, toks, i);
             if (sub.next > 0) i = sub.next - 1;
             return;

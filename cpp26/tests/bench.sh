@@ -26,7 +26,7 @@ PY
 
 echo "== compilation latency (median of 5) =="
 printf '%-28s %10s %10s %10s %10s\n' program fast_ms c_ms direct_ms ncomp_ms
-for src in "$ROOT/corpus/05_functions.art" "$ROOT/corpus/50_defined_types.art" "$ROOT/src/compiler.art"; do
+for src in "$ROOT/corpus/05_functions.art" "$ROOT/corpus/50_defined_types.art" "$ROOT/upstream/unittests/lib.collections.art"; do
     [ -f "$src" ] || continue
     name=$(basename "$src")
     f=$(median_ms 5 ./bin/arturoc "$src" "$WORK/out-fast")

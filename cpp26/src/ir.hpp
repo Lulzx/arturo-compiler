@@ -58,7 +58,7 @@ enum class CKind : std::uint8_t {
     Null, Int, BigInt, Float, Str, Char, Bool,
     Word, Literal, Symbol, SymbolLiteral, Type, Label,
     Attribute, AttributeLabel, PathLiteral, Block, Inline,
-    Quantity, Unit, Version, Color, Regex,
+    Quantity, Unit, Version, Color, Regex, Rational,
 };
 
 struct Const {

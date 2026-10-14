@@ -137,14 +137,18 @@ exactly (division by zero, overflow beyond `int64`, exotic kinds).
   stack frames) is a tooling surface the original also lists as partial;
   it is not part of this contract.
 
-## 8. Documented host-defect exception
+## 8. Documented host-defect exception (tested, not excluded)
 
 Arturo 0.10.0 mishandles string append with an integer right operand
 (`print "n=" ++ 13` raises a misleading arity error; the assignment form
 may silently print nothing). Like the original native runtime, arturoc
 uses the useful semantics (`n=13`) for integer, logical, and character
-operands. This case is intentionally excluded from the byte-identical
-claim and from the parity corpus.
+operands. This is a divergence from the *host interpreter* only: it is
+byte-identical to the original native compiler, and it is verified by the
+original's own golden outputs in `../compat/` (all compat cases, including
+`01_string_integer_append`, run in `tests/run_tests.sh`). The residual
+boundary is exactly the original's: the native compilers and the host
+disagree here, on purpose.
 
 ## 9. Proof boundary (what is verified, and how)
 
@@ -153,19 +157,22 @@ exit status byte for byte):
 
 - all **112** local corpus programs (`tests/owned-corpus.txt`) on the fast
   backend, and with `-O0` vs `-O1` optimizer equivalence on the same set;
-- **19** of the 32 pinned upstream programs (`tests/owned-upstream.txt`)
-  on the fast backend. The remaining 13 (the large `lib.*` test-framework
-  suites, `customtypes`, `parser`, `strings`, `values.version`,
-  `quantities`) exercise surface beyond this compiler's current lexer/
-  grouping coverage and are outside the claim until they pass;
+- all **32** pinned upstream programs (`tests/owned-upstream.txt`) on the
+  fast backend;
+- all of the original's `../compat/` cases against their golden outputs
+  (the tested host-defect exceptions of §8);
 - the C and direct backends on a representative subset
   (`tests/backend-subset.txt`);
 - compile-time rejection of unsupported capabilities, nonzero failure of
   invalid programs, and AIR determinism.
 
+The suite runs in CI (the `cpp26` job in `../.github/workflows/ci.yml`,
+alongside the original's parity and sanitize jobs).
+
 Not claimed: the original's self-hosting proof (arturoc is written in
-C++26 and does not compile itself), the whole Arturo language, sanitizer
-gates for the new C++ code, and bit-identical behavior outside the owned
-lists. Constructs outside the owned subset either compile and pass, or
-fail with a compile-time diagnostic; they must never silently produce a
-wrong-result executable — any such case found is a contract bug.
+C++26 and does not compile itself), and bit-identical behavior for
+programs outside the owned lists (for example file-system, network, and
+process behavior beyond the corpus fixtures). Constructs outside the
+owned subset either compile and pass, or fail with a compile-time
+diagnostic; they must never silently produce a wrong-result executable —
+any such case found is a contract bug.

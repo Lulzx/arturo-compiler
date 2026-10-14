@@ -112,8 +112,9 @@ emission and after optimization.
     make -C cpp26 bench            # compile-time and run-time comparisons
 
 The differential suite holds `arturoc` to this compiler's standard: all
-112 corpus programs and 19 of the 32 pinned upstream programs match the
-host byte for byte, the optimizer is output-equivalent to `-O0` across the
+112 corpus programs and all 32 pinned upstream programs match the
+host byte for byte, all compat cases match the original's golden outputs,
+the optimizer is output-equivalent to `-O0` across the
 corpus, and unsupported capabilities are rejected at compile time. The
 precise proof boundary — and everything not claimed — is written down in
 `cpp26/CONTRACT.md`; `cpp26/README.md` describes the implementation.

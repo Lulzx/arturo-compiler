@@ -43,13 +43,19 @@ Value constValue(const air::Const& c) {
         case air::CKind::Symbol: return v_token(V_SYMBOL, c.s.c_str());
         case air::CKind::SymbolLiteral: return v_token(V_SYMBOLLITERAL, c.s.c_str());
         case air::CKind::Type: return v_token(V_TYPE, (":" + c.s).c_str());
-        case air::CKind::Label: return v_str(c.s.c_str());
+        case air::CKind::Label: return v_str(("@LBL:" + c.s).c_str());
         case air::CKind::Quantity:
             return c.b ? v_quantity_int(static_cast<long>(c.i), c.s.c_str())
                        : v_quantity(c.f, c.s.c_str());
         case air::CKind::Unit: return v_unit(c.s.c_str());
         case air::CKind::Version: return v_version(c.s.c_str());
         case air::CKind::Color: return v_color_hex(c.s.c_str());
+        case air::CKind::Rational: {
+            auto slash = c.s.find('/');
+            long num = std::stol(c.s.substr(0, slash));
+            long den = slash == std::string::npos ? 1 : std::stol(c.s.substr(slash + 1));
+            return v_rational(num, den);
+        }
         case air::CKind::Regex: return v_token(V_REGEX, c.s.c_str());
         case air::CKind::Attribute: return v_token(V_ATTRIBUTE, c.s.c_str());
         case air::CKind::AttributeLabel: return v_token(V_ATTRIBUTELABEL, c.s.c_str());

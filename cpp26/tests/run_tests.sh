@@ -70,6 +70,18 @@ while read -r name; do
     done
 done < tests/backend-subset.txt
 
+echo "== compat exceptions match the original native compiler =="
+# The documented host defects (compat/ in the parent repo) keep the
+# original native semantics here too -- most visibly string ++ integer,
+# which the host rejects but both native compilers stringify. Golden
+# outputs are the original's own compat/*.out files.
+for src in "$ROOT"/compat/*.art; do
+    name=$(basename "$src" .art)
+    if ! ./bin/arturoc "$src" "$WORK/p" >"$WORK/c.log" 2>&1; then bad "compile compat $name: $(cat "$WORK/c.log")"; continue; fi
+    (cd "$WORK" && ./p > compat.out 2>compat.err)
+    if cmp -s "$WORK/compat.out" "$ROOT/compat/$name.out"; then ok; else bad "compat $name"; fi
+done
+
 echo "== unsupported capabilities rejected at compile time =="
 printf 'print eval "1 + 2"\n' > "$WORK/unsupported.art"
 if ./bin/arturoc "$WORK/unsupported.art" "$WORK/should-not-exist" >"$WORK/c.log" 2>&1; then

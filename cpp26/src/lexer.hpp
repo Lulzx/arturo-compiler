@@ -22,7 +22,7 @@ struct CompileError : std::runtime_error {
 enum class TK {
     End, Int, Float, Str, CharTok, Word, Label, LabelStr, Literal, TypeTok,
     Symbol, Attr, AttrLabel, Path, PathLabel, Block, Inline,
-    Quantity, UnitTok, VersionTok, ColorTok, RegexTok, SymbolLit,
+    Quantity, UnitTok, VersionTok, ColorTok, RegexTok, SymbolLit, RationalTok,
 };
 
 struct Seg {
@@ -123,9 +123,34 @@ class Lexer {
     Token lexString() {
         Token t; t.kind = TK::Str; t.line = line_;
         take();  // opening "
+        // the host lexer toggles a code mode at each '|': inside template
+        // segments, backslash escapes are NOT decoded (so |this\name| keeps
+        // its path separator for render); outside, they are
+        bool inCode = false;
         while (pos_ < s_.size() && peek() != '"') {
-            if (peek() == '\\') { take(); t.text += decodeEscape(); }
-            else t.text += static_cast<char>(take());
+            unsigned char c = peek();
+            if (c == '|') { inCode = !inCode; t.text += static_cast<char>(take()); continue; }
+            if (c == '\\' && !inCode) {
+                take();
+                char e = static_cast<char>(peek());
+                switch (e) {
+                    case '\\': case '"': case '\'': case '/': t.text += decodeEscape(); break;
+                    case 'a': take(); t.text += '\a'; break;
+                    case 'b': take(); t.text += '\b'; break;
+                    case 'e': take(); t.text += '\x1b'; break;
+                    case 'f': take(); t.text += '\f'; break;
+                    case 'n': case 'l': take(); t.text += '\n'; break;
+                    case 'r': case 'c': take(); t.text += '\r'; break;
+                    case 't': take(); t.text += '\t'; break;
+                    case 'v': take(); t.text += '\v'; break;
+                    default:  // unknown escape: the backslash survives (host rule)
+                        t.text += '\\';
+                        t.text += static_cast<char>(take());
+                        break;
+                }
+                continue;
+            }
+            t.text += static_cast<char>(take());
         }
         if (pos_ >= s_.size()) fail("unterminated string");
         take();  // closing "
@@ -292,6 +317,44 @@ class Lexer {
         Token t; t.line = line_;
         std::string n;
         while (isDigit(peek()) || peek() == '_') n += static_cast<char>(take());
+        // hexadecimal / binary integers: 0xE8, 0b101
+        if (n == "0" && (peek() == 'x' || peek() == 'X' || peek() == 'b' || peek() == 'B')) {
+            bool hex = peek() == 'x' || peek() == 'X';
+            take();
+            std::string digits;
+            while (isDigit(peek()) || (hex && ((peek() >= 'a' && peek() <= 'f') || (peek() >= 'A' && peek() <= 'F'))))
+                digits += static_cast<char>(take());
+            unsigned __int128 v = 0;
+            for (char d : digits) {
+                int val = d >= '0' && d <= '9' ? d - '0' : d >= 'a' && d <= 'f' ? d - 'a' + 10 : d - 'A' + 10;
+                v = v * (hex ? 16 : 2) + static_cast<unsigned>(val);
+            }
+            std::string dec;
+            if (v == 0) dec = "0";
+            while (v > 0) { dec = static_cast<char>('0' + v % 10) + dec; v /= 10; }
+            t.kind = TK::Int;
+            t.text = dec;
+            return t;
+        }
+        // a rational literal: 1:2 (also a quantity amount: 127:5000`meters)
+        if (peek() == ':' && isDigit(peek(1))) {
+            take();
+            std::string den;
+            while (isDigit(peek())) den += static_cast<char>(take());
+            if (peek() == '`') {
+                take();
+                std::string unit;
+                while (isWordChar(peek()) || peek() == '/' || peek() == '*' || peek() == '.')
+                    unit += static_cast<char>(take());
+                t.kind = TK::Quantity;
+                t.text = n + "/" + den;
+                t.unit = unit;
+                return t;
+            }
+            t.kind = TK::RationalTok;
+            t.text = n + "/" + den;
+            return t;
+        }
         bool isFloat = false;
         if (peek() == '.' && isDigit(peek(1))) {
             isFloat = true;
@@ -350,7 +413,26 @@ class Lexer {
     Token lexOne() {
         unsigned char c = peek();
         int ln = line_;
-        if (c == 0xC2 && peek(1) == 0xAB && peek(2) == 0xC2 && peek(3) == 0xAB) return lexSafeString();
+        if (c == 0xC3 && peek(1) == 0xB8) {  // ø is the null literal
+            pos_ += 2;
+            Token t; t.kind = TK::Word; t.text = "null"; t.line = ln;
+            return t;
+        }
+        if (c == 0xE2 && peek(1) == 0x88 && peek(2) == 0x9E) {  // ∞ is infinity
+            pos_ += 3;
+            Token t; t.kind = TK::Float; t.text = "inf"; t.line = ln;
+            return t;
+        }
+        if (c == 0xC2 && peek(1) == 0xAB) return lexSafeString();  // « or ««
+        if (c == '-' && peek(1) == '-' && peek(2) == '-') {
+            // `---` dash string: everything to EOF, dedented (host rule)
+            Token t; t.kind = TK::Str; t.line = ln;
+            while (peek() == '-') take();
+            std::string raw;
+            while (pos_ < s_.size()) raw += static_cast<char>(take());
+            t.text = dedent(raw);
+            return t;
+        }
         if (c == '"') return lexString();
         if (c == '{') return lexBraceString();
         if (c == '`') {  // bare unit literal: `m
@@ -410,6 +492,10 @@ class Lexer {
         if (isWordStart(c) && !isSymbolChar(c)) {
             Token t; t.line = ln;
             std::string w = readWord();
+            if (w == "_") {  // a lone underscore is a symbol on the host
+                t.kind = TK::Symbol; t.text = "_";
+                return t;
+            }
             if (peek() == '\\') {
                 Seg base; base.name = w;
                 t.segs.push_back(base);
