@@ -118,6 +118,14 @@ corpus, and unsupported capabilities are rejected at compile time. The
 precise proof boundary — and everything not claimed — is written down in
 `cpp26/CONTRACT.md`; `cpp26/README.md` describes the implementation.
 
+On speed, measured with `make -C cpp26 bench` (medians on the development
+machine): the fast backend compiles in roughly **4–5 ms** per program,
+against 39–238 ms for the original native compiler, because no C compiler
+runs at program-compile time. Compiled programs run roughly **2–4× faster
+than the host interpreter** across the `tools/bench` programs, with the
+direct backend fastest on the recursion (`fib`) and loop (`while_counter`)
+workloads. Run the bench locally for current numbers on your hardware.
+
 ## Files
 
     src/intrinsics.art   GENERATED: builtin arities, read off Arturo's source

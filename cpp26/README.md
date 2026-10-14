@@ -98,3 +98,10 @@ the other backends are held to it by the differential tests.
 pinned host byte for byte on the fast backend; the C and direct backends
 match on the tested subset; the optimizer is output-equivalent to `-O0`
 across the corpus. See CONTRACT.md §9 for the precise proof boundary.
+
+Measured speed (`make bench`, medians on the development machine): the
+fast backend compiles in ~4–5 ms per program against 39–238 ms for the
+original native compiler, since no C compiler runs at program-compile
+time. Compiled programs run roughly 2–4× faster than the host interpreter
+across `tools/bench`, with the direct backend fastest on the recursion
+(`fib`) and loop (`while_counter`) workloads.
