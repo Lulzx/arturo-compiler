@@ -13,6 +13,11 @@ CC      ?= cc
 STD     := $(shell echo 'int main(){}' | $(CXX) -std=c++2c -x c++ -fsyntax-only - 2>/dev/null && echo -std=c++2c || echo -std=c++2b)
 CXXFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
 CFLAGS   ?= -O2 -fvisibility=hidden
+# the runtime uses OpenSSL on Linux (CommonCrypto is implicit on macOS)
+LDLIBS   := -lm
+ifeq ($(shell uname -s),Linux)
+LDLIBS   += -lcrypto
+endif
 BIN      := bin
 SRC      := src
 
@@ -35,7 +40,7 @@ $(BIN)/arturoc: $(SRC)/main.cpp $(SRC)/ir.hpp $(SRC)/lexer.hpp $(SRC)/parser.hpp
 	$(CXX) $(STD) $(CXXFLAGS) -Isrc $(SRC)/main.cpp $(BIN)/ir.o -o $@
 
 $(BIN)/arturo-stub: $(SRC)/stub.cpp $(SRC)/ir.hpp $(BIN)/ir.o $(BIN)/runtime.o
-	$(CXX) $(STD) $(CXXFLAGS) -Isrc -I$(ROOT)/runtime $(SRC)/stub.cpp $(BIN)/ir.o $(BIN)/runtime.o -lm -o $@
+	$(CXX) $(STD) $(CXXFLAGS) -Isrc -I$(ROOT)/runtime $(SRC)/stub.cpp $(BIN)/ir.o $(BIN)/runtime.o $(LDLIBS) -o $@
 
 src/tables.inc: tools/gen_tables.py $(ROOT)/src/intrinsics.art $(ROOT)/src/semantics.art $(ROOT)/src/front.art
 	python3 tools/gen_tables.py
