@@ -125,8 +125,8 @@ int main(int argc, char** argv) {
             else if (a == "--timing") timing = true;
             else if (a == "--dump-ir") emitIr = "-";
             else if (a == "--help" || a == "-h") {
-                std::cout << "usage: arturoc [-O0|-O1] [--backend=fast|c] [--emit-ir f] "
-                             "[--emit-c f] [--stats] [--timing] <in.art> <out>\n";
+                std::cout << "usage: arturoc [-O0|-O1|-O2] [--backend=fast|c|direct] [--emit-ir f] "
+                             "[--emit-c f] [--dump-ir] [--stats] [--timing] <in.art> <out>\n";
                 return 0;
             } else if (!a.empty() && a[0] == '-') throw artc::CompileError("unknown option: " + a);
             else if (inPath.empty()) inPath = a;
@@ -138,7 +138,8 @@ int main(int argc, char** argv) {
         }
     }
     if (inPath.empty() || outPath.empty()) {
-        std::cerr << "usage: arturoc [-O0|-O1] [--backend=fast|c] <in.art> <out>\n";
+        std::cerr << "usage: arturoc [-O0|-O1|-O2] [--backend=fast|c|direct] [--emit-ir f] "
+                     "[--emit-c f] [--dump-ir] [--stats] [--timing] <in.art> <out>\n";
         return 1;
     }
     try {
@@ -231,19 +232,35 @@ int main(int argc, char** argv) {
             const char* extra = "-lcrypto";
 #endif
             std::string cc = std::getenv("CC") ? std::getenv("CC") : "cc";
-            auto sh = [](const fs::path& p) { return "'" + p.string() + "'"; };
+            // Single-quote for the shell, escaping embedded single quotes:
+            // output paths are user input and must never become shell syntax.
+            auto sh = [](const fs::path& p) {
+                std::string s = "'";
+                for (char c : p.string()) s += c == '\'' ? "'\\''" : std::string(1, c);
+                return s + "'";
+            };
+            // The generated C and objects are intermediates (the C text is
+            // available via --emit-c); remove them on success and failure.
+            bool builtRuntime = false;
+            auto cleanup = [&]() {
+                std::error_code ec;
+                fs::remove(cpath, ec);
+                fs::remove(opath, ec);
+                if (builtRuntime) fs::remove(fs::path(outPath + ".runtime.o"), ec);
+            };
             int rc = runCmd(cc + " -O2 -I" + sh(rt) + " -c " + sh(cpath) + " -o " + sh(opath));
-            if (rc != 0) throw artc::CompileError("C compilation failed for " + outPath);
+            if (rc != 0) { cleanup(); throw artc::CompileError("C compilation failed for " + outPath); }
             fs::path rto = exeDir() / "runtime.o";  // built by cpp26/Makefile from the current runtime.c
             if (!fs::exists(rto)) rto = rt / "runtime.o";
             if (!fs::exists(rto)) {
                 rto = fs::path(outPath + ".runtime.o");
+                builtRuntime = true;
                 rc = runCmd(cc + " -O2 -I" + sh(rt) + " -c " + sh(rt / "runtime.c") + " -o " + sh(rto));
-                if (rc != 0) throw artc::CompileError("runtime compilation failed");
+                if (rc != 0) { cleanup(); throw artc::CompileError("runtime compilation failed"); }
             }
             rc = runCmd(cc + " -O2 " + sh(opath) + " " + sh(rto) + " -lm " + extra + " -o " + sh(fs::path(outPath)));
-            if (rc != 0) throw artc::CompileError("link failed for " + outPath);
-            fs::remove(opath);
+            if (rc != 0) { cleanup(); throw artc::CompileError("link failed for " + outPath); }
+            cleanup();
             ::chmod(outPath.c_str(), 0755);
         } else {
             throw artc::CompileError("unknown backend: " + backend + " (expected fast, c, or direct)");

@@ -164,7 +164,16 @@ exit status byte for byte):
 - the C and direct backends on a representative subset
   (`tests/backend-subset.txt`);
 - compile-time rejection of unsupported capabilities, nonzero failure of
-  invalid programs, and AIR determinism.
+  invalid programs, and AIR determinism;
+- regression programs pinning past optimizer and constant-pool bugs
+  (float constants closer than 1e-6, integer comparisons above 2^53,
+  constant propagation across rebinding `if`/`try`/`do` bodies) against
+  the host and across `-O0`/`-O1` and the C/direct backends;
+- rejection of malformed AIR payloads by the stub (unknown opcode,
+  out-of-range pool indices, misshapen nodes) with a diagnostic and no
+  signal, plus the CLI contract, C-backend shell quoting and intermediate
+  cleanup, and nesting-depth limits (pathological nesting is a compile
+  error, not a crash).
 
 The suite runs in CI (the `cpp26` job in `../.github/workflows/ci.yml`,
 alongside the original's parity and sanitize jobs).

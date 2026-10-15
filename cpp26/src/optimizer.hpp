@@ -74,6 +74,10 @@ class Optimizer {
         return n;
     }
     static std::optional<int> cmpConst(const air::Const& a, const air::Const& b) {
+        // Two integers compare exactly: going through double would equate
+        // distinct int64 values above 2^53 (9007199254740993 vs ...992).
+        if (a.kind == air::CKind::Int && b.kind == air::CKind::Int)
+            return a.i < b.i ? -1 : a.i > b.i ? 1 : 0;
         double da, db;
         if (numeric(a, da) && numeric(b, db)) return da < db ? -1 : da > db ? 1 : 0;
         if (a.kind == air::CKind::Str && b.kind == air::CKind::Str)
@@ -83,6 +87,7 @@ class Optimizer {
         return std::nullopt;
     }
     static bool equalConst(const air::Const& a, const air::Const& b) {
+        if (a.kind == air::CKind::Int && b.kind == air::CKind::Int) return a.i == b.i;
         double da, db;
         if (numeric(a, da) && numeric(b, db)) return da == db;
         if (a.kind != b.kind) return a.kind == air::CKind::Null && b.kind == air::CKind::Null;
@@ -130,7 +135,13 @@ class Optimizer {
                 else if (name == "mod") { if (y == 0) return std::nullopt; r = x % y; }
                 else if (name == "pow") {
                     if (y < 0 || y > 62) return std::nullopt;
-                    r = 1; for (std::int64_t i = 0; i < y; ++i) r *= x;
+                    // Bail as soon as the result leaves int64: continuing
+                    // would overflow the __int128 accumulator itself.
+                    r = 1;
+                    for (std::int64_t i = 0; i < y; ++i) {
+                        r *= x;
+                        if (r > INT64_MAX || r < INT64_MIN) return std::nullopt;
+                    }
                 } else if (name == "fdiv") {
                     if (y == 0) return std::nullopt;
                     return makeFloat(static_cast<double>(x) / static_cast<double>(y));
@@ -230,7 +241,13 @@ class Optimizer {
             if (t == "integer" && a[1].kind == air::CKind::Str) {
                 try { return makeInt(std::stoll(a[1].s)); } catch (...) { return std::nullopt; }
             }
-            if (t == "integer" && a[1].kind == air::CKind::Float) return makeInt(static_cast<std::int64_t>(a[1].f));
+            if (t == "integer" && a[1].kind == air::CKind::Float) {
+                // Casting an out-of-range or NaN double to int64 is undefined
+                // in C++; leave those to the runtime instead of folding.
+                if (!(a[1].f >= -9223372036854775808.0 && a[1].f < 9223372036854775808.0))
+                    return std::nullopt;
+                return makeInt(static_cast<std::int64_t>(a[1].f));
+            }
             if (t == "floating" && a[1].kind == air::CKind::Int) return makeFloat(static_cast<double>(a[1].i));
             return std::nullopt;
         }
@@ -270,6 +287,12 @@ class Optimizer {
                                           : (node.kids.size() > 2 ? node.kids[2] : air::kNone);
             if (branch != air::kNone) {
                 p.nodes[id] = p.nodes[branch];
+                ++st.branchesFolded;
+            } else {
+                // `if false [...]` with no else evaluates to null.
+                air::Const nc; nc.kind = air::CKind::Null;
+                auto cid = p.addConst(nc);
+                p.nodes[id] = air::Node{}; p.nodes[id].op = air::Op::Const; p.nodes[id].con = cid;
                 ++st.branchesFolded;
             }
         }
@@ -337,6 +360,29 @@ class Optimizer {
         std::vector<std::uint32_t> kids = n.kids;
         for (auto k : kids) substitute(p, k, env);
     }
+    // Whether executing this subtree can rebind a name or cause any other
+    // effect that invalidates a propagated constant. Function/method values
+    // only create a closure (their bodies run later, elsewhere), so they do
+    // not count; everything that can run user or runtime code does.
+    bool subtreeExecutes(air::Program& p, std::uint32_t id, int depth) {
+        if (depth > 32) return true;
+        const auto& n = p.nodes[id];
+        switch (n.op) {
+            case air::Op::Function: case air::Op::Method:
+                for (auto& a : n.attrs) if (subtreeExecutes(p, a.second, depth + 1)) return true;
+                return false;
+            case air::Op::Call: case air::Op::If: case air::Op::Unless: case air::Op::Switch:
+            case air::Op::When: case air::Op::Try: case air::Op::ThrowsQ: case air::Op::Ensure:
+            case air::Op::Using: case air::Op::While: case air::Op::Until: case air::Op::Loop:
+            case air::Op::Higher: case air::Op::Define: case air::Op::Let: case air::Op::Return:
+            case air::Op::Break: case air::Op::Continue:
+                return true;
+            default: break;
+        }
+        for (auto k : n.kids) if (subtreeExecutes(p, k, depth + 1)) return true;
+        for (auto& a : n.attrs) if (subtreeExecutes(p, a.second, depth + 1)) return true;
+        return false;
+    }
     void propagateSeq(air::Program& p, std::uint32_t id, OptStats& st) {
         (void)st;
         auto& node = p.nodes[id];
@@ -348,13 +394,21 @@ class Optimizer {
             if (!env.empty() && !subtreeHasCallOrControl(p, k, 0)) substitute(p, k, env);
             const auto& n = p.nodes[k];
             if ((n.op == air::Op::Define || n.op == air::Op::Let) && n.name != air::kNone &&
-                !n.kids.empty() && isConst(p, n.kids[0])) {
-                env[p.str(n.name)] = p.nodes[n.kids[0]].con;
-            } else if (n.op == air::Op::Call || n.op == air::Op::Loop || n.op == air::Op::While ||
-                       n.op == air::Op::Function || n.op == air::Op::Method) {
+                !n.kids.empty()) {
+                if (isConst(p, n.kids[0])) {
+                    env[p.str(n.name)] = p.nodes[n.kids[0]].con;
+                } else if (subtreeExecutes(p, n.kids[0], 0)) {
+                    // The right-hand side may have rebound anything before
+                    // this binding landed; nothing propagated survives it.
+                    env.clear();
+                } else {
+                    env.erase(p.str(n.name));
+                }
+            } else if (subtreeExecutes(p, k, 0)) {
+                // Any statement that can execute a nested body (if/try/do/
+                // loops/calls, including ones whose bodies were folded into
+                // a nested sequence) may rebind a propagated name.
                 env.clear();
-            } else if ((n.op == air::Op::Define || n.op == air::Op::Let) && n.name != air::kNone) {
-                env.erase(p.str(n.name));
             }
         }
     }

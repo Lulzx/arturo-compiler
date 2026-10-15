@@ -33,6 +33,11 @@ class Emitter {
     }
 
     std::uint32_t emit(const GPtr& g) {
+        // The call tree is walked recursively (as are the optimizer and the
+        // stub's IR builder downstream); reject pathological nesting with a
+        // diagnostic instead of overflowing the stack.
+        if (++depth_ > 8192) throw CompileError("expression nested too deeply (limit 8192)");
+        struct DepthGuard { int& d; ~DepthGuard() { --d; } } guard{depth_};
         switch (g->kind) {
             case GNode::Kind::Define: {
                 std::uint32_t expr = g->args.empty() ? constNull() : emit(g->args[0]);
@@ -89,12 +94,15 @@ class Emitter {
   private:
     Grouper& g_;
     air::Program& p_;
+    int depth_ = 0;
 
     std::uint32_t constNull() {
         air::Const c; c.kind = air::CKind::Null;
         return p_.makeConst(c);
     }
     air::Const constOf(const Token& t) {
+        if (++depth_ > 8192) throw CompileError("expression nested too deeply (limit 8192)");
+        struct DepthGuard { int& d; ~DepthGuard() { --d; } } guard{depth_};
         air::Const c;
         switch (t.kind) {
             case TK::Int: {

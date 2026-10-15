@@ -62,6 +62,10 @@ inline bool verifyProgram(const air::Program& p, std::string& err) {
                 if (n.kids.size() != 3 || p.nodes[n.kids[1]].op != O::Params)
                     return bad("needs collection, parameters, and body");
                 break;
+            case O::Constructor:
+                if (n.kids.size() != 1 || p.nodes[n.kids[0]].op != O::Params)
+                    return bad("constructor needs a parameter list");
+                break;
             case O::Range: case O::Is:
                 if (n.kids.size() != 2) return bad("needs two children");
                 break;

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "ir.hpp"
+#include "verify.hpp"
 
 extern "C" {
 #include "runtime.h"
@@ -281,6 +282,12 @@ int main(int argc, char** argv) {
     std::string err;
     if (!air::readProgram(payload.data(), payload.size(), g_prog, err)) {
         std::fprintf(stderr, "arturo-stub: %s\n", err.c_str());
+        return 1;
+    }
+    // The payload may be hand-crafted rather than compiler-produced: check
+    // the per-op shapes the builder below relies on before dereferencing.
+    if (!artc::verifyProgram(g_prog, err)) {
+        std::fprintf(stderr, "arturo-stub: invalid AIR payload: %s\n", err.c_str());
         return 1;
     }
     runtime_set_args(argc - argShift, argv + argShift);

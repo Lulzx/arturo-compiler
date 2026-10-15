@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -107,7 +108,12 @@ struct Program {
     static std::string constKey(const Const& c) {
         std::string k;
         k += static_cast<char>('a' + static_cast<int>(c.kind));
-        k += '|' + std::to_string(c.i) + '|' + std::to_string(c.f) + '|' + (c.b ? "1" : "0");
+        // The float must key on its exact bit pattern: std::to_string(double)
+        // prints only six decimal digits, which merged distinct constants
+        // such as 1.0000001 and 1.0000002 into one pool entry.
+        std::uint64_t fbits = 0;
+        std::memcpy(&fbits, &c.f, sizeof(fbits));
+        k += '|' + std::to_string(c.i) + '|' + std::to_string(fbits) + '|' + (c.b ? "1" : "0");
         k += '|' + std::to_string(c.s.size()) + ':' + c.s;
         for (const auto& it : c.items) k += '{' + constKey(it) + '}';
         return k;

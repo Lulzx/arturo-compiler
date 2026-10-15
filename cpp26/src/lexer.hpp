@@ -72,6 +72,7 @@ class Lexer {
     std::string s_;
     std::size_t pos_ = 0;
     int line_ = 1;
+    int depth_ = 0;
 
     [[noreturn]] void fail(const std::string& msg) const {
         throw CompileError("lexer: " + msg + " (line " + std::to_string(line_) + ")");
@@ -396,6 +397,9 @@ class Lexer {
         return t;
     }
     std::vector<Token> lexSeq(bool nested, char close) {
+        // Recursive descent on [...] / (...) nesting: reject pathological
+        // depth with a diagnostic instead of overflowing the stack.
+        if (++depth_ > 8192) fail("blocks nested too deeply (limit 8192)");
         std::vector<Token> out;
         for (;;) {
             skipSpaceAndComments();
@@ -408,6 +412,7 @@ class Lexer {
             if (c == ']' || c == ')') fail(std::string("unbalanced ") + static_cast<char>(c));
             out.push_back(lexOne());
         }
+        --depth_;
         return out;
     }
     Token lexOne() {

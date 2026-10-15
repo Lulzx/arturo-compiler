@@ -88,6 +88,7 @@ bool getConst(Reader& r, Const& c, int depth) {
     if (depth > 64) return false;
     std::uint8_t kind;
     if (!r.byte(kind)) return false;
+    if (kind > static_cast<std::uint8_t>(CKind::Rational)) return false;
     c.kind = static_cast<CKind>(kind);
     switch (c.kind) {
         case CKind::Int: {
@@ -193,6 +194,7 @@ bool readProgram(const std::uint8_t* data, std::size_t size, Program& p, std::st
     for (auto& nd : p.nodes) {
         std::uint8_t opb; std::uint64_t x;
         if (!r.byte(opb)) { err = "truncated node"; return false; }
+        if (opb > static_cast<std::uint8_t>(Op::Is)) { err = "unknown opcode"; return false; }
         nd.op = static_cast<Op>(opb);
         if (!r.var(x)) return false; nd.name = x == 0 ? kNone : static_cast<std::uint32_t>(x - 1);
         if (!r.var(x)) return false; nd.con = x == 0 ? kNone : static_cast<std::uint32_t>(x - 1);
@@ -213,6 +215,24 @@ bool readProgram(const std::uint8_t* data, std::size_t size, Program& p, std::st
     if (!r.var(v)) { err = "missing root"; return false; }
     p.root = v == 0 ? kNone : static_cast<std::uint32_t>(v - 1);
     if (p.root != kNone && p.root >= p.nodes.size()) { err = "root out of range"; return false; }
+    // Pool indices are dereferenced without further checks by the stub's IR
+    // builder, so validate every reference here, at decode time: a corrupt
+    // or hand-crafted payload must fail with an error, never a crash.
+    for (std::size_t i = 0; i < p.nodes.size(); ++i) {
+        const auto& nd = p.nodes[i];
+        auto oob = [&](const char* what) {
+            err = "node " + std::to_string(i) + ": " + what + " out of range";
+            return false;
+        };
+        if (nd.name != kNone && nd.name >= p.strings.size()) return oob("name index");
+        if (nd.con != kNone && nd.con >= p.consts.size()) return oob("constant index");
+        for (auto k : nd.kids) if (k >= p.nodes.size()) return oob("child index");
+        for (auto& a : nd.attrs) {
+            if (a.first >= p.strings.size()) return oob("attribute name");
+            if (a.second >= p.nodes.size()) return oob("attribute value");
+        }
+        for (auto nm : nd.names) if (nm >= p.strings.size()) return oob("parameter name");
+    }
     return true;
 }
 
