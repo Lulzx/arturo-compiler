@@ -1,12 +1,26 @@
 # arturo-compiler
 
-A compiler for Arturo, written in Arturo, that compiles itself to a native
-binary. On the owned, corpus-pinned subset it reproduces the interpreter's
-output byte for byte, except for explicitly documented host defects.
+A self-hosting compiler for [Arturo](https://arturo-lang.io/) — written in Arturo, compiling itself to a native binary. On the subset it owns, compiled output matches the host interpreter byte for byte.
 
-## One table
+Requires Arturo `0.10.0` on `PATH` (pinned revision in `corpus/m1/RESULTS.md`; CI fetches the official `v0.10.0` binary).
 
-One row per construct, three columns.
+## Quick start
+
+```sh
+make ncomp               # build the native compiler -> tmp/ncomp
+./tmp/ncomp in.art out   # compile a program
+./out                    # run it — no VM needed
+```
+
+Or without the native build:
+
+```sh
+arturo src/compiler.art in.art out
+```
+
+## How it works
+
+Everything is **one table, one row per construct**:
 
 ```arturo
 defRule "while" #[
@@ -16,147 +30,66 @@ defRule "while" #[
 ]
 ```
 
-`eval` is what the construct means interpreted from source, `emit` is the IR
-it produces, `run` is what that IR does when executed. The dispatchers know
-no construct by name; they look up the row and pick a column. Adding a
-language feature is adding a row.
+`eval` is the meaning, `emit` is the IR it produces, `run` is what the IR does. Dispatchers look up the row — they know no construct by name, so adding a feature means adding a row (see `CONTRIBUTING.md`). Even `call` is a row: the kernel applies closures itself rather than exposing their internals to the host.
 
-Arity is not in the row. It is generated into `INTRINSICS` from Arturo's own
-source, one copy, nothing to drift.
-
-`call` is a row too. A kernel closure will not hand its internals to the
-host, so the kernel applies it itself, which is how the table is executed.
-
-## The invariant
+The invariant every row must satisfy, checked across four engines (host, kernel, compiled, in-kernel IR):
 
 ```
 eval(env, emit(n)) == eval(env, n)      ; for every node n
 ```
 
-Every construct is held to it across four engines: host, kernel, compiled,
-and in-kernel IR. `corpus/` is one program per rule, and each runs through
-all four and must agree.
+Builtin arities aren't hand-maintained — they're generated into `INTRINSICS` from Arturo's own source (`tools/extract_intrinsics.art`), so there's one copy and nothing to drift.
 
-## Self-hosting
+## Proof and scope
 
-The compiler emits itself to C, links it, and the result, `tmp/ncomp`, is a
-standalone native CLI. It compiles corpus programs to native binaries whose
-output is byte-identical to the host interpreter. `make verify` proves it
-every time it runs.
+`make verify` is the self-hosting proof: the compiler emits itself to C, links `tmp/ncomp`, and that binary compiles every corpus program to output identical to the host — stdout, stderr, exit status, and filesystem effects, each in an isolated directory.
 
-The native parity harness compares stdout, stderr, process exit status, and
-filesystem effects in isolated working directories. It is proven on 111 local
-cases, thirty-two unmodified pinned-upstream programs, and the compiler's own
-source—not on the whole language; constructs the compiler does not yet own (see
-the backlog in `SPEC.md`) are outside the proof until a corpus program pins
-them. Finally, documented host defects may be corrected rather than reproduced;
-those cases are compatibility exceptions and are not part of the byte-identical
-claim. Beyond the harness, the compiler also builds a real pinned ecosystem
-program end to end: `demo/getbuiltins.art` compiles natively and runs without
-the VM (see `demo/README.md`).
+Current coverage: **112 corpus programs** (one per rule, all four engines must agree), **32 unmodified pinned-upstream programs**, randomized differential tests, and the compiler's own source. `demo/getbuiltins.art` shows a real ecosystem program built end to end (`demo/README.md`).
 
-### Known host compatibility exception
+This is not yet the whole language. Unowned constructs (backlog in `SPEC.md`, readiness gate in `LANGUAGE_SUPPORT.md`) are outside the claim until a corpus program pins them.
 
-Arturo 0.10.0 mishandles string append when the right operand is an integer:
-`print "n=" ++ 13` raises a misleading `print` arity error, while assigning
-the same append before printing may silently produce no output. The native C
-runtime deliberately uses the useful semantics and prints `n=13`, consistent
-with its existing string conversion for integer, logical, and character
-operands. String-to-string append remains byte-identical. This exception was
-found by randomized differential testing and is intentionally not added to
-the parity corpus, because its expected result differs from the pinned host.
+**One deliberate exception:** Arturo 0.10.0 mishandles `"n=" ++ 13` (a misleading `print` arity error, or silent empty output). The native runtime uses the useful semantics and prints `n=13`; string-to-string append stays byte-identical. These fixed cases live in `compat/` with their own golden outputs, outside the parity corpus.
 
-## Build, run, test
+## Tests
 
-    make ncomp              # build the native compiler -> tmp/ncomp
-    ./tmp/ncomp in.art out  # compile a program to a native binary
-    ./out                   # run it
-    make test               # 4-way differential, every corpus program
-    make verify             # native == host, byte for byte
-    make upstream           # vendored upstream stdout/stderr/status/effect parity
-    make diagnostics        # stable stderr and nonzero-exit failure contract
-    make compat             # expected output for documented host fixes
-    make unsupported        # reject intentionally unavailable capabilities
-    make coverage           # declared vs implemented native intrinsics
-    make random             # seeded generated four-engine/native parity
-    make negative           # host/native invalid-program failure parity
-    make sanitize           # ASan + UBSan; Linux LSan over every native case
+```sh
+make test         # 4-way differential over the corpus
+make verify       # native == host, byte for byte (self-hosting)
+make check        # coverage + test + verify + upstream + compat +
+                  # diagnostics + unsupported + random + negative
+```
 
-Or by hand:
+Individual gates: `make upstream|compat|diagnostics|unsupported|coverage|random|negative|sanitize|bench`. Sanitizers run ASan + UBSan (plus LSan on Linux; unavailable in Apple Clang).
 
-    arturo tools/cbnative.art            # build the native compiler
-    arturo src/compiler.art in.art out   # emit -> fold -> render
+## The C++26 compiler (`cpp26/`)
 
-## The C++26 compiler (cpp26/)
+`arturoc` is a second, optimizing native compiler in C++26. It shares this repo's semantics and `runtime/runtime.c` (plus three additive ABI wrappers), but generates its intrinsic tables (all 395 builtins) from `src/` and uses a compact pooled IR with three backends: `fast` (default — prebuilt stub + IR payload, no C compiler at compile time), `c`, and `direct`.
 
-`cpp26/` holds `arturoc`, a second, optimizing native compiler written in
-C++26 and built against this implementation. It shares the semantics, not
-the code path: its intrinsic tables (all 395 builtins) are generated from
-`src/intrinsics.art`, `src/semantics.art`, and `src/front.art`, and its
-programs execute on this repo's `runtime/runtime.c`, extended only by three
-additive ABI wrappers (`rt_apply`, `rt_define_local`, `rt_let`).
+```sh
+make -C cpp26                  # -> cpp26/bin/arturoc
+./cpp26/bin/arturoc in.art out
+make -C cpp26 test bench
+```
 
-Its IR is compact — flat string/constant/node pools with a deterministic
-binary form — instead of op-tagged dictionaries, and it has three backends
-over one semantics: `fast` (the default; a prebuilt stub plus an appended
-IR payload, so no C compiler runs at program-compile time), `c` (generated
-C on the runtime's builder API), and `direct` (plain C computation with
-checked inline arithmetic, direct calls to binding-stable functions, and a
-per-expression generic fallback). The optimizer folds only the pure
-intrinsics this repo already whitelists, and an IR verifier runs after
-emission and after optimization.
+It meets the same bar — all 112 corpus and 32 upstream programs byte-identical, optimizer output-equivalent to `-O0` — and compiles in ~4–5 ms per program (vs. 39–238 ms for the compiler above), with compiled programs running ~2–4× faster than the host. Exact claim boundary: `cpp26/CONTRACT.md`; implementation: `cpp26/README.md`.
 
-    make -C cpp26                  # build -> cpp26/bin/arturoc
-    ./cpp26/bin/arturoc in.art out # compile a program to a native binary
-    make -C cpp26 test             # differential suite vs the pinned host
-    make -C cpp26 bench            # compile-time and run-time comparisons
+## Layout
 
-The differential suite holds `arturoc` to this compiler's standard: all
-112 corpus programs and all 32 pinned upstream programs match the
-host byte for byte, all compat cases match the original's golden outputs,
-the optimizer is output-equivalent to `-O0` across the
-corpus, and unsupported capabilities are rejected at compile time. The
-precise proof boundary — and everything not claimed — is written down in
-`cpp26/CONTRACT.md`; `cpp26/README.md` describes the implementation.
+```
+src/kernel.art      the rule table, dispatchers, runIR
+src/front.art       lex + lower          src/ir.art        IR + constant folding
+src/intrinsics.art  GENERATED arities    src/semantics.art non-generated judgements
+src/modules.art     import resolution    src/cbackend.art  C emitter
+src/compiler.art    entry point          src/backend.art   shells out to -c / -x
+runtime/runtime.c   native runtime linked into every binary (+ runtime.h)
+config/             per-intrinsic compatibility policy
+corpus/  compat/  fixtures/  upstream/   test programs and goldens
+tools/              generators, build, and test harnesses
+cpp26/  demo/       the C++26 compiler; a real program compiled natively
+```
 
-On speed, measured with `make -C cpp26 bench` (medians on the development
-machine): the fast backend compiles in roughly **4–5 ms** per program,
-against 39–238 ms for the original native compiler, because no C compiler
-runs at program-compile time. Compiled programs run roughly **2–4× faster
-than the host interpreter** across the `tools/bench` programs, with the
-direct backend fastest on the recursion (`fib`) and loop (`while_counter`)
-workloads. Run the bench locally for current numbers on your hardware.
+## Docs
 
-## Files
-
-    src/intrinsics.art   GENERATED: builtin arities, read off Arturo's source
-    src/modules.art      compile-time import resolution
-    src/semantics.art    non-generated judgements the compiler must make
-    src/front.art        lex + lower
-    src/kernel.art       the rule table, its dispatchers, runIR
-    src/ir.art           IR + constant folding
-    src/backend.art      runIR; shells out to -c / -x
-    src/cbackend.art     C emitter
-    src/compiler.art     entry point
-    runtime/runtime.c    the native runtime linked into every compiled binary
-    runtime/runtime.h    its value model and IR-builder API
-    config/intrinsic-policy.tsv  per-intrinsic compatibility dispositions
-    fixtures/            modules/package/unsupported fixtures for the tests
-    tools/extract_intrinsics.art      the generator
-    tools/gen_intrinsic_arity.sh      emit the C runtime arity table
-    tools/cbnative.art               build the native compiler
-    tools/selfhost_test.sh            the self-hosting proof
-    corpus/                          one program per rule
-    cpp26/                           the C++26 compiler (arturoc), its contract and tests
-    compat/                          deliberate host-defect fixes
-    demo/                            a real ecosystem program, compiled natively
-    SPEC.md                          the full design
-    CONTRIBUTING.md                  how to add a construct
-
-Built against Arturo 0.10.0, pinned to the revision in `corpus/m1/RESULTS.md`.
-CI downloads the prebuilt `v0.10.0` release binary on Linux and macOS before
-running parity, compatibility, ASan, and UBSan checks. Linux also runs the
-LeakSanitizer gate; Apple Clang does not provide LeakSanitizer on macOS.
-Read `SPEC.md` for the precise proof boundary and design, and
-`LANGUAGE_SUPPORT.md` for the production-readiness gate and the route to full
-language coverage.
+- `SPEC.md` — full design and precise proof boundary
+- `CONTRIBUTING.md` — how to add a construct
+- `LANGUAGE_SUPPORT.md` — production-readiness gate and path to full coverage
