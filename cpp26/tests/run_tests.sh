@@ -27,10 +27,13 @@ pass=0; fail=0
 ok() { pass=$((pass+1)); }
 bad() { fail=$((fail+1)); echo "FAIL: $*"; }
 
+TMO=()
+if command -v timeout >/dev/null 2>&1; then TMO=(timeout 60); fi
 run3() { # run3 <file> <bin> : compare host vs bin on stdout/stderr/status
     local src=$1 bin=$2
-    (cd "$WORK" && "$ARTURO" --no-color "$src" >host.out 2>host.err); local hs=$?
-    (cd "$WORK" && env ARTURO_NO_COLOR=1 "$bin" >new.out 2>new.err); local ns=$?
+    echo "TEST run3 $src"
+    (cd "$WORK" && "${TMO[@]}" "$ARTURO" --no-color "$src" >host.out 2>host.err); local hs=$?
+    (cd "$WORK" && env ARTURO_NO_COLOR=1 "${TMO[@]}" "$bin" >new.out 2>new.err); local ns=$?
     cmp -s "$WORK/host.out" "$WORK/new.out" && cmp -s "$WORK/host.err" "$WORK/new.err" && [ "$hs" = "$ns" ]
 }
 
@@ -201,6 +204,7 @@ print 0 ^ 99999
 print (neg 1) ^ 999999999
 EOF
 for reg in reg_floats reg_propagate reg_branch reg_slice reg_predicates reg_pow; do
+    echo "TEST reg $reg"
     src="$WORK/$reg.art"
     if ! ./bin/arturoc "$src" "$WORK/p" >"$WORK/c.log" 2>&1; then bad "compile $reg: $(cat "$WORK/c.log")"; continue; fi
     if run3 "$src" "$WORK/p"; then ok; else bad "parity $reg"; fi
@@ -224,11 +228,13 @@ EOF
 # backend's preamble too, and an attributed (.export) function must not be
 # lowered as a plain binding-stable C function.
 for reg in reg_floats reg_direct; do
+    echo "TEST reg-fast $reg"
     if ! ./bin/arturoc "$WORK/$reg.art" "$WORK/p" >"$WORK/c.log" 2>&1; then bad "compile $reg: $(cat "$WORK/c.log")"; continue; fi
     if run3 "$WORK/$reg.art" "$WORK/p"; then ok; else bad "parity $reg"; fi
 done
 for backend in c direct; do
     for reg in reg_floats reg_direct; do
+        echo "TEST reg-$backend $reg"
         if ! ./bin/arturoc --backend=$backend "$WORK/$reg.art" "$WORK/p" >"$WORK/c.log" 2>&1; then
             bad "compile ($backend) $reg: $(cat "$WORK/c.log")"; continue
         fi
