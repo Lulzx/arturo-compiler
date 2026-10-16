@@ -14,7 +14,7 @@ STD     := $(shell echo 'int main(){}' | $(CXX) -std=c++2c -x c++ -fsyntax-only 
 CXXFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
 CFLAGS   ?= -O2 -fvisibility=hidden
 # the runtime uses OpenSSL on Linux (CommonCrypto is implicit on macOS)
-LDLIBS   := -lm
+LDLIBS   := -lm -lz
 ifeq ($(shell uname -s),Linux)
 LDLIBS   += -lcrypto
 endif

@@ -28,6 +28,7 @@
 #include <poll.h>
 #include <errno.h>
 #include <signal.h>
+#include <zlib.h>
 #include <unistd.h>
 #include <time.h>
 #include <regex.h>
@@ -3666,6 +3667,139 @@ static Value b_unplug(Env*e, Value*a, int n) {
     return v_null();
 }
 static Value b_socketp(Env*e, Value*a, int n){ return v_bool(a[0].k==V_SOCKET); }
+/* ---- zip / unzip / volume (host Files.nim semantics) -------------------- */
+static Value b_volume(Env*e, Value*a, int n) {
+    if (!IS_STRLIKE(a[0].k)) die("volume: expected a path");
+    struct stat st;
+    if (stat(a[0].u.s, &st) != 0) die("volume: cannot stat path");
+    return v_quantity_int((long)st.st_size, "B");
+}
+static unsigned char *read_whole_file(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return NULL; }
+    unsigned char *buf = xmalloc((size_t)sz + 1);
+    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return NULL; }
+    fclose(f); *out_len = (size_t)sz; return buf;
+}
+static void put_u16(FILE *f, unsigned v) { fputc(v & 0xFF, f); fputc((v >> 8) & 0xFF, f); }
+static void put_u32(FILE *f, unsigned long v) { put_u16(f, v & 0xFFFF); put_u16(f, (v >> 16) & 0xFFFF); }
+static Value b_zip(Env*e, Value*a, int n) {
+    if (!IS_STRLIKE(a[0].k)) die("zip: expected a destination path");
+    if (a[1].k != V_BLOCK) die("zip: expected a block of files");
+    /* the host's miniz writer silently skips files it cannot read and
+     * always produces an archive, even an empty one */
+    FILE *f = fopen(a[0].u.s, "wb");
+    if (!f) die("zip: cannot create archive");
+    typedef struct { char *name; unsigned long crc, csize, usize, offset; } Entry;
+    Entry *entries = NULL; size_t nent = 0, ecap = 0;
+    for (int i = 0; i < a[1].u.block.b->n; i++) {
+        Value item = *a[1].u.block.b->items[i];
+        if (!IS_STRLIKE(item.k)) continue;
+        /* upstream's wrapper passes extractFileName (the basename) as both
+         * the archive entry name and the source path, so "sub/b.txt" reads
+         * ./b.txt and is stored as "b.txt"; replicate the host exactly */
+        const char *base = strrchr(item.u.s, '/');
+        base = base ? base + 1 : item.u.s;
+        char *entry_name = strdup(base);
+        size_t len = 0; unsigned char *data = read_whole_file(base, &len);
+        if (!data) { free(entry_name); continue; }
+        uLongf cbound = compressBound((uLong)len);
+        unsigned char *cdata = xmalloc(cbound + 1);
+        z_stream zs; memset(&zs, 0, sizeof zs);
+        if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) { free(data); free(cdata); free(entry_name); continue; }
+        zs.next_in = data; zs.avail_in = (uInt)len;
+        zs.next_out = cdata; zs.avail_out = (uInt)cbound;
+        int zr = deflate(&zs, Z_FINISH); deflateEnd(&zs);
+        if (zr != Z_STREAM_END) { free(data); free(cdata); free(entry_name); continue; }
+        unsigned long csize = zs.total_out;
+        unsigned long crc = crc32(crc32(0L, Z_NULL, 0), data, (uInt)len);
+        long offset = ftell(f);
+        put_u32(f, 0x04034b50); put_u16(f, 20); put_u16(f, 0); put_u16(f, 8);
+        put_u16(f, 0); put_u16(f, 0);
+        put_u32(f, crc); put_u32(f, csize); put_u32(f, (unsigned long)len);
+        put_u16(f, (unsigned)strlen(entry_name)); put_u16(f, 0);
+        fwrite(entry_name, 1, strlen(entry_name), f);
+        fwrite(cdata, 1, csize, f);
+        free(data); free(cdata);
+        if (nent == ecap) { ecap = ecap ? ecap * 2 : 8; entries = realloc(entries, ecap * sizeof(Entry)); }
+        entries[nent].name = entry_name; entries[nent].crc = crc;
+        entries[nent].csize = csize; entries[nent].usize = (unsigned long)len;
+        entries[nent].offset = (unsigned long)offset; nent++;
+    }
+    long cd_start = ftell(f);
+    for (size_t i = 0; i < nent; i++) {
+        put_u32(f, 0x02014b50); put_u16(f, 20); put_u16(f, 20); put_u16(f, 0); put_u16(f, 8);
+        put_u16(f, 0); put_u16(f, 0);
+        put_u32(f, entries[i].crc); put_u32(f, entries[i].csize); put_u32(f, entries[i].usize);
+        put_u16(f, (unsigned)strlen(entries[i].name)); put_u16(f, 0); put_u16(f, 0);
+        put_u16(f, 0); put_u16(f, 0); put_u32(f, 0); put_u32(f, entries[i].offset);
+        fwrite(entries[i].name, 1, strlen(entries[i].name), f);
+        free(entries[i].name);
+    }
+    long cd_end = ftell(f);
+    put_u32(f, 0x06054b50); put_u16(f, 0); put_u16(f, 0);
+    put_u16(f, (unsigned)nent); put_u16(f, (unsigned)nent);
+    put_u32(f, (unsigned long)(cd_end - cd_start)); put_u32(f, (unsigned long)cd_start); put_u16(f, 0);
+    free(entries);
+    fclose(f);
+    return v_null();
+}
+static unsigned get_u16(const unsigned char *p) { return p[0] | (p[1] << 8); }
+static unsigned long get_u32(const unsigned char *p) { return get_u16(p) | (get_u16(p + 2) << 16); }
+static void make_parent_dirs(const char *path) {
+    char *tmp = strdup(path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') { *p = 0; mkdir(tmp, 0777); *p = '/'; }
+    }
+    free(tmp);
+}
+static Value b_unzip(Env*e, Value*a, int n) {
+    if (!IS_STRLIKE(a[0].k) || !IS_STRLIKE(a[1].k)) die("unzip: expected destination and archive paths");
+    /* host order: unzip <destination-folder> <archive>; the host's miniz
+     * reader silently does nothing when the archive cannot be opened */
+    size_t zlen = 0; unsigned char *zip = read_whole_file(a[1].u.s, &zlen);
+    if (!zip) return v_null();
+    size_t pos = 0;
+    while (pos + 30 <= zlen && get_u32(zip + pos) == 0x04034b50) {
+        unsigned method = get_u16(zip + pos + 8);
+        unsigned long csize = get_u32(zip + pos + 18);
+        unsigned long usize = get_u32(zip + pos + 22);
+        unsigned nlen = get_u16(zip + pos + 26), xlen = get_u16(zip + pos + 28);
+        if (pos + 30 + nlen + xlen > zlen) break;
+        char *name = xmalloc(nlen + 1); memcpy(name, zip + pos + 30, nlen); name[nlen] = 0;
+        size_t data_off = pos + 30 + nlen + xlen;
+        if (data_off + csize > zlen) { free(name); break; }
+        /* skip directory entries and anything escaping the destination */
+        if (nlen > 0 && name[nlen - 1] != '/' && !strstr(name, "..")) {
+            unsigned char *out = NULL;
+            if (method == 0) { out = xmalloc(usize + 1); memcpy(out, zip + data_off, usize); }
+            else if (method == 8) {
+                out = xmalloc(usize + 1);
+                z_stream zs; memset(&zs, 0, sizeof zs);
+                if (inflateInit2(&zs, -15) == Z_OK) {
+                    zs.next_in = zip + data_off; zs.avail_in = (uInt)csize;
+                    zs.next_out = out; zs.avail_out = (uInt)usize;
+                    if (inflate(&zs, Z_FINISH) != Z_STREAM_END && zs.total_out != usize) { free(out); out = NULL; }
+                    inflateEnd(&zs);
+                } else { free(out); out = NULL; }
+            }
+            if (out) {
+                char *target = xmalloc(strlen(a[0].u.s) + nlen + 2);
+                sprintf(target, "%s/%s", a[0].u.s, name);
+                make_parent_dirs(target);
+                FILE *of = fopen(target, "wb");
+                if (of) { fwrite(out, 1, usize, of); fclose(of); }
+                free(target); free(out);
+            }
+        }
+        free(name);
+        pos = data_off + csize;
+    }
+    free(zip);
+    return v_null();
+}
 static Value b_standalonep(Env*e,Value*a,int n){ return v_bool(1); }
 static Value b_superuserp(Env*e,Value*a,int n){ return v_bool(geteuid()==0); }
 static Value b_false_always(Env*e,Value*a,int n){ return v_bool(0); }
@@ -4893,6 +5027,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"database?",b_false_always},{"socket?",b_socketp},{"store?",b_false_always},{"future?",b_futurep},
     {"connect",b_connect},{"listen",b_listen},{"accept",b_accept},{"send",b_send},
     {"send?",b_sendq},{"receive",b_receive},{"unplug",b_unplug},
+    {"zip",b_zip},{"unzip",b_unzip},{"volume",b_volume},
     {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
     {"lower?",b_lowerp},{"upper?",b_upperp},{"numeric?",b_numericp},
     {"prefix?",b_prefixp},{"suffix?",b_suffixp},{"between?",b_betweenp},{"same?",b_samep},

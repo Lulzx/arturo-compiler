@@ -548,9 +548,6 @@ inline constexpr const char* kUnsupportedIntrinsics[] = {
   "store",
   "terminate",
   "unstack",
-  "unzip",
-  "volume",
-  "zip",
 };
 inline constexpr const char* kShadowable[] = {
   "abs",

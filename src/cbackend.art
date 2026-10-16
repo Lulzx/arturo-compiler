@@ -2030,7 +2030,7 @@ compileToNativeC: function [src outName][
     unameOut: strip execute "uname -s"
     if "Darwin" = unameOut -> cryptoLib: ""
     if "Darwin" <> unameOut -> ldflags: "-O1"
-    linkResult: execute.code ("cc " ++ ldflags ++ " " ++ outName ++ ".o runtime/runtime.a -lm " ++ cryptoLib ++ " -o " ++ outName ++ " 2>&1")
+    linkResult: execute.code ("cc " ++ ldflags ++ " " ++ outName ++ ".o runtime/runtime.a -lm -lz " ++ cryptoLib ++ " -o " ++ outName ++ " 2>&1")
     if 0 <> linkResult\code [ panic linkResult\output ]
     outName
 ]

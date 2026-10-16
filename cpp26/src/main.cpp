@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
                 rc = runCmd(cc + " -O2 -I" + sh(rt) + " -c " + sh(rt / "runtime.c") + " -o " + sh(rto));
                 if (rc != 0) { cleanup(); throw artc::CompileError("runtime compilation failed"); }
             }
-            rc = runCmd(cc + " -O2 " + sh(opath) + " " + sh(rto) + " -lm " + extra + " -o " + sh(fs::path(outPath)));
+            rc = runCmd(cc + " -O2 " + sh(opath) + " " + sh(rto) + " -lm -lz " + extra + " -o " + sh(fs::path(outPath)));
             if (rc != 0) { cleanup(); throw artc::CompileError("link failed for " + outPath); }
             cleanup();
             ::chmod(outPath.c_str(), 0755);

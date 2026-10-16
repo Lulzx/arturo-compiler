@@ -41,7 +41,7 @@ sanitize_source() {
     stage=compile
     if with_timeout ./tmp/ncomp "$root/$source" "$generated" >"$generated.ncomp.log" 2>&1 \
         && { stage=cc; with_timeout "$cc_bin" "${flags[@]}" -Iruntime -c "$generated.c" -o "$generated.o" 2>"$generated.cc.log"; } \
-        && { stage=link; with_timeout "$cc_bin" "${flags[@]}" "$generated.o" "$work/runtime.o" -lm ${crypto_lib[@]+"${crypto_lib[@]}"} -o "$generated.san" 2>>"$generated.cc.log"; } \
+        && { stage=link; with_timeout "$cc_bin" "${flags[@]}" "$generated.o" "$work/runtime.o" -lm -lz ${crypto_lib[@]+"${crypto_lib[@]}"} -o "$generated.san" 2>>"$generated.cc.log"; } \
         && { stage=run; mkdir -p "$generated.fs"; (
             cd "$generated.fs"
             ASAN_OPTIONS="detect_leaks=$detect_leaks:halt_on_error=1" \

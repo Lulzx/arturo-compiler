@@ -280,6 +280,38 @@ for i in $(seq 1 25); do
 done
 if [ "$rerun_fail" -eq 0 ]; then ok; else bad "recompiled output not runnable at iteration $i"; fi
 
+echo "== zip/unzip/volume parity (isolated directories, tree compared) =="
+cat > "$WORK/zipprog.art" <<'EOF'
+write "alpha content 123\n" "a.txt"
+write "beta beta beta\n" "b.txt"
+zip "out.zip" ["a.txt" "b.txt" "missing.txt"]
+unzip "ext" "out.zip"
+print read "ext/a.txt"
+print read "ext/b.txt"
+print volume "a.txt"
+unzip "nowhere" "missing.zip"
+print "done"
+EOF
+mkdir -p "$WORK/zip-host" "$WORK/zip-cpp"
+if ./bin/arturoc "$WORK/zipprog.art" "$WORK/zipbin" >"$WORK/c.log" 2>&1; then
+    cp "$WORK/zipprog.art" "$WORK/zip-host/p.art"; cp "$WORK/zipprog.art" "$WORK/zip-cpp/p.art"
+    (cd "$WORK/zip-host" && "$ARTURO" --no-color p.art >out.txt 2>err.txt); hs=$?
+    (cd "$WORK/zip-cpp" && "$WORK/zipbin" >out.txt 2>err.txt); ns=$?
+    zipok=1
+    cmp -s "$WORK/zip-host/out.txt" "$WORK/zip-cpp/out.txt" || zipok=0
+    cmp -s "$WORK/zip-host/ext/a.txt" "$WORK/zip-cpp/ext/a.txt" || zipok=0
+    cmp -s "$WORK/zip-host/ext/b.txt" "$WORK/zip-cpp/ext/b.txt" || zipok=0
+    [ "$hs" = "$ns" ] || zipok=0
+    # cross-extraction: each engine must read the other's archive
+    mkdir -p "$WORK/zip-cross"
+    printf 'unzip "ext" "out.zip"\nprint read "ext/b.txt"\n' > "$WORK/zip-cross/x.art"
+    cp "$WORK/zip-host/out.zip" "$WORK/zip-cross/out.zip"
+    ./bin/arturoc "$WORK/zip-cross/x.art" "$WORK/zipxbin" >/dev/null 2>&1 || zipok=0
+    (cd "$WORK/zip-cross" && "$WORK/zipxbin" >x.out 2>/dev/null) || zipok=0
+    grep -q "beta" "$WORK/zip-cross/x.out" || zipok=0
+    if [ "$zipok" -eq 1 ]; then ok; else bad "zip/unzip/volume parity"; fi
+else bad "compile zipprog: $(cat "$WORK/c.log")"; fi
+
 echo "== socket parity over live TCP (host vs compiled) =="
 if ARTURO_HOST="$ARTURO" python3 tests/socket_test.py "$WORK" >"$WORK/sock.log" 2>&1; then ok; else bad "socket parity: $(cat "$WORK/sock.log")"; fi
 

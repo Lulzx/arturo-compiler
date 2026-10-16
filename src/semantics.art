@@ -41,8 +41,7 @@ UNSUPPORTED_INTRINSICS: #[
     "request": true
     "serve": true "spin": true
     "stack": true "store": true
-    "terminate": true "unstack": true "unzip": true
-    "volume": true "zip": true
+    "terminate": true "unstack": true
 ]
 
 unsupportedIntrinsic?: function [name][ key? UNSUPPORTED_INTRINSICS name ]
