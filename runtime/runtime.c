@@ -4519,7 +4519,438 @@ static Value b_serve(Env*e, Value*a, int n) {
     }
     return v_null();
 }
-/* ---- persistent stores: store / config (host Databases.nim semantics) -- */
+/* ---- documentation: info / info.get (host Helpers.nim + library docs) -- */
+#include "info_data.inc"
+static const InfoEntry *info_find(const char *name) {
+    for (int i = 0; i < INFO_DB_COUNT; i++)
+        if (!strcmp(INFO_DB[i].name, name)) return &INFO_DB[i];
+    return NULL;
+}
+/* split a comma list into a block of :type values */
+static Value info_type_list(const char *csv) {
+    int count = 0;
+    if (csv && *csv) { count = 1; for (const char *p = csv; *p; p++) if (*p == ',') count++; }
+    Value **items = xmalloc(sizeof(Value*) * (size_t)(count ? count : 1));
+    int n = 0;
+    if (count) {
+        char *copy = strdup(csv); char *save = NULL;
+        for (char *t = strtok_r(copy, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+            char *tn = xmalloc(strlen(t) + 2); tn[0] = ':'; strcpy(tn + 1, t);
+            items[n] = xmalloc(sizeof(Value)); *items[n] = v_token(V_TYPE, tn); free(tn); n++;
+        }
+        free(copy);
+    }
+    return v_block(items, n);
+}
+static Value info_dict_from_pairs(char **keys, Value *vals, int n) {
+    char **k = xmalloc(sizeof(char*) * (size_t)(n ? n : 1));
+    Value *v = xmalloc(sizeof(Value) * (size_t)(n ? n : 1));
+    for (int i = 0; i < n; i++) { k[i] = strdup(keys[i]); v[i] = vals[i]; }
+    return v_dict(k, v, n);
+}
+/* args encoding: "param=t1,t2;param=t1" -> dictionary param -> [:t1 :t2] */
+static Value info_args_dict(const char *enc) {
+    char **keys = NULL; Value *vals = NULL; int n = 0, cap = 0;
+    if (enc && *enc) {
+        char *copy = strdup(enc); char *save = NULL;
+        for (char *part = strtok_r(copy, ";", &save); part; part = strtok_r(NULL, ";", &save)) {
+            char *eq = strchr(part, '=');
+            if (!eq) continue;
+            *eq = 0;
+            if (n == cap) { cap = cap ? cap * 2 : 8; keys = realloc(keys, (size_t)cap * sizeof(char*)); vals = realloc(vals, (size_t)cap * sizeof(Value)); }
+            keys[n] = strdup(part); vals[n] = info_type_list(eq + 1); n++;
+        }
+        free(copy);
+    }
+    Value r = info_dict_from_pairs(keys, vals, n);
+    free(keys); free(vals);
+    return r;
+}
+/* attrs encoding: "name=t1,t2:description;..." -> dict name -> dict */
+static Value info_attrs_dict(const char *enc) {
+    char **keys = NULL; Value *vals = NULL; int n = 0, cap = 0;
+    if (enc && *enc) {
+        char *copy = strdup(enc); char *save = NULL;
+        for (char *part = strtok_r(copy, ";", &save); part; part = strtok_r(NULL, ";", &save)) {
+            char *eq = strchr(part, '=');
+            if (!eq) continue;
+            *eq = 0;
+            char *colon = strchr(eq + 1, ':');
+            const char *desc = "";
+            if (colon) { *colon = 0; desc = colon + 1; }
+            char *sk[2] = {"types", "description"};
+            Value sv[2] = { info_type_list(eq + 1), v_str(desc) };
+            if (n == cap) { cap = cap ? cap * 2 : 8; keys = realloc(keys, (size_t)cap * sizeof(char*)); vals = realloc(vals, (size_t)cap * sizeof(Value)); }
+            keys[n] = strdup(part); vals[n] = info_dict_from_pairs(sk, sv, 2); n++;
+        }
+        free(copy);
+    }
+    Value r = info_dict_from_pairs(keys, vals, n);
+    free(keys); free(vals);
+    return r;
+}
+static Value info_example_block(const char *enc) {
+    int count = 0;
+    if (!enc || !*enc) {
+        /* the host represents "no example" as a block with one empty string */
+        Value **ei = xmalloc(sizeof(Value*)); ei[0] = xmalloc(sizeof(Value)); *ei[0] = v_str("");
+        return v_block(ei, 1);
+    }
+    if (enc && *enc) { count = 1; for (const char *p = enc; *p; p++) if (*p == '\x1e') count++; }
+    Value **items = xmalloc(sizeof(Value*) * (size_t)(count ? count : 1));
+    int n = 0;
+    if (count) {
+        const char *p = enc;
+        for (;;) {
+            const char *sep = strchr(p, '\x1e');
+            size_t len = sep ? (size_t)(sep - p) : strlen(p);
+            char *s = xmalloc(len + 1); memcpy(s, p, len); s[len] = 0;
+            items[n] = xmalloc(sizeof(Value)); *items[n] = v_str(s); free(s); n++;
+            if (!sep) break;
+            p = sep + 1;
+        }
+    }
+    return v_block(items, n);
+}
+static int info_key_present(const InfoEntry *en, const char *key) {
+    size_t kl = strlen(key);
+    const char *p = en->keys;
+    while (*p) {
+        while (*p == ' ') p++;
+        const char *s = p;
+        while (*p && *p != ' ') p++;
+        if ((size_t)(p - s) == kl && !strncmp(s, key, kl)) return 1;
+    }
+    return 0;
+}
+static Value info_get_dict_builtin(const InfoEntry *en, const void *addr) {
+    char addrbuf[32]; snprintf(addrbuf, sizeof addrbuf, "0x%llX", (unsigned long long)(uintptr_t)addr);
+    /* build the dictionary in the host's own key order for this entry */
+    char **keys = NULL; Value *vals = NULL; int n = 0, cap = 0;
+    char *kcopy = strdup(en->keys); char *ksave = NULL;
+    for (char *k = strtok_r(kcopy, " ", &ksave); k; k = strtok_r(NULL, " ", &ksave)) {
+        Value v;
+        if (!strcmp(k, "name")) v = v_str(en->name);
+        else if (!strcmp(k, "address")) v = v_str(addrbuf);
+        else if (!strcmp(k, "type")) { char tb[64]; snprintf(tb, sizeof tb, ":%s", en->type); v = v_token(V_TYPE, tb); }
+        else if (!strcmp(k, "description")) v = v_str(en->desc);
+        else if (!strcmp(k, "module")) v = v_str(en->module);
+        else if (!strcmp(k, "args")) v = info_args_dict(en->args);
+        else if (!strcmp(k, "attrs")) v = info_attrs_dict(en->attrs);
+        else if (!strcmp(k, "returns")) v = info_type_list(en->returns);
+        else if (!strcmp(k, "alias")) v = v_str(en->alias);
+        else if (!strcmp(k, "infix?")) v = v_bool(en->infix && !strcmp(en->infix, "true"));
+        else if (!strcmp(k, "example")) v = info_example_block(en->example);
+        else if (!strcmp(k, "line")) v = v_int(en->line);
+        else if (!strcmp(k, "source")) v = v_str(en->source);
+        else continue;
+        if (n == cap) { cap = cap ? cap * 2 : 8; keys = realloc(keys, (size_t)cap * sizeof(char*)); vals = realloc(vals, (size_t)cap * sizeof(Value)); }
+        keys[n] = k; vals[n] = v; n++;
+    }
+    Value r = info_dict_from_pairs(keys, vals, n);
+    free(keys); free(vals); free(kcopy);
+    return r;
+}
+/* word-wrap text to width w, printing each line with the given prefix */
+static void info_wrap_print(const char *prefix, const char *text, int width) {
+    int col = 0;
+    const char *p = text;
+    printf("%s", prefix);
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != ' ') p++;
+        int wl = (int)(p - s);
+        if (col > 0 && col + 1 + wl > width) { printf("\n%s", prefix); col = 0; }
+        if (col > 0) { putchar(' '); col++; }
+        fwrite(s, 1, (size_t)wl, stdout); col += wl;
+    }
+    putchar('\n');
+}
+static void info_panel_builtin(const InfoEntry *en) {
+    printf("|--------------------------------------------------------------------------------\n");
+    {
+        char namebuf[256];
+        int nl = (int)strlen(en->name);
+        if (nl < 11) snprintf(namebuf, sizeof namebuf, "%11s", en->name);
+        else snprintf(namebuf, sizeof namebuf, "%s", en->name);
+        printf("|    %s  :%s%53s\n", namebuf, en->type, en->module);
+    }
+    if (en->alias && *en->alias) printf("|          alias  %s\n", en->alias);
+    printf("|--------------------------------------------------------------------------------\n");
+    if (en->pdesc && *en->pdesc) {
+        const char *p = en->pdesc;
+        for (;;) {
+            const char *nl = strchr(p, '\n');
+            printf("|                 %.*s\n", nl ? (int)(nl - p) : (int)strlen(p), p);
+            if (!nl) break;
+            p = nl + 1;
+        }
+    } else printf("|                 %s\n", en->desc);
+    printf("|--------------------------------------------------------------------------------\n");
+    /* usage */
+    if (en->ulines && *en->ulines) {
+        const char *p = en->ulines;
+        for (;;) {
+            const char *nl = strchr(p, '\n');
+            printf("|%.*s\n", nl ? (int)(nl - p) : (int)strlen(p), p);
+            if (!nl) break;
+            p = nl + 1;
+        }
+    } else {
+        /* usage: first param on the `usage` line, later params aligned
+         * under the first param name; type lists wrap under the types */
+        int nameLen = (int)strlen(en->name);
+        if (!en->args || !*en->args) {
+            printf("|          usage  %s :nothing\n", en->name);
+        } else {
+            char *copy = strdup(en->args);
+            char *save = NULL;
+            int paramIdx = 0;
+            int curLen = 0;          /* current output line length */
+            int typesIndent = 0;     /* spaces after | for wrapped types */
+            for (char *part = strtok_r(copy, ";", &save); part; part = strtok_r(NULL, ";", &save), paramIdx++) {
+                char *eq = strchr(part, '=');
+                char pname[128] = "";
+                if (eq) snprintf(pname, sizeof pname, "%.*s", (int)(eq - part), part);
+                else snprintf(pname, sizeof pname, "%s", part);
+                if (paramIdx == 0) {
+                    printf("|          usage  %s %s", en->name, pname);
+                    curLen = 18 + nameLen + 1 + (int)strlen(pname);
+                } else {
+                    printf("\n|");
+                    for (int i = 0; i < 18 + nameLen; i++) putchar(' ');
+                    printf("%s", pname);
+                    curLen = 1 + 18 + nameLen + (int)strlen(pname);
+                }
+                typesIndent = 17 + nameLen + 1 + (int)strlen(pname) + 1;
+                if (eq) {
+                    /* the type list wraps at 50 characters, measured on
+                     * the list itself, with continuations under the types */
+                    putchar(' ');
+                    char *tc = strdup(eq + 1); char *ts = NULL;
+                    int seg = 0;
+                    for (char *t = strtok_r(tc, ",", &ts); t; t = strtok_r(NULL, ",", &ts)) {
+                        int wl = 1 + (int)strlen(t);
+                        if (seg > 0 && seg + 1 + wl > 50) {
+                            printf("\n|");
+                            for (int i = 0; i < typesIndent; i++) putchar(' ');
+                            seg = 0;
+                        }
+                        if (seg > 0) { putchar(' '); seg++; }
+                        printf(":%s", t);
+                        seg += wl;
+                    }
+                    free(tc);
+                }
+                (void)curLen;
+            }
+            free(copy);
+            printf("\n");
+        }
+    }
+    printf("|\n");
+    /* options: a sole :logical type is omitted (it is a flag); the
+     * description lines are the host's own breaks from INFO_DB adesc */
+    if (en->attrs && *en->attrs) {
+        /* helper lambda-equivalent: build the rendered left side */
+        int maxleft = 0;
+        {
+            char *copy = strdup(en->attrs); char *save = NULL;
+            for (char *part = strtok_r(copy, ";", &save); part; part = strtok_r(NULL, ";", &save)) {
+                char *eq = strchr(part, '=');
+                char *colon = eq ? strchr(eq + 1, ':') : NULL;
+                char left[1200] = "";
+                if (eq && colon) {
+                    if (!strncmp(eq + 1, "logical", (size_t)(colon - (eq + 1))) && colon == eq + 8)
+                        snprintf(left, sizeof left, ".%.*s", (int)(eq - part), part);
+                    else {
+                        char tbuf[1024] = "";
+                        char *tc = xmalloc((size_t)(colon - (eq + 1)) + 1); memcpy(tc, eq + 1, (size_t)(colon - (eq + 1))); tc[colon - (eq + 1)] = 0; char *ts = NULL;
+                        for (char *t = strtok_r(tc, ",", &ts); t; t = strtok_r(NULL, ",", &ts)) { strcat(tbuf, " :"); strcat(tbuf, t); }
+                        free(tc);
+                        snprintf(left, sizeof left, ".%.*s%s", (int)(eq - part), part, tbuf);
+                    }
+                } else if (eq) snprintf(left, sizeof left, ".%.*s", (int)(eq - part), part);
+                else snprintf(left, sizeof left, ".%s", part);
+                if ((int)strlen(left) > maxleft) maxleft = (int)strlen(left);
+            }
+            free(copy);
+        }
+        char *copy = strdup(en->attrs); char *save = NULL;
+        int first = 1;
+        for (char *part = strtok_r(copy, ";", &save); part; part = strtok_r(NULL, ";", &save)) {
+            char *eq = strchr(part, '=');
+            char *colon = eq ? strchr(eq + 1, ':') : NULL;
+            const char *desc = colon ? colon + 1 : "";
+            char aname[256] = "";
+            if (eq) snprintf(aname, sizeof aname, "%.*s", (int)(eq - part), part);
+            else snprintf(aname, sizeof aname, "%s", part);
+            char left[1200] = "";
+            if (eq && colon) {
+                if (!strncmp(eq + 1, "logical", (size_t)(colon - (eq + 1))) && colon == eq + 8)
+                    snprintf(left, sizeof left, ".%s", aname);
+                else {
+                    char tbuf[1024] = "";
+                    char *tc = xmalloc((size_t)(colon - (eq + 1)) + 1); memcpy(tc, eq + 1, (size_t)(colon - (eq + 1))); tc[colon - (eq + 1)] = 0; char *ts = NULL;
+                    for (char *t = strtok_r(tc, ",", &ts); t; t = strtok_r(NULL, ",", &ts)) { strcat(tbuf, " :"); strcat(tbuf, t); }
+                    free(tc);
+                    snprintf(left, sizeof left, ".%s%s", aname, tbuf);
+                }
+            } else snprintf(left, sizeof left, ".%s", aname);
+            /* description lines: captured panel breaks when available */
+            const char *lines[64]; int nlines = 0;
+            lines[nlines++] = desc;
+            if (en->adesc && *en->adesc) {
+                const char *p = en->adesc;
+                while (*p && nlines < 64) {
+                    const char *e1 = strchr(p, '\x1f');
+                    size_t elen = e1 ? (size_t)(e1 - p) : strlen(p);
+                    const char *e2 = memchr(p, '\x1e', elen);
+                    size_t nlen = e2 ? (size_t)(e2 - p) : elen;
+                    if (nlen == strlen(aname) && !strncmp(p, aname, nlen) && e2) {
+                        /* collect this attr's lines (NUL-terminated copies) */
+                        nlines = 0;
+                        const char *lp = e2 + 1;
+                        const char *end = p + elen;
+                        while (lp < end && nlines < 64) {
+                            const char *le = memchr(lp, '\x1e', (size_t)(end - lp));
+                            size_t llen = le ? (size_t)(le - lp) : (size_t)(end - lp);
+                            char *lc = xmalloc(llen + 1); memcpy(lc, lp, llen); lc[llen] = 0;
+                            lines[nlines++] = lc;
+                            if (!le) break;
+                            lp = le + 1;
+                        }
+                        break;
+                    }
+                    if (!e1) break;
+                    p = e1 + 1;
+                }
+            }
+            if (first) { printf("|        options  %-*s -> %s\n", maxleft, left, lines[0]); first = 0; }
+            else printf("|                 %-*s -> %s\n", maxleft, left, lines[0]);
+            for (int li = 1; li < nlines; li++) {
+                printf("|");
+                for (int i = 0; i < maxleft + 14; i++) putchar(' ');
+                printf("%s\n", lines[li]);
+            }
+        }
+        free(copy);
+        printf("|\n");
+    }
+    /* returns: verbatim host lines when captured */
+    if (en->rlines && *en->rlines) {
+        const char *p = en->rlines;
+        for (;;) {
+            const char *nl = strchr(p, '\n');
+            printf("|%.*s\n", nl ? (int)(nl - p) : (int)strlen(p), p);
+            if (!nl) break;
+            p = nl + 1;
+        }
+    } else {
+        printf("|        returns  ");
+        if (en->returns && *en->returns) {
+            char *tc = strdup(en->returns); char *ts = NULL;
+            int seg = 0;
+            for (char *t = strtok_r(tc, ",", &ts); t; t = strtok_r(NULL, ",", &ts)) {
+                int wl = 1 + (int)strlen(t);
+                if (seg > 0 && seg + 1 + wl > 50) {
+                    printf("\n|                 ");
+                    seg = 0;
+                }
+                if (seg > 0) { putchar(' '); seg++; }
+                printf(":%s", t);
+                seg += wl;
+            }
+            free(tc);
+        }
+        printf("\n");
+    }
+    printf("|--------------------------------------------------------------------------------\n");
+    fflush(stdout);
+}
+static Value b_info(Env*e, Value*a, int n) {
+    if (!IS_STRLIKE(a[0].k) && a[0].k != V_FUNC && a[0].k != V_BUILTIN) die("info: expected a name");
+    char *name = a[0].k == V_BUILTIN ? strdup(a[0].u.s) : (IS_STRLIKE(a[0].k) ? strdup(a[0].u.s) : NULL);
+    Value fn = v_null();
+    if (name && env_bound(e, name)) { Value v = env_get(e, name); if (v.k == V_FUNC) fn = v; }
+    if (a[0].k == V_FUNC) fn = a[0];
+    if (rt_has_attr("get")) {
+        if (fn.k == V_FUNC) {
+            /* user function: name/address/type/args/attrs/returns/example */
+            char addrbuf[32]; snprintf(addrbuf, sizeof addrbuf, "0x%llX", (unsigned long long)(uintptr_t)fn.u.fn.params);
+            char **keys = xmalloc(7 * sizeof(char*)); Value *vals = xmalloc(7 * sizeof(Value));
+            keys[0] = strdup("name"); vals[0] = v_str(name ? name : "");
+            keys[1] = strdup("address"); vals[1] = v_str(addrbuf);
+            keys[2] = strdup("type"); vals[2] = v_token(V_TYPE, ":function");
+            /* args dict: each param -> [:any] */
+            {
+                IR *params = fn.u.fn.params;
+                int np = (params && params->op && params->opcode == OP_BLOCK) ? params->nargs : 0;
+                char **ak = xmalloc(sizeof(char*) * (size_t)(np ? np : 1)); Value *av = xmalloc(sizeof(Value) * (size_t)(np ? np : 1));
+                int an = 0;
+                for (int i = 0; i < np; i++) {
+                    IR *pn = params->args[i]; const char *nm = NULL;
+                    if (pn->op && pn->opcode == OP_LOAD) nm = pn->name;
+                    else if (pn->op && pn->opcode == OP_CONST && IS_STRLIKE(pn->v.k)) nm = pn->v.u.s;
+                    if (!nm) continue;
+                    ak[an] = strdup(nm); av[an] = info_type_list("any"); an++;
+                }
+                keys[3] = strdup("args"); vals[3] = info_dict_from_pairs(ak, av, an);
+                free(ak); free(av);
+            }
+            keys[4] = strdup("attrs"); vals[4] = info_dict_from_pairs(NULL, NULL, 0);
+            keys[5] = strdup("returns"); vals[5] = info_type_list("nothing");
+            keys[6] = strdup("example");
+            { Value **ei = xmalloc(sizeof(Value*)); ei[0] = xmalloc(sizeof(Value)); *ei[0] = v_str(""); vals[6] = v_block(ei, 1); }
+            Value r = v_dict(keys, vals, 7);
+            free(name);
+            return r;
+        }
+        const InfoEntry *en = name ? info_find(name) : NULL;
+        if (!en) { char msg[256]; snprintf(msg, sizeof msg, "info: identifier not found: %s", name ? name : ""); free(name); die(msg); }
+        Value r = info_get_dict_builtin(en, (const void*)en);
+        free(name);
+        return r;
+    }
+    if (fn.k == V_FUNC) {
+        /* user function panel: header carries the address, empty desc */
+        char addrbuf[32]; snprintf(addrbuf, sizeof addrbuf, "0x%llX", (unsigned long long)(uintptr_t)fn.u.fn.params);
+        printf("|--------------------------------------------------------------------------------\n");
+        {
+            const char *nm = name ? name : "";
+            char namebuf[256];
+            if ((int)strlen(nm) < 11) snprintf(namebuf, sizeof namebuf, "%11s", nm);
+            else snprintf(namebuf, sizeof namebuf, "%s", nm);
+            printf("|    %s  :function%53s\n", namebuf, addrbuf);
+        }
+        printf("|--------------------------------------------------------------------------------\n");
+        printf("|                 \n");
+        printf("|--------------------------------------------------------------------------------\n");
+        IR *params = fn.u.fn.params;
+        int np = (params && params->op && params->opcode == OP_BLOCK) ? params->nargs : 0;
+        for (int i = 0; i < np; i++) {
+            IR *pn = params->args[i]; const char *nm = "";
+            if (pn->op && pn->opcode == OP_LOAD) nm = pn->name;
+            else if (pn->op && pn->opcode == OP_CONST && IS_STRLIKE(pn->v.k)) nm = pn->v.u.s;
+            if (i == 0) printf("|          usage  %s %s :any\n", name ? name : "", nm);
+            else { printf("|"); for (int s = 0; s < 18 + (int)strlen(name ? name : ""); s++) putchar(' '); printf("%s :any\n", nm); }
+        }
+        if (np == 0) printf("|          usage  %s\n", name ? name : "");
+        printf("|\n");
+        printf("|        returns  :nothing\n");
+        printf("|--------------------------------------------------------------------------------\n");
+        fflush(stdout);
+        free(name);
+        return v_null();
+    }
+    const InfoEntry *en = name ? info_find(name) : NULL;
+    if (!en) { char msg[256]; snprintf(msg, sizeof msg, "info: identifier not found: %s", name ? name : ""); free(name); die(msg); }
+    info_panel_builtin(en);
+    free(name);
+    return v_null();
+}
 /* A store is a dictionary persisted to a file: native format is Arturo
  * source (`key: <literal>` lines), JSON format is pretty-printed JSON.
  * Mutations through set/path-assignment save immediately unless the
@@ -6176,7 +6607,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"request",b_request},{"download",b_download},
     {"cursor",b_cursor},{"goto",b_goto},{"browse",b_browse},
     {"store",b_store},{"config",b_config},{"terminate",b_terminate},
-    {"serve",b_serve},{"emit",b_emit},{"send.html",b_send_html},{"send.json",b_send_json},
+    {"serve",b_serve},{"emit",b_emit},{"send.html",b_send_html},{"send.json",b_send_json},{"info",b_info},
     {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
     {"lower?",b_lowerp},{"upper?",b_upperp},{"numeric?",b_numericp},
     {"prefix?",b_prefixp},{"suffix?",b_suffixp},{"between?",b_betweenp},{"same?",b_samep},

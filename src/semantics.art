@@ -35,7 +35,7 @@ NOT_MUTATING: #[
 UNSUPPORTED_INTRINSICS: #[
     "__VerbosePackager": true
     "cancel": true "channel": true
-    "eval": true "event": true "failed?": true "finished?": true "info": true
+    "eval": true "event": true "failed?": true "finished?": true
     "mail": true "off": true "on": true
     "stack": true
     "unstack": true

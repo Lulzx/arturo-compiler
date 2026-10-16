@@ -25,7 +25,7 @@ SRC      := src
 
 all: $(BIN)/arturoc $(BIN)/arturo-stub
 
-$(BIN)/runtime.o: $(ROOT)/runtime/runtime.c $(ROOT)/runtime/runtime.h $(ROOT)/runtime/intrinsic_arity.inc
+$(BIN)/runtime.o: $(ROOT)/runtime/runtime.c $(ROOT)/runtime/runtime.h $(ROOT)/runtime/intrinsic_arity.inc $(ROOT)/runtime/info_data.inc
 	@mkdir -p $(BIN)
 	$(CC) $(CFLAGS) -I$(ROOT)/runtime -c $(ROOT)/runtime/runtime.c -o $@
 

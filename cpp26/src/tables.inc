@@ -531,7 +531,6 @@ inline constexpr const char* kUnsupportedIntrinsics[] = {
   "event",
   "failed?",
   "finished?",
-  "info",
   "mail",
   "off",
   "on",
