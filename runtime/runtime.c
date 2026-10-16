@@ -1562,35 +1562,49 @@ static char *big_sub(const char *a, const char *b){
     free(nb);
     return r;
 }
+/* base-1e9 limbs (little-endian) parsed from a normalized decimal string */
+static uint32_t *big_parse_limbs(const char *digits, size_t *out_n) {
+    size_t len = strlen(digits);
+    size_t n = (len + 8) / 9;
+    uint32_t *limbs = xmalloc((n ? n : 1) * sizeof(uint32_t));
+    size_t li = 0;
+    for (size_t end = len; end > 0;) {
+        size_t start = end >= 9 ? end - 9 : 0;
+        uint32_t v = 0;
+        for (size_t i = start; i < end; i++) v = v * 10 + (uint32_t)(digits[i] - '0');
+        limbs[li++] = v;
+        end = start;
+    }
+    while (n > 1 && limbs[n - 1] == 0) n--;
+    *out_n = n;
+    return limbs;
+}
 static char *big_mul(const char *a, const char *b){
     int negative = big_neg(a) != big_neg(b);
     const char *A = big_abs(a), *B = big_abs(b);
-    size_t la = strlen(A), lb = strlen(B);
     if (strcmp(A,"0")==0 || strcmp(B,"0")==0) return strdup("0");
-    size_t cap = la + lb + 2;
-    char *res = xmalloc(cap); memset(res, '0', cap - 1); res[cap-1] = 0;
-    for (size_t i = 0; i < la; i++){
-        int da = A[la-1-i] - '0';
-        if (!da) continue;
-        int carry = 0;
-        for (size_t j = 0; j < lb; j++){
-            int db = B[lb-1-j] - '0';
-            size_t pos = cap - 2 - (i + j);
-            int cur = (res[pos] - '0') + da * db + carry;
-            res[pos] = (char)('0' + cur % 10);
-            carry = cur / 10;
+    size_t na = 0, nb = 0;
+    uint32_t *x = big_parse_limbs(A, &na), *y = big_parse_limbs(B, &nb);
+    size_t nr = na + nb;
+    uint32_t *r = xmalloc(nr * sizeof(uint32_t)); memset(r, 0, nr * sizeof(uint32_t));
+    for (size_t i = 0; i < na; i++) {
+        uint64_t carry = 0;
+        for (size_t j = 0; j < nb; j++) {
+            uint64_t cur = r[i + j] + (uint64_t)x[i] * y[j] + carry;
+            r[i + j] = (uint32_t)(cur % 1000000000u);
+            carry = cur / 1000000000u;
         }
-        size_t pos = cap - 2 - (i + lb);
-        while (carry){ int cur = (res[pos] - '0') + carry % 10; res[pos] = (char)('0' + cur % 10); carry = cur / 10; if (pos) pos--; else break; }
+        r[i + nb] = (uint32_t)carry;
     }
-    const char *norm = big_norm(res);
-    char *out;
-    if (negative){
-        out = xmalloc(strlen(norm) + 2); out[0] = '-'; strcpy(out + 1, norm);
-    } else {
-        out = strdup(norm);
-    }
-    free(res);
+    free(x); free(y);
+    while (nr > 1 && r[nr - 1] == 0) nr--;
+    size_t cap = nr * 9 + 3;
+    char *out = xmalloc(cap);
+    char *w = out;
+    if (negative) *w++ = '-';
+    w += sprintf(w, "%u", r[nr - 1]);
+    for (size_t i = nr - 1; i-- > 0;) w += sprintf(w, "%09u", r[i]);
+    free(r);
     return out;
 }
 static char *big_negate(const char *s){
@@ -1601,6 +1615,19 @@ static char *big_negate(const char *s){
     return out;
 }
 static char *big_pow(const char *base, long exp){
+    /* refuse results whose size makes completion impossible in practice
+     * (the host crashes with SIGFPE in this region); failing with a
+     * diagnostic beats hanging or dying by signal */
+    if (exp > 0) {
+        const char *abs_base = big_abs(base);
+        if (strcmp(abs_base, "0") && strcmp(abs_base, "1")) {
+            size_t nd = strlen(abs_base);
+            char head[16]; size_t take = nd < 15 ? nd : 15;
+            memcpy(head, abs_base, take); head[take] = 0;
+            double approx = (double)((long)nd - (long)take) + log10((double)atoll(head));
+            if (approx * (double)exp > 10000000.0) die("pow: result too large");
+        }
+    }
     char *result = strdup("1");
     char *b = strdup(base);
     while (exp){

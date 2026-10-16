@@ -191,7 +191,16 @@ print spin #red 90
 print spin #123456 45
 print spin #123456 (neg 45)
 EOF
-for reg in reg_floats reg_propagate reg_branch reg_slice reg_predicates; do
+cat > "$WORK/reg_pow.art" <<'EOF'
+print 2 ^ 100
+print (neg 3) ^ 77
+print 99999999999999999999 * 88888888888888888888
+print size (to :string (2 ^ 100000))
+print 1 ^ 999999999
+print 0 ^ 99999
+print (neg 1) ^ 999999999
+EOF
+for reg in reg_floats reg_propagate reg_branch reg_slice reg_predicates reg_pow; do
     src="$WORK/$reg.art"
     if ! ./bin/arturoc "$src" "$WORK/p" >"$WORK/c.log" 2>&1; then bad "compile $reg: $(cat "$WORK/c.log")"; continue; fi
     if run3 "$src" "$WORK/p"; then ok; else bad "parity $reg"; fi
