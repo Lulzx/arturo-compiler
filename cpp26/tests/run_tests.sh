@@ -51,8 +51,8 @@ while read -r name; do
     src="$ROOT/corpus/$name.art"
     ./bin/arturoc -O0 "$src" "$WORK/p0" >/dev/null 2>&1 || { bad "compile -O0 $name"; continue; }
     ./bin/arturoc -O1 "$src" "$WORK/p1" >/dev/null 2>&1 || { bad "compile -O1 $name"; continue; }
-    (cd "$WORK" && ./p0 >o0.out 2>o0.err); s0=$?
-    (cd "$WORK" && ./p1 >o1.out 2>o1.err); s1=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./p0 >o0.out 2>o0.err); s0=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./p1 >o1.out 2>o1.err); s1=$?
     if cmp -s "$WORK/o0.out" "$WORK/o1.out" && cmp -s "$WORK/o0.err" "$WORK/o1.err" && [ "$s0" = "$s1" ]; then ok; else bad "optimizer divergence $name"; fi
 done < tests/owned-corpus.txt
 
@@ -84,7 +84,7 @@ echo "== compat exceptions match the original native compiler =="
 for src in "$ROOT"/compat/*.art; do
     name=$(basename "$src" .art)
     if ! ./bin/arturoc "$src" "$WORK/p" >"$WORK/c.log" 2>&1; then bad "compile compat $name: $(cat "$WORK/c.log")"; continue; fi
-    (cd "$WORK" && ./p > compat.out 2>compat.err)
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./p > compat.out 2>compat.err)
     if cmp -s "$WORK/compat.out" "$ROOT/compat/$name.out"; then ok; else bad "compat $name"; fi
 done
 
@@ -102,7 +102,7 @@ printf 'print definitelyUnboundName123\n' > "$WORK/invalid.art"
 "$ARTURO" --no-color "$WORK/invalid.art" >/dev/null 2>&1; hs=$?
 ./bin/arturoc "$WORK/invalid.art" "$WORK/invalid-bin" >/dev/null 2>&1 || { bad "invalid program did not compile"; hs=0; }
 if [ "${hs:-0}" != "0" ]; then
-    (cd "$WORK" && ./invalid-bin >/dev/null 2>&1); ns=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./invalid-bin >/dev/null 2>&1); ns=$?
     if [ "$ns" != "0" ] && [ "$ns" -lt 128 ]; then ok; else bad "invalid program exit status $ns"; fi
 fi
 
@@ -210,8 +210,8 @@ for reg in reg_floats reg_propagate reg_branch reg_slice reg_predicates reg_pow;
     if run3 "$src" "$WORK/p"; then ok; else bad "parity $reg"; fi
     ./bin/arturoc -O0 "$src" "$WORK/p0" >/dev/null 2>&1 || { bad "compile -O0 $reg"; continue; }
     ./bin/arturoc -O1 "$src" "$WORK/p1" >/dev/null 2>&1 || { bad "compile -O1 $reg"; continue; }
-    (cd "$WORK" && ./p0 >o0.out 2>o0.err); s0=$?
-    (cd "$WORK" && ./p1 >o1.out 2>o1.err); s1=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./p0 >o0.out 2>o0.err); s0=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./p1 >o1.out 2>o1.err); s1=$?
     if cmp -s "$WORK/o0.out" "$WORK/o1.out" && cmp -s "$WORK/o0.err" "$WORK/o1.err" && [ "$s0" = "$s1" ]; then ok; else bad "optimizer divergence $reg"; fi
 done
 cat > "$WORK/reg_direct.art" <<'EOF'
@@ -254,8 +254,8 @@ done
 # intentionally differs (see CONTRACT.md SS7), so only stdout/status compare.
 printf 'print "before"\nprint slice [1 2 3 4 5] 3 0\nprint "after"\n' > "$WORK/reg_slice_err.art"
 if ./bin/arturoc "$WORK/reg_slice_err.art" "$WORK/p" >"$WORK/c.log" 2>&1; then
-    (cd "$WORK" && "$ARTURO" --no-color reg_slice_err.art >host.out 2>/dev/null); hs=$?
-    (cd "$WORK" && ./p >new.out 2>/dev/null); ns=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} "$ARTURO" --no-color reg_slice_err.art >host.out 2>/dev/null); hs=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./p >new.out 2>/dev/null); ns=$?
     if [ "$hs" != "0" ] && [ "$ns" != "0" ] && [ "$ns" -lt 128 ] && cmp -s "$WORK/host.out" "$WORK/new.out"; then ok; else bad "slice reversed-block error (host=$hs cpp=$ns)"; fi
 else bad "compile reg_slice_err: $(cat "$WORK/c.log")"; fi
 
@@ -264,7 +264,7 @@ else bad "compile reg_slice_err: $(cat "$WORK/c.log")"; fi
 # without a signal. Error text differs, so only the status is compared.
 printf 'print future? 123\n' > "$WORK/reg_future.art"
 if ./bin/arturoc "$WORK/reg_future.art" "$WORK/p" >"$WORK/c.log" 2>&1; then
-    (cd "$WORK" && ./p >/dev/null 2>&1); ns=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./p >/dev/null 2>&1); ns=$?
     if [ "$ns" != "0" ] && [ "$ns" -lt 128 ]; then ok; else bad "future? on non-future (status $ns)"; fi
 else bad "compile reg_future: $(cat "$WORK/c.log")"; fi
 
@@ -281,7 +281,7 @@ for backend in fast c direct; do
     if [ "$backend" = fast ]; then ./bin/arturoc "$WORK/errline.art" "$WORK/p" >"$WORK/c.log" 2>&1
     else ./bin/arturoc --backend=$backend "$WORK/errline.art" "$WORK/p" >"$WORK/c.log" 2>&1; fi
     if [ $? -ne 0 ]; then bad "compile errline ($backend): $(cat "$WORK/c.log")"; continue; fi
-    (cd "$WORK" && ./p >e.out 2>e.err); ns=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./p >e.out 2>e.err); ns=$?
     if [ "$ns" != "0" ] && [ "$ns" -lt 128 ] && grep -q "at .*/errline.art:4" "$WORK/e.err"; then ok; else bad "error line ($backend, status $ns): $(cat "$WORK/e.err")"; fi
 done
 
@@ -333,8 +333,8 @@ else bad "compile zipprog: $(cat "$WORK/c.log")"; fi
 echo "== cursor/goto escape bytes and browse opener (host vs compiled) =="
 printf 'cursor false\ncursor true\ngoto 10 15\ngoto 5 null\ngoto null 3\nprint "x"\n' > "$WORK/cg.art"
 if ./bin/arturoc "$WORK/cg.art" "$WORK/cgbin" >"$WORK/c.log" 2>&1; then
-    (cd "$WORK" && "$ARTURO" --no-color cg.art >cg.host 2>/dev/null)
-    (cd "$WORK" && ./cgbin >cg.cpp 2>/dev/null)
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} "$ARTURO" --no-color cg.art >cg.host 2>/dev/null)
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./cgbin >cg.cpp 2>/dev/null)
     if cmp -s "$WORK/cg.host" "$WORK/cg.cpp"; then ok; else bad "cursor/goto bytes"; fi
 else bad "compile cg: $(cat "$WORK/c.log")"; fi
 mkdir -p "$WORK/fakebin"
@@ -346,9 +346,9 @@ if ./bin/arturoc "$WORK/browse.art" "$WORK/browsebin" >"$WORK/c.log" 2>&1; then
     # the opener is launched without waiting; give its log a moment to land
     wait_log() { local i; for i in $(seq 1 40); do [ -s "$WORK/fakebin/log" ] && break; sleep 0.05; done; cat "$WORK/fakebin/log" 2>/dev/null; }
     rm -f "$WORK/fakebin/log"
-    (cd "$WORK" && PATH="$WORK/fakebin:$PATH" "$ARTURO" --no-color browse.art >b.host 2>/dev/null)
+    (cd "$WORK" && PATH="$WORK/fakebin:$PATH" ${TMO[@]+"${TMO[@]}"} "$ARTURO" --no-color browse.art >b.host 2>/dev/null)
     hostlog=$(wait_log); rm -f "$WORK/fakebin/log"
-    (cd "$WORK" && PATH="$WORK/fakebin:$PATH" ./browsebin >b.cpp 2>/dev/null)
+    (cd "$WORK" && PATH="$WORK/fakebin:$PATH" ${TMO[@]+"${TMO[@]}"} ./browsebin >b.cpp 2>/dev/null)
     cpplog=$(wait_log)
     if [ "$hostlog" = "$cpplog" ] && [ -n "$hostlog" ] && cmp -s "$WORK/b.host" "$WORK/b.cpp"; then ok; else bad "browse opener (host='$hostlog' cpp='$cpplog')"; fi
 else bad "compile browse: $(cat "$WORK/c.log")"; fi
@@ -356,7 +356,7 @@ else bad "compile browse: $(cat "$WORK/c.log")"; fi
 echo "== terminate signal semantics and execute.async failure (host-matching) =="
 printf 'pid: execute.async "sleep 5"\nprint "after"\n' > "$WORK/async.art"
 if ./bin/arturoc "$WORK/async.art" "$WORK/ab" >"$WORK/c.log" 2>&1; then
-    (cd "$WORK" && ./ab >/dev/null 2>&1); ns=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./ab >/dev/null 2>&1); ns=$?
     if [ "$ns" != "0" ] && [ "$ns" -lt 128 ]; then ok; else bad "execute.async should fail like the host (status $ns)"; fi
 else bad "compile async: $(cat "$WORK/c.log")"; fi
 sleep 30 & SL1=$!
@@ -364,9 +364,9 @@ printf 'terminate %s\nprint "done"\n' "$SL1" > "$WORK/term1.art"
 sleep 30 & SL2=$!
 printf 'terminate.code: 9 %s\nprint "done"\n' "$SL2" > "$WORK/term2.art"
 termok=1
-./bin/arturoc "$WORK/term1.art" "$WORK/tb1" >/dev/null 2>&1 && "$WORK/tb1" >/dev/null 2>&1 || termok=0
+./bin/arturoc "$WORK/term1.art" "$WORK/tb1" >/dev/null 2>&1 && ${TMO[@]+"${TMO[@]}"} "$WORK/tb1" >/dev/null 2>&1 || termok=0
 kill -0 $SL1 2>/dev/null || termok=0
-./bin/arturoc "$WORK/term2.art" "$WORK/tb2" >/dev/null 2>&1 && "$WORK/tb2" >/dev/null 2>&1 || termok=0
+./bin/arturoc "$WORK/term2.art" "$WORK/tb2" >/dev/null 2>&1 && ${TMO[@]+"${TMO[@]}"} "$WORK/tb2" >/dev/null 2>&1 || termok=0
 sleep 0.3
 kill -0 $SL2 2>/dev/null && termok=0
 kill $SL1 2>/dev/null; wait $SL1 2>/dev/null; wait $SL2 2>/dev/null
@@ -395,12 +395,12 @@ printf 'AIR1\001\000\000\000\001\310\000\000\000\000\000\000\001' > "$WORK/bad-o
 printf 'AIR1\001\000\000\000\001\001\000\143\000\000\000\000\001' > "$WORK/bad-con.air"
 printf 'AIR1\001\000\000\000\001\004\000\000\000\000\000\000\001' > "$WORK/bad-def.air"
 for bad_air in bad-op bad-con bad-def; do
-    ./bin/arturo-stub "$WORK/$bad_air.air" >"$WORK/s.out" 2>"$WORK/s.err"; ns=$?
+    ${TMO[@]+"${TMO[@]}"} ./bin/arturo-stub "$WORK/$bad_air.air" >"$WORK/s.out" 2>"$WORK/s.err"; ns=$?
     if [ "$ns" != "0" ] && [ "$ns" -lt 128 ] && [ -s "$WORK/s.err" ]; then ok; else bad "stub accepted or crashed on $bad_air (status $ns)"; fi
 done
 ./bin/arturoc --emit-ir "$WORK/valid.air" "$ROOT/corpus/05_functions.art" "$WORK/valid-bin" >/dev/null 2>&1
-(cd "$WORK" && "$CPP/bin/arturo-stub" valid.air > stub.out 2>stub.err); ss=$?
-(cd "$WORK" && ./valid-bin > bin.out 2>bin.err)
+(cd "$WORK" && ${TMO[@]+"${TMO[@]}"} "$CPP/bin/arturo-stub" valid.air > stub.out 2>stub.err); ss=$?
+(cd "$WORK" && ${TMO[@]+"${TMO[@]}"} ./valid-bin > bin.out 2>bin.err)
 if [ "$ss" = "0" ] && cmp -s "$WORK/stub.out" "$WORK/bin.out"; then ok; else bad "stub rejected or diverged on valid AIR"; fi
 
 echo "== CLI contract =="
