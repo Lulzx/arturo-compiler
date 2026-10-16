@@ -6,17 +6,14 @@
 # `unsupported` means compilation must reject the feature with a stable,
 # actionable diagnostic rather than failing later as an unknown function.
 __VerbosePackager	unavailable	unsupported
-browse	unavailable	unsupported
 cancel	unavailable	unsupported
 channel	unavailable	unsupported
 config	unavailable	unsupported
-cursor	unavailable	unsupported
 emit	unavailable	unsupported
 eval	unavailable	unsupported
 event	unavailable	unsupported
 failed?	unavailable	unsupported
 finished?	unavailable	unsupported
-goto	unavailable	unsupported
 info	unavailable	unsupported
 mail	unavailable	unsupported
 off	unavailable	unsupported

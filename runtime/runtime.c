@@ -3667,6 +3667,39 @@ static Value b_unplug(Env*e, Value*a, int n) {
     return v_null();
 }
 static Value b_socketp(Env*e, Value*a, int n){ return v_bool(a[0].k==V_SOCKET); }
+/* ---- terminal cursor / browser (host Io.nim + Net.nim semantics) -------- */
+static Value b_cursor(Env*e, Value*a, int n) {
+    if (a[0].k != V_BOOL) die("cursor: expected a logical");
+    fputs(a[0].u.b ? "\x1b[?25h" : "\x1b[?25l", stdout); fflush(stdout);
+    return v_null();
+}
+static Value b_goto(Env*e, Value*a, int n) {
+    int has_x = a[0].k == V_INT, has_y = a[1].k == V_INT;
+    if (!has_x && a[0].k != V_NULL) die("goto: expected integer or null coordinates");
+    if (!has_y && a[1].k != V_NULL) die("goto: expected integer or null coordinates");
+    if (has_x && has_y) printf("\x1b[%ld;%ldf", a[1].u.i + 1, a[0].u.i + 1);
+    else if (has_x) printf("\x1b[%ldG", a[0].u.i + 1);
+    /* y-only is a no-op in the host on non-Windows, as is null/null */
+    fflush(stdout);
+    return v_null();
+}
+static Value b_browse(Env*e, Value*a, int n) {
+    if (!IS_STRLIKE(a[0].k)) die("browse: expected a url string");
+#ifdef __APPLE__
+    const char *opener = "open";
+#else
+    const char *opener = "xdg-open";
+#endif
+    /* the host launches the OS opener without waiting for it */
+    pid_t pid = fork();
+    if (pid == 0) {
+        pid_t inner = fork();
+        if (inner == 0) { execlp(opener, opener, a[0].u.s, (char*)NULL); _exit(127); }
+        _exit(0);
+    }
+    if (pid > 0) { int status; while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {} }
+    return v_null();
+}
 static unsigned char *read_whole_file(const char *path, size_t *out_len);  /* zip section below */
 /* ---- HTTP client: request / download (host Net.nim semantics) ----------- */
 /* Transport is the system curl (present on macOS and mainstream Linux),
@@ -5305,6 +5338,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"send?",b_sendq},{"receive",b_receive},{"unplug",b_unplug},
     {"zip",b_zip},{"unzip",b_unzip},{"volume",b_volume},
     {"request",b_request},{"download",b_download},
+    {"cursor",b_cursor},{"goto",b_goto},{"browse",b_browse},
     {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
     {"lower?",b_lowerp},{"upper?",b_upperp},{"numeric?",b_numericp},
     {"prefix?",b_prefixp},{"suffix?",b_suffixp},{"between?",b_betweenp},{"same?",b_samep},

@@ -312,6 +312,29 @@ if ./bin/arturoc "$WORK/zipprog.art" "$WORK/zipbin" >"$WORK/c.log" 2>&1; then
     if [ "$zipok" -eq 1 ]; then ok; else bad "zip/unzip/volume parity"; fi
 else bad "compile zipprog: $(cat "$WORK/c.log")"; fi
 
+echo "== cursor/goto escape bytes and browse opener (host vs compiled) =="
+printf 'cursor false\ncursor true\ngoto 10 15\ngoto 5 null\ngoto null 3\nprint "x"\n' > "$WORK/cg.art"
+if ./bin/arturoc "$WORK/cg.art" "$WORK/cgbin" >"$WORK/c.log" 2>&1; then
+    (cd "$WORK" && "$ARTURO" --no-color cg.art >cg.host 2>/dev/null)
+    (cd "$WORK" && ./cgbin >cg.cpp 2>/dev/null)
+    if cmp -s "$WORK/cg.host" "$WORK/cg.cpp"; then ok; else bad "cursor/goto bytes"; fi
+else bad "compile cg: $(cat "$WORK/c.log")"; fi
+mkdir -p "$WORK/fakebin"
+printf '#!/bin/sh\necho "OPENER: $@" >> "%s/fakebin/log"\n' "$WORK" > "$WORK/fakebin/open"
+printf '#!/bin/sh\necho "OPENER: $@" >> "%s/fakebin/log"\n' "$WORK" > "$WORK/fakebin/xdg-open"
+chmod +x "$WORK/fakebin/open" "$WORK/fakebin/xdg-open"
+printf 'browse "https://example.com/page"\nprint "after"\n' > "$WORK/browse.art"
+if ./bin/arturoc "$WORK/browse.art" "$WORK/browsebin" >"$WORK/c.log" 2>&1; then
+    # the opener is launched without waiting; give its log a moment to land
+    wait_log() { local i; for i in $(seq 1 40); do [ -s "$WORK/fakebin/log" ] && break; sleep 0.05; done; cat "$WORK/fakebin/log" 2>/dev/null; }
+    rm -f "$WORK/fakebin/log"
+    (cd "$WORK" && PATH="$WORK/fakebin:$PATH" "$ARTURO" --no-color browse.art >b.host 2>/dev/null)
+    hostlog=$(wait_log); rm -f "$WORK/fakebin/log"
+    (cd "$WORK" && PATH="$WORK/fakebin:$PATH" ./browsebin >b.cpp 2>/dev/null)
+    cpplog=$(wait_log)
+    if [ "$hostlog" = "$cpplog" ] && [ -n "$hostlog" ] && cmp -s "$WORK/b.host" "$WORK/b.cpp"; then ok; else bad "browse opener (host='$hostlog' cpp='$cpplog')"; fi
+else bad "compile browse: $(cat "$WORK/c.log")"; fi
+
 echo "== HTTP parity: request/download vs local server (host vs compiled) =="
 if ARTURO_HOST="$ARTURO" python3 tests/http_test.py "$WORK" >"$WORK/http.log" 2>&1; then ok; else bad "http parity: $(cat "$WORK/http.log")"; fi
 

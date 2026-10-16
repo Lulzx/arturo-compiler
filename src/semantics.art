@@ -33,10 +33,9 @@ NOT_MUTATING: #[
 ; The C backend rejects direct calls during compilation with a stable error;
 ; they must never degrade into an unknown-function crash in generated code.
 UNSUPPORTED_INTRINSICS: #[
-    "__VerbosePackager": true "browse": true
+    "__VerbosePackager": true
     "cancel": true "channel": true "config": true
-    "cursor": true
-    "emit": true "eval": true "event": true "failed?": true "finished?": true "goto": true "info": true
+    "emit": true "eval": true "event": true "failed?": true "finished?": true "info": true
     "mail": true "off": true "on": true
     "serve": true "spin": true
     "stack": true "store": true
