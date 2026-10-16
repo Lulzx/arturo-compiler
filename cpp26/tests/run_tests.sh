@@ -174,7 +174,17 @@ print b
 slice 'b 1 3
 print b
 EOF
-for reg in reg_floats reg_propagate reg_branch reg_slice; do
+cat > "$WORK/reg_predicates.art" <<'EOF'
+print standalone?
+print superuser?
+print bytecode? "x"
+print bytecode? [1 2]
+print database? "x"
+print database? 123
+print socket? null
+print store? #[]
+EOF
+for reg in reg_floats reg_propagate reg_branch reg_slice reg_predicates; do
     src="$WORK/$reg.art"
     if ! ./bin/arturoc "$src" "$WORK/p" >"$WORK/c.log" 2>&1; then bad "compile $reg: $(cat "$WORK/c.log")"; continue; fi
     if run3 "$src" "$WORK/p"; then ok; else bad "parity $reg"; fi
@@ -226,6 +236,15 @@ if ./bin/arturoc "$WORK/reg_slice_err.art" "$WORK/p" >"$WORK/c.log" 2>&1; then
     (cd "$WORK" && ./p >new.out 2>/dev/null); ns=$?
     if [ "$hs" != "0" ] && [ "$ns" != "0" ] && [ "$ns" -lt 128 ] && cmp -s "$WORK/host.out" "$WORK/new.out"; then ok; else bad "slice reversed-block error (host=$hs cpp=$ns)"; fi
 else bad "compile reg_slice_err: $(cat "$WORK/c.log")"; fi
+
+# `future?` type-errors on every value a compiled program can hold (no
+# future can be constructed); host and compiled must both fail nonzero
+# without a signal. Error text differs, so only the status is compared.
+printf 'print future? 123\n' > "$WORK/reg_future.art"
+if ./bin/arturoc "$WORK/reg_future.art" "$WORK/p" >"$WORK/c.log" 2>&1; then
+    (cd "$WORK" && ./p >/dev/null 2>&1); ns=$?
+    if [ "$ns" != "0" ] && [ "$ns" -lt 128 ]; then ok; else bad "future? on non-future (status $ns)"; fi
+else bad "compile reg_future: $(cat "$WORK/c.log")"; fi
 
 echo "== runtime errors carry the source line (all backends) =="
 cat > "$WORK/errline.art" <<'EOF'

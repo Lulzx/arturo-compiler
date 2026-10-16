@@ -34,13 +34,13 @@ NOT_MUTATING: #[
 ; they must never degrade into an unknown-function crash in generated code.
 UNSUPPORTED_INTRINSICS: #[
     "__VerbosePackager": true "accept": true "browse": true
-    "bytecode?": true "cancel": true "channel": true "config": true
-    "connect": true "cursor": true "database?": true "download": true
-    "emit": true "eval": true "event": true "failed?": true "finished?": true "future?": true "goto": true "info": true
+    "cancel": true "channel": true "config": true
+    "connect": true "cursor": true "download": true
+    "emit": true "eval": true "event": true "failed?": true "finished?": true "goto": true "info": true
     "listen": true "mail": true "off": true "on": true
     "permissions": true "receive": true "request": true "send": true
-    "send?": true "serve": true "socket?": true "spin": true
-    "stack": true "standalone?": true "store": true "store?": true "superuser?": true
+    "send?": true "serve": true "spin": true
+    "stack": true "store": true
     "terminal": true "terminate": true "unplug": true "unstack": true "unzip": true
     "volume": true "zip": true
 ]

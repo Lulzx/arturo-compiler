@@ -3475,6 +3475,15 @@ static Value v_block_cpy(Value **items, int n){
 }
 
 /* ---- scalar/text/token predicates --------------------------------------- */
+/* Environment predicates whose host answers are determined for every value
+ * a compiled program can hold: external handles (database/socket/store) and
+ * bytecode values can never be constructed here, so their predicates are
+ * constantly false; a compiled program is always standalone; `future?`
+ * type-errors on any non-future, and no future can exist here. */
+static Value b_standalonep(Env*e,Value*a,int n){ return v_bool(1); }
+static Value b_superuserp(Env*e,Value*a,int n){ return v_bool(geteuid()==0); }
+static Value b_false_always(Env*e,Value*a,int n){ return v_bool(0); }
+static Value b_futurep(Env*e,Value*a,int n){ die("future?: expected a future value"); return v_null(); }
 static Value b_truep(Env*e,Value*a,int n){ return v_bool(a[0].k==V_BOOL && a[0].u.b); }
 static Value b_falsep(Env*e,Value*a,int n){ return v_bool(a[0].k==V_BOOL && !a[0].u.b); }
 static Value b_onep(Env*e,Value*a,int n){
@@ -4693,6 +4702,8 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"type?",b_typep},{"version?",b_versionp},{"errorKind?",b_errorkindp},{"inline?",b_inlinep},{"path?",b_pathp},{"pathLabel?",b_pathlabelp},
     {"pathLiteral?",b_pathliteralp},{"regex?",b_regexp},{"attribute?",b_attributep},
     {"attributeLabel?",b_attributelabelp},{"true?",b_truep},{"false?",b_falsep},
+    {"standalone?",b_standalonep},{"superuser?",b_superuserp},{"bytecode?",b_false_always},
+    {"database?",b_false_always},{"socket?",b_false_always},{"store?",b_false_always},{"future?",b_futurep},
     {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
     {"lower?",b_lowerp},{"upper?",b_upperp},{"numeric?",b_numericp},
     {"prefix?",b_prefixp},{"suffix?",b_suffixp},{"between?",b_betweenp},{"same?",b_samep},
