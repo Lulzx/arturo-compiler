@@ -32,8 +32,8 @@ if command -v timeout >/dev/null 2>&1; then TMO=(timeout 60); fi
 run3() { # run3 <file> <bin> : compare host vs bin on stdout/stderr/status
     local src=$1 bin=$2
     echo "TEST run3 $src"
-    (cd "$WORK" && "${TMO[@]}" "$ARTURO" --no-color "$src" >host.out 2>host.err); local hs=$?
-    (cd "$WORK" && env ARTURO_NO_COLOR=1 "${TMO[@]}" "$bin" >new.out 2>new.err); local ns=$?
+    (cd "$WORK" && ${TMO[@]+"${TMO[@]}"} "$ARTURO" --no-color "$src" >host.out 2>host.err); local hs=$?
+    (cd "$WORK" && env ARTURO_NO_COLOR=1 ${TMO[@]+"${TMO[@]}"} "$bin" >new.out 2>new.err); local ns=$?
     cmp -s "$WORK/host.out" "$WORK/new.out" && cmp -s "$WORK/host.err" "$WORK/new.err" && [ "$hs" = "$ns" ]
 }
 
