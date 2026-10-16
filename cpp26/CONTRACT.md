@@ -127,7 +127,7 @@ exactly (division by zero, overflow beyond `int64`, exotic kinds).
 
 - Compile-time rejection, with a stable diagnostic and no output
   executable, for the original's intentionally unavailable capabilities
-  (the 22 declarations classified `unsupported` in
+  (the 17 declarations classified `unsupported` in
   `../config/intrinsic-policy.tsv`: sockets, servers, databases, GUI,
   `eval`, and friends). arturoc's diagnostic is
   `unsupported standalone capability: <name>`.
