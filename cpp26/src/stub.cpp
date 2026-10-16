@@ -139,7 +139,7 @@ IR* withAttrs(IR* node, const air::Node& n) {
     return ir_attrs(node, names.data(), values.data(), static_cast<int>(names.size()));
 }
 
-IR* build(std::uint32_t id) {
+IR* buildNode(std::uint32_t id) {
     const air::Node& n = g_prog.nodes[id];
     switch (n.op) {
         case air::Op::Const: return ir_const(constValue(g_prog.consts[n.con]));
@@ -216,6 +216,12 @@ IR* build(std::uint32_t id) {
             return withAttrs(node, n);
         }
     }
+}
+
+IR* build(std::uint32_t id) {
+    IR* node = buildNode(id);
+    if (node && g_prog.nodes[id].line > 0) node->line = static_cast<int>(g_prog.nodes[id].line);
+    return node;
 }
 
 std::string selfPath(const char* argv0) {

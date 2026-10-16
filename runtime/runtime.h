@@ -159,6 +159,7 @@ struct IR {
     int          builtin;    /* intrinsic: BUILTINS index, -1 if unknown (runtime-private) */
     int          arity;      /* intrinsic: declared arity, -1 if none (runtime-private) */
     int          literal;    /* load/word: 1 true, 2 false, 3 null, 4 runtimeError (runtime-private) */
+    int          line;       /* 1-based source line, 0 = unknown */
 };
 
 IR *ir_const(Value v);
@@ -178,6 +179,7 @@ IR *ir_op_attrs(const char *op, IR **args, int n, const char **names, IR **value
 IR *ir_higher(const char *name, IR *collection, IR *params, IR *body,
               const char **names, IR **values, int nattrs);
 IR *ir_seq(IR **items, int n);                 /* internal __seq of statements */
+IR *ir_line(IR *node, int line);               /* attach a source line, returns node */
 
 /* ---- evaluation -------------------------------------------------------- */
 /* Process-lifetime arena used by runtime values and generated direct code.
@@ -186,6 +188,7 @@ void *runtime_alloc(size_t size);
 void runtime_cleanup(void);
 void runtime_set_args(int argc, char **argv);
 void runtime_set_source(const char *path);
+void rt_set_line(int line);           /* generated code: current source line for diagnostics */
 Value runSeq(Env *e, IR **seq, int n);
 Value runNode(Env *e, IR *node);
 

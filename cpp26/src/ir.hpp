@@ -79,6 +79,7 @@ struct Node {
     std::uint32_t name = 0xFFFFFFFFu;  // string pool index or kNone
     std::uint32_t con = 0xFFFFFFFFu;   // constant pool index or kNone
     std::uint32_t aux = 0;             // Block: 1 = raw [...] data, 0 = @[...]
+    std::uint32_t line = 0;            // 1-based source line, 0 = unknown
     std::vector<std::uint32_t> kids;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> attrs;  // (name, kid)
     std::vector<std::uint32_t> names;  // Params: parameter name indices
@@ -127,7 +128,12 @@ struct Program {
         constIndex.emplace(std::move(key), id);
         return id;
     }
+    // Source line the emitter is currently lowering; stamped onto new nodes
+    // that do not carry an explicit line (synthesized nodes inherit the
+    // enclosing construct's line).
+    std::uint32_t curLine = 0;
     std::uint32_t addNode(Node n) {
+        if (n.line == 0) n.line = curLine;
         auto id = static_cast<std::uint32_t>(nodes.size());
         nodes.push_back(std::move(n));
         return id;

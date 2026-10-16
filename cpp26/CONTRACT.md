@@ -135,7 +135,9 @@ exactly (division by zero, overflow beyond `int64`, exotic kinds).
   fail with a nonzero exit status and no signal in both engines. Exact
   host diagnostic *formatting* (fancy panels, source spans, Arturo-level
   stack frames) is a tooling surface the original also lists as partial;
-  it is not part of this contract.
+  it is not part of this contract. arturoc runtime errors do identify the
+  failing statement as `file:line` on all three backends (per-node source
+  lines in AIR format v2; v1 payloads remain readable with no line).
 
 ## 8. Documented host-defect exception (tested, not excluded)
 

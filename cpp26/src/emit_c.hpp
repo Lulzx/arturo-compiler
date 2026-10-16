@@ -169,6 +169,12 @@ class CEmitter {
         return "ir_attrs(" + base + ", (const char*[]){" + names + "}, (IR*[]){" + vals + "}, " + cnt + ")";
     }
     std::string node(std::uint32_t id) {
+        std::string inner = nodeImpl(id);
+        const air::Node& n = p_.nodes[id];
+        if (n.line > 0) return "ir_line(" + inner + ", " + std::to_string(n.line) + ")";
+        return inner;
+    }
+    std::string nodeImpl(std::uint32_t id) {
         const air::Node& n = p_.nodes[id];
         using O = air::Op;
         switch (n.op) {

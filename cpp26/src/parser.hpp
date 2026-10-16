@@ -40,15 +40,18 @@ inline GPtr gLeaf(Token t) {
     g->kind = GNode::Kind::Leaf; g->token = std::move(t);
     return g;
 }
-inline GPtr gName(const std::string& name, bool intrinsic) {
+inline GPtr gName(const std::string& name, bool intrinsic, int line = 0) {
     auto g = std::make_shared<GNode>();
     g->kind = GNode::Kind::Leaf; g->name = name; g->intrinsic = intrinsic;
     g->token.kind = TK::Word; g->token.text = name;
+    if (line > 0) g->token.line = line;
     return g;
 }
 inline GPtr gCall(GPtr fn, std::vector<GPtr> args = {}) {
     auto g = std::make_shared<GNode>();
-    g->kind = GNode::Kind::Call; g->fn = std::move(fn); g->args = std::move(args);
+    g->kind = GNode::Kind::Call;
+    if (fn) g->token = fn->token;  // a call starts at its callee's line
+    g->fn = std::move(fn); g->args = std::move(args);
     return g;
 }
 
@@ -84,11 +87,11 @@ class Grouper {
     std::string emitName(const std::string& n) const {
         return shadowed_.count(n) ? "_shadow_" + n : n;
     }
-    GPtr wordNode(const std::string& name) {
-        if (shadowed_.count(name)) return gName("_shadow_" + name, false);
-        if (callableShadowed_.count(name)) return gName(name, false);
-        if (builtins_.count(name)) return gName(name, true);
-        return gName(name, false);
+    GPtr wordNode(const std::string& name, int line = 0) {
+        if (shadowed_.count(name)) return gName("_shadow_" + name, false, line);
+        if (callableShadowed_.count(name)) return gName(name, false, line);
+        if (builtins_.count(name)) return gName(name, true, line);
+        return gName(name, false, line);
     }
     static std::string calleeName(const GPtr& fn) {
         return fn && fn->kind == GNode::Kind::Leaf ? fn->name : std::string();
@@ -175,7 +178,7 @@ class Grouper {
             const Token el = toks[i];
             if (el.kind == TK::Label || el.kind == TK::LabelStr) {
                 auto d = std::make_shared<GNode>();
-                d->kind = GNode::Kind::Define; d->name = el.text;
+                d->kind = GNode::Kind::Define; d->name = el.text; d->token = el;
                 descend(d, 1);
             } else if (el.kind == TK::Word) {
                 const std::string name = el.text;
@@ -183,9 +186,9 @@ class Grouper {
                     appendInfixAware(gLeaf(el), toks, i);
                 } else {
                     int ar = arityOf(name);
-                    if (ar > 0) descend(gCall(wordNode(name)), ar);
-                    else if (ar == 0) appendInfixAware(gCall(wordNode(name)), toks, i);
-                    else appendInfixAware(wordNode(name), toks, i);
+                    if (ar > 0) descend(gCall(wordNode(name, el.line)), ar);
+                    else if (ar == 0) appendInfixAware(gCall(wordNode(name, el.line)), toks, i);
+                    else appendInfixAware(wordNode(name, el.line), toks, i);
                 }
             } else if (el.kind == TK::Symbol) {
                 handleSymbol(el, toks, i, stack, roots, rewind, descend, appendValue, appendInfixAware);
@@ -289,7 +292,7 @@ class Grouper {
         return gLeaf(t);
     }
     GPtr pathGet(const Token& el) {
-        GPtr node = wordNode(el.segs.empty() ? el.text : el.segs[0].name);
+        GPtr node = wordNode(el.segs.empty() ? el.text : el.segs[0].name, el.line);
         for (std::size_t j = 1; j < el.segs.size(); ++j) {
             const char* getter = j + 1 == el.segs.size() ? "pathGet" : "get";
             node = gCall(gName(getter, true), {node, segNode(el.segs[j])});
@@ -297,7 +300,7 @@ class Grouper {
         return node;
     }
     GPtr pathSetFrame(const Token& el) {
-        GPtr node = wordNode(el.segs.empty() ? el.text : el.segs[0].name);
+        GPtr node = wordNode(el.segs.empty() ? el.text : el.segs[0].name, el.line);
         for (std::size_t j = 1; j + 1 < el.segs.size(); ++j)
             node = gCall(gName("get", true), {node, segNode(el.segs[j])});
         GPtr last = el.segs.size() > 1 ? segNode(el.segs.back()) : gLeaf(el);

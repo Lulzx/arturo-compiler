@@ -153,7 +153,7 @@ const char* opName(Op op) {
 
 void writeProgram(const Program& p, std::vector<std::uint8_t>& out) {
     out.insert(out.end(), {'A', 'I', 'R', '1'});
-    putVar(out, 1);  // format version
+    putVar(out, 2);  // format version (2: per-node source lines)
     putStr(out, p.sourcePath);
     putVar(out, p.strings.size());
     for (const auto& s : p.strings) putStr(out, s);
@@ -171,6 +171,7 @@ void writeProgram(const Program& p, std::vector<std::uint8_t>& out) {
         for (auto& a : nd.attrs) { putVar(out, a.first); putVar(out, a.second); }
         putVar(out, nd.names.size());
         for (auto nm : nd.names) putVar(out, nm);
+        putVar(out, nd.line);
     }
     putVar(out, p.root == kNone ? 0 : static_cast<std::uint64_t>(p.root) + 1);
 }
@@ -179,7 +180,8 @@ bool readProgram(const std::uint8_t* data, std::size_t size, Program& p, std::st
     if (size < 4 || std::memcmp(data, "AIR1", 4) != 0) { err = "bad AIR1 magic"; return false; }
     Reader r{data + 4, size - 4, 0};
     std::uint64_t v;
-    if (!r.var(v) || v != 1) { err = "unsupported AIR version"; return false; }
+    if (!r.var(v) || (v != 1 && v != 2)) { err = "unsupported AIR version"; return false; }
+    const bool hasLines = v == 2;
     if (!r.str(p.sourcePath)) { err = "truncated source path"; return false; }
     auto count = [&](std::uint64_t& c) { return r.var(c) && c <= 10'000'000; };
     if (!count(v)) { err = "bad string pool"; return false; }
@@ -211,6 +213,7 @@ bool readProgram(const std::uint8_t* data, std::size_t size, Program& p, std::st
         if (!count(x)) return false;
         nd.names.resize(static_cast<std::size_t>(x));
         for (auto& nm : nd.names) { if (!r.var(v)) return false; nm = static_cast<std::uint32_t>(v); }
+        if (hasLines) { if (!r.var(v)) return false; nd.line = static_cast<std::uint32_t>(v); }
     }
     if (!r.var(v)) { err = "missing root"; return false; }
     p.root = v == 0 ? kNone : static_cast<std::uint32_t>(v - 1);

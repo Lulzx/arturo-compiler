@@ -146,6 +146,7 @@ class DirectEmitter {
         std::string expr(std::string& out, std::uint32_t id) {
             const air::Program& p = d.p_;
             const auto& n = p.nodes[id];
+            if (n.line > 0) out += "\trt_set_line(" + std::to_string(n.line) + ");\n";
             std::string v = fresh();
             auto fallback = [&]() {
                 out += "\tValue " + v + " = runNode(e, " + d.ce_.expr(id) + ");\n";

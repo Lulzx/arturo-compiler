@@ -18,7 +18,7 @@ deterministically generated valid programs, and representative invalid cases.
 | Exceptions | Partial (`try`, `throw`, `throws?`, `error?`, `ensure`, `panic`) | Arturo-level stack frames and exact upstream diagnostic formatting remain |
 | Required portable Arturo value kinds | Corpus-proven | Rational, complex, quantity/unit, date, color, regex, binary, version, error-kind, and symbol-literal values are native; external handles such as stores remain explicitly unavailable |
 | I/O, networking, databases, GUI | Filesystem/process basics supported; 43 declarations intentionally unavailable | Keep compile-time rejection policy machine-checked; only add capabilities with portable implementations and effect tests |
-| Diagnostics/tooling | Partial | Native failures have filenames, stable stderr, and nonzero exits; source lines and Arturo-level stack frames remain |
+| Diagnostics/tooling | Partial | Native failures have filenames, stable stderr, and nonzero exits; arturoc runtime errors also carry the source line (AIR format v2) on all three backends; Arturo-level stack frames remain |
 
 ## Route to the whole language
 

@@ -227,6 +227,23 @@ if ./bin/arturoc "$WORK/reg_slice_err.art" "$WORK/p" >"$WORK/c.log" 2>&1; then
     if [ "$hs" != "0" ] && [ "$ns" != "0" ] && [ "$ns" -lt 128 ] && cmp -s "$WORK/host.out" "$WORK/new.out"; then ok; else bad "slice reversed-block error (host=$hs cpp=$ns)"; fi
 else bad "compile reg_slice_err: $(cat "$WORK/c.log")"; fi
 
+echo "== runtime errors carry the source line (all backends) =="
+cat > "$WORK/errline.art" <<'EOF'
+print "start"
+x: [1 2 3]
+f: function [v][
+    print slice v 3 0
+]
+f x
+EOF
+for backend in fast c direct; do
+    if [ "$backend" = fast ]; then ./bin/arturoc "$WORK/errline.art" "$WORK/p" >"$WORK/c.log" 2>&1
+    else ./bin/arturoc --backend=$backend "$WORK/errline.art" "$WORK/p" >"$WORK/c.log" 2>&1; fi
+    if [ $? -ne 0 ]; then bad "compile errline ($backend): $(cat "$WORK/c.log")"; continue; fi
+    (cd "$WORK" && ./p >e.out 2>e.err); ns=$?
+    if [ "$ns" != "0" ] && [ "$ns" -lt 128 ] && grep -q "at .*/errline.art:4" "$WORK/e.err"; then ok; else bad "error line ($backend, status $ns): $(cat "$WORK/e.err")"; fi
+done
+
 echo "== malformed AIR payloads rejected without a signal =="
 # Hand-crafted AIR1 streams: unknown opcode, out-of-range constant index,
 # and a define node with no expression. Each must exit nonzero, never by

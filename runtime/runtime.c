@@ -218,6 +218,7 @@ static char g_last_error[512];
 static char g_last_error_kind[256]="Runtime Error";
 static int g_custom_error_pending=0;
 static const char *g_source_path = NULL;
+static int g_cur_line = 0;   /* line of the IR node currently evaluating */
 /* source line mapping (diagnostics).  Built by the lexer pass below: one entry
  * per flat top-level element in the order `to :block` yields. */
 typedef struct { int *lines; int n; } LineMap;
@@ -248,7 +249,10 @@ static void die(const char *msg) {
         fprintf(stderr, "runtime error: %s\n", g_last_error);
     else
         fprintf(stderr, "runtime error (%s): %s\n", g_last_error_kind, g_last_error);
-    if(g_source_path&&*g_source_path)fprintf(stderr,"  at %s\n",g_source_path);
+    if(g_source_path&&*g_source_path){
+        if(g_cur_line>0)fprintf(stderr,"  at %s:%d\n",g_source_path,g_cur_line);
+        else fprintf(stderr,"  at %s\n",g_source_path);
+    }
     if(getenv("ARTURO_NATIVE_TRACE")){void *frames[64];int count=backtrace(frames,64);backtrace_symbols_fd(frames,count,2);}
     exit(1);
 }
@@ -1295,6 +1299,7 @@ IR *ir_higher(const char *name,IR *collection,IR *params,IR *body,const char **n
 }
 /* a seq: internal __seq node wrapping a list of statements */
 IR *ir_seq(IR **items, int n){ IR*x=ir_new("__seq"); x->args=ir_copy_nodes(items,n); x->nargs=n; return x; }
+IR *ir_line(IR *node, int line){ if(node&&line>0)node->line=line; return node; }
 
 /* ---- return / break signals ------------------------------------------------------- */
 static int   rt_ret_set = 0;
@@ -4577,6 +4582,7 @@ static int  g_argc = 0;
 static char **g_argv = NULL;
 void runtime_set_args(int argc, char **argv){ g_argc = argc; g_argv = argv; }
 void runtime_set_source(const char *path){g_source_path=path;}
+void rt_set_line(int line){g_cur_line=line;}
 
 static Value dict_from_pairs(const char **names,Value *vals,int n){char **keys=xmalloc((size_t)n*sizeof(char*));Value *out=xmalloc((size_t)n*sizeof(Value));for(int i=0;i<n;i++){keys[i]=strdup(names[i]);out[i]=vals[i];}return v_dict(keys,out,n);}
 static Value b_prints(Env*e,Value*a,int n){(void)e;(void)n;print_scalar(a[0]);fflush(stdout);return v_null();}
@@ -5443,6 +5449,7 @@ static int define_self_append(Env *e, const char *name, IR *rhs, int is_let, Val
 
 static Value runNode0(Env *e, IR *node) {
     if (!node) return v_null();
+    if (node->line > 0) g_cur_line = node->line;
     if (!node->op) return node->v;   /* a raw constant */
 
     switch (node->opcode) {

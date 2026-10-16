@@ -24,6 +24,7 @@ class Emitter {
     std::uint32_t emitProgram(const std::vector<GPtr>& roots) {
         auto seq = emitSeq(roots);
         p_.root = seq;
+        p_.curLine = 0;  // optimizer-synthesized nodes have no source line
         return seq;
     }
     std::uint32_t emitSeq(const std::vector<GPtr>& roots) {
@@ -32,12 +33,27 @@ class Emitter {
         return p_.make(air::Op::Seq, std::move(kids));
     }
 
+    static std::uint32_t lineOf(const GPtr& g) {
+        if (!g) return 0;
+        if (g->kind == GNode::Kind::Call && g->fn) return lineOf(g->fn);
+        return static_cast<std::uint32_t>(g->token.line > 0 ? g->token.line : 0);
+    }
+
     std::uint32_t emit(const GPtr& g) {
         // The call tree is walked recursively (as are the optimizer and the
         // stub's IR builder downstream); reject pathological nesting with a
         // diagnostic instead of overflowing the stack.
         if (++depth_ > 8192) throw CompileError("expression nested too deeply (limit 8192)");
         struct DepthGuard { int& d; ~DepthGuard() { --d; } } guard{depth_};
+        // Nodes created while lowering this construct carry its source line,
+        // so runtime errors can point at the failing statement.
+        struct LineGuard {
+            air::Program& p; std::uint32_t prev;
+            LineGuard(air::Program& pr, std::uint32_t line) : p(pr), prev(pr.curLine) {
+                if (line) p.curLine = line;
+            }
+            ~LineGuard() { p.curLine = prev; }
+        } lineGuard{p_, lineOf(g)};
         switch (g->kind) {
             case GNode::Kind::Define: {
                 std::uint32_t expr = g->args.empty() ? constNull() : emit(g->args[0]);
