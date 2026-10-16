@@ -25,7 +25,6 @@ listen	unavailable	unsupported
 mail	unavailable	unsupported
 off	unavailable	unsupported
 on	unavailable	unsupported
-permissions	unavailable	unsupported
 receive	unavailable	unsupported
 request	unavailable	unsupported
 send	unavailable	unsupported
@@ -34,7 +33,6 @@ serve	unavailable	unsupported
 spin	unavailable	unsupported
 stack	unavailable	unsupported
 store	unavailable	unsupported
-terminal	unavailable	unsupported
 terminate	unavailable	unsupported
 unplug	unavailable	unsupported
 unstack	unavailable	unsupported

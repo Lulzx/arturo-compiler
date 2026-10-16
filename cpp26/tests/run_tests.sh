@@ -183,6 +183,10 @@ print database? "x"
 print database? 123
 print socket? null
 print store? #[]
+print permissions "reg_predicates.art"
+print permissions "definitely-not-here-12345"
+print get terminal 'width
+print type terminal
 EOF
 for reg in reg_floats reg_propagate reg_branch reg_slice reg_predicates; do
     src="$WORK/$reg.art"

@@ -20,6 +20,7 @@
 #include <ctype.h>
 #include <setjmp.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <time.h>
 #include <regex.h>
@@ -3480,6 +3481,31 @@ static Value v_block_cpy(Value **items, int n){
  * bytecode values can never be constructed here, so their predicates are
  * constantly false; a compiled program is always standalone; `future?`
  * type-errors on any non-future, and no future can exist here. */
+static Value b_permissions(Env*e,Value*a,int n){
+    if(!IS_STRLIKE(a[0].k)) die("permissions: expected a path");
+    struct stat st; if(stat(a[0].u.s,&st)!=0) return v_null();
+    const char *who[3]={"user","group","others"};
+    unsigned bits[3]={(unsigned)(st.st_mode>>6)&7u,(unsigned)(st.st_mode>>3)&7u,(unsigned)st.st_mode&7u};
+    char **keys=xmalloc(3*sizeof(char*)); Value *vals=xmalloc(3*sizeof(Value));
+    for(int i=0;i<3;i++){
+        char **ik=xmalloc(3*sizeof(char*)); Value *iv=xmalloc(3*sizeof(Value));
+        const char *nm[3]={"read","write","execute"};
+        for(int j=0;j<3;j++){ ik[j]=strdup(nm[j]); iv[j]=v_bool((bits[i]>>(2-j))&1u); }
+        keys[i]=strdup(who[i]); vals[i]=v_dict(ik,iv,3);
+    }
+    return v_dict(keys,vals,3);
+}
+static Value b_terminal(Env*e,Value*a,int n){
+    int width=80, height=0;
+#ifdef TIOCGWINSZ
+    struct winsize ws; memset(&ws,0,sizeof ws);
+    if(ioctl(STDOUT_FILENO,TIOCGWINSZ,&ws)==0 && ws.ws_col>0){ width=ws.ws_col; height=ws.ws_row; }
+#endif
+    char **keys=xmalloc(2*sizeof(char*)); Value *vals=xmalloc(2*sizeof(Value));
+    keys[0]=strdup("width"); vals[0]=v_int(width);
+    keys[1]=strdup("height"); vals[1]=v_int(height);
+    return v_dict(keys,vals,2);
+}
 static Value b_standalonep(Env*e,Value*a,int n){ return v_bool(1); }
 static Value b_superuserp(Env*e,Value*a,int n){ return v_bool(geteuid()==0); }
 static Value b_false_always(Env*e,Value*a,int n){ return v_bool(0); }
@@ -4702,6 +4728,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"type?",b_typep},{"version?",b_versionp},{"errorKind?",b_errorkindp},{"inline?",b_inlinep},{"path?",b_pathp},{"pathLabel?",b_pathlabelp},
     {"pathLiteral?",b_pathliteralp},{"regex?",b_regexp},{"attribute?",b_attributep},
     {"attributeLabel?",b_attributelabelp},{"true?",b_truep},{"false?",b_falsep},
+    {"permissions",b_permissions},{"terminal",b_terminal},
     {"standalone?",b_standalonep},{"superuser?",b_superuserp},{"bytecode?",b_false_always},
     {"database?",b_false_always},{"socket?",b_false_always},{"store?",b_false_always},{"future?",b_futurep},
     {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
