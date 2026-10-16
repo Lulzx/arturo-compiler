@@ -187,6 +187,9 @@ print permissions "reg_predicates.art"
 print permissions "definitely-not-here-12345"
 print get terminal 'width
 print type terminal
+print spin #red 90
+print spin #123456 45
+print spin #123456 (neg 45)
 EOF
 for reg in reg_floats reg_propagate reg_branch reg_slice reg_predicates; do
     src="$WORK/$reg.art"

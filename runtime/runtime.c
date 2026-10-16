@@ -402,6 +402,7 @@ static Value b_desaturate(Env*e,Value*a,int n){(void)e;(void)n;if(a[0].k!=V_COLO
 static Value b_grayscale(Env*e,Value*a,int n){(void)e;(void)n;if(a[0].k!=V_COLOR)die("grayscale: expected color");return color_saturation(a[0],-1.0);}
 static Value color_spin(Value v,double degrees){double h,s,l;rgb_hsl(v,&h,&s,&l);h=fmod(round(h)+degrees,360.0);if(h<0)h+=360.0;return hsl_rgb(h,s,l,color_chan(v,0));}
 static Value b_invert(Env*e,Value*a,int n){(void)e;(void)n;if(a[0].k!=V_COLOR)die("invert: expected color");return color_spin(a[0],180.0);}
+static Value b_spin(Env*e,Value*a,int n){(void)e;(void)n;if(a[0].k!=V_COLOR)die("spin: expected color");if(a[1].k!=V_INT)die("spin: expected integer amount");return color_spin(a[0],(double)a[1].u.i);}
 static Value color_block(Value *colors,int count){Value **items=(Value**)xmalloc((size_t)(count+1)*sizeof(Value*));for(int i=0;i<count;i++){items[i]=(Value*)xmalloc(sizeof(Value));*items[i]=colors[i];}return v_block(items,count);}
 static Value b_palette(Env*e,Value*a,int n){
     (void)e;(void)n;if(a[0].k!=V_COLOR)die("palette: expected color");
@@ -5635,7 +5636,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"move",b_move_file},{"rename",b_move_file},{"symlink",b_symlink_file},
     {"match",b_match},{"match?",b_matchp},
     {"crc",b_crc},{"encode",b_encode},{"decode",b_decode},{"color",b_color},{"escape",b_escape},{"unescape",b_unescape},{"wordwrap",b_wordwrap},{"arity",b_arity},{"symbols",b_symbols},{"var",b_var},{"unset",b_unset},{"property",b_property},{"conforms?",b_conformsp},{"parse",b_parse},{"translate",b_translate},{"extract",b_extract},{"render",b_render},{"express",b_express},{"inspect",b_inspect},{"benchmark",b_benchmark},{"export",b_export},{"alphabet",b_alphabet},{"digest",b_digest},{"hash",b_hash},{"with",b_with},{"specify",b_specify},{"alias",b_alias},
-    {"blend",b_blend},{"darken",b_darken},{"lighten",b_lighten},{"saturate",b_saturate},{"desaturate",b_desaturate},{"grayscale",b_grayscale},{"invert",b_invert},{"palette",b_palette},
+    {"blend",b_blend},{"darken",b_darken},{"lighten",b_lighten},{"saturate",b_saturate},{"desaturate",b_desaturate},{"grayscale",b_grayscale},{"invert",b_invert},{"spin",b_spin},{"palette",b_palette},
     {"new",b_new},{"set?",b_setp},
     {"insert",b_insert},{"break",b_break},{"continue",b_continue},{"do",b_do},{"null?",b_isNull},{"contains?",b_contains},
     {"greaterOrEqual?",b_ge},{"lessOrEqual?",b_le},{"join",b_join},{"try",b_try},

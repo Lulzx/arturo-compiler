@@ -537,7 +537,6 @@ inline constexpr const char* kUnsupportedIntrinsics[] = {
   "off",
   "on",
   "serve",
-  "spin",
   "stack",
   "unstack",
 };

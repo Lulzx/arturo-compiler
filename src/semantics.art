@@ -37,7 +37,7 @@ UNSUPPORTED_INTRINSICS: #[
     "cancel": true "channel": true
     "emit": true "eval": true "event": true "failed?": true "finished?": true "info": true
     "mail": true "off": true "on": true
-    "serve": true "spin": true
+    "serve": true
     "stack": true
     "unstack": true
 ]
