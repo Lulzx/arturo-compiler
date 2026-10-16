@@ -4267,36 +4267,51 @@ static Value b_index(Env*e,Value*a,int n){
     if(a[0].k==V_RANGE){int count=iterator_count(a[0]);for(int i=0;i<count;i++)if(value_eq(iterator_item(a[0],i),a[1]))return v_int(i);return v_int(-1);}
     die("index"); return v_null();
 }
-/* `slice coll from to` — inclusive slice (Arturo semantics). */
+/* Nim `runeSubStr(s, pos, len)` for pos >= 0, as used by the host's slice:
+ * a negative len counts back from the end of the string. */
+static Value rune_substr_value(const char *s, long from, long len, int total){
+    if(from<0 || from>total) return v_str("");
+    long cnt;
+    if(len>=0){ cnt=len; if(cnt>total-from)cnt=total-from; }
+    else{ long end=total+len; if(end<=0)return v_str(""); cnt=end-from; if(cnt<0)cnt=0; if(cnt>total-from)cnt=total-from; }
+    const char *start=rune_offset(s,(int)from);
+    const char *p=start; int bytes=0;
+    for(long k=0;k<cnt;k++){bytes+=utf8_rune_len(p);p+=utf8_rune_len(p);}
+    char *out=xmalloc((size_t)bytes+1); memcpy(out,start,(size_t)bytes); out[bytes]=0;
+    Value r=v_str(out); free(out); return r;
+}
+/* `slice coll from to` — host (Arturo 0.10.0 Collections.nim) semantics:
+ * block: only when from >= 0 and to <= len-1 is a slice attempted; a reversed
+ * range wider than one index fails in the host's Nim seq slice, an exactly
+ * adjacent reversal is empty, and anything else is an empty block. In the
+ * literal (in-place) form a non-attempted slice leaves the value unchanged.
+ * string: only when from >= 0 and to <= runeLen is a slice attempted, via
+ * runeSubStr(from, to-from+1) — so reversed ranges follow Nim's negative-len
+ * rule instead of being empty; otherwise "" (unchanged in-place). */
 static Value b_slice(Env*e,Value*a,int n){
     MutTarget target;Value source=mut_load(e,a[0],&target);
     long from=as_int(a[1]), to=as_int(a[2]);
     if(source.k==V_BLOCK){
         int m=source.u.block.b->n;
         if(from>=0 && to<=m-1){
-            long cnt=to-from+1; if(cnt<0)cnt=0; if(cnt>m-from)cnt=m-from;
+            if(from>to+1) die("slice");
+            long cnt=to-from+1; if(cnt<0)cnt=0;
             Value **items=(Value**)xmalloc((size_t)(cnt?cnt:1)*sizeof(Value*));
             for(long i=0;i<cnt;i++) items[i]=source.u.block.b->items[from+i];
             Value result=v_block(items,(int)cnt);
             if(target.kind){mut_store(e,&target,result);return v_null();}return result;
         }
-        Value result=v_block(NULL,0);
-        if(target.kind){mut_store(e,&target,result);return v_null();}return result;
+        if(target.kind) return v_null();
+        return v_block(NULL,0);
     }
     if(source.k==V_STR){
         int total=rune_count(source.u.s);
         if(from>=0 && to<=total){
-            long len=to-from+1; if(len<0)len=0;
-            int avail=total-(int)from; if(len>avail)len=avail; if(len<0)len=0;
-            const char*start=rune_offset(source.u.s,(int)from);
-            const char*p=start; int bytes=0;
-            for(int k=0;k<(int)len;k++){bytes+=utf8_rune_len(p);p+=utf8_rune_len(p);}
-            char *out=xmalloc((size_t)bytes+1); memcpy(out,start,(size_t)bytes); out[bytes]=0;
-            Value r=v_str(out); free(out);
+            Value r=rune_substr_value(source.u.s,from,to-from+1,total);
             if(target.kind){mut_store(e,&target,r);return v_null();}return r;
         }
-        Value r=v_str("");
-        if(target.kind){mut_store(e,&target,r);return v_null();}return r;
+        if(target.kind) return v_null();
+        return v_str("");
     }
     die("slice"); return v_null();
 }

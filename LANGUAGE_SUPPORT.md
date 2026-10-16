@@ -63,8 +63,11 @@ compiled bytecode, runIR, and the standalone native executable. `make negative`
 checks eleven representative invalid programs: host and native must both fail
 without a signal and must agree on output emitted before the error. Exact native
 stderr remains enforced separately by `make diagnostics`. Generated collection
-indices stay inside the currently supported bounds; out-of-range `slice`
-semantics remain a known compatibility gap to close with a fixed regression.
+indices stay inside the currently supported bounds. Out-of-range and reversed
+`slice` semantics are now host-exact (including the host's reversed-string
+`runeSubStr` behavior, its reversed-block runtime error, and in-place slices
+leaving the value unchanged when no slice is attempted) and are pinned by the
+`reg_slice` regression in `cpp26/tests/run_tests.sh`.
 
 The release gate for a “full Arturo compiler” is: the pinned upstream suite and
 the local suite pass against the host for every supported target, no

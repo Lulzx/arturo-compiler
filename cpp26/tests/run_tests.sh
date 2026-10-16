@@ -152,7 +152,29 @@ if false [ print "never" ]
 unless true [ print "never2" ]
 print "done"
 EOF
-for reg in reg_floats reg_propagate reg_branch; do
+cat > "$WORK/reg_slice.art" <<'EOF'
+lo: 2
+hi: 0
+print slice "abcdefgh" lo hi
+print slice "abcdefgh" 3 1
+print slice "hello" 0 99
+print slice "hello" 3 99
+print slice [1 2 3 4 5] 0 99
+print slice [1 2 3 4 5] 3 99
+print size slice [1 2 3 4 5] 1 0
+neg: 0-2
+print slice [1 2 3 4 5] neg 2
+print slice "hello" neg 2
+a: "hello"
+slice 'a 0 99
+print a
+b: [1 2 3 4 5]
+slice 'b 0 99
+print b
+slice 'b 1 3
+print b
+EOF
+for reg in reg_floats reg_propagate reg_branch reg_slice; do
     src="$WORK/$reg.art"
     if ! ./bin/arturoc "$src" "$WORK/p" >"$WORK/c.log" 2>&1; then bad "compile $reg: $(cat "$WORK/c.log")"; continue; fi
     if run3 "$src" "$WORK/p"; then ok; else bad "parity $reg"; fi
@@ -193,6 +215,17 @@ for backend in c direct; do
         if run3 "$ROOT/$rel" "$WORK/p"; then ok; else bad "parity ($backend) $rel"; fi
     done
 done
+
+# A reversed block slice whose gap exceeds one index is a runtime error in
+# the host (it attempts the Nim seq slice); both engines must fail nonzero
+# without a signal, with identical stdout up to the failure. Error *text*
+# intentionally differs (see CONTRACT.md SS7), so only stdout/status compare.
+printf 'print "before"\nprint slice [1 2 3 4 5] 3 0\nprint "after"\n' > "$WORK/reg_slice_err.art"
+if ./bin/arturoc "$WORK/reg_slice_err.art" "$WORK/p" >"$WORK/c.log" 2>&1; then
+    (cd "$WORK" && "$ARTURO" --no-color reg_slice_err.art >host.out 2>/dev/null); hs=$?
+    (cd "$WORK" && ./p >new.out 2>/dev/null); ns=$?
+    if [ "$hs" != "0" ] && [ "$ns" != "0" ] && [ "$ns" -lt 128 ] && cmp -s "$WORK/host.out" "$WORK/new.out"; then ok; else bad "slice reversed-block error (host=$hs cpp=$ns)"; fi
+else bad "compile reg_slice_err: $(cat "$WORK/c.log")"; fi
 
 echo "== malformed AIR payloads rejected without a signal =="
 # Hand-crafted AIR1 streams: unknown opcode, out-of-range constant index,
