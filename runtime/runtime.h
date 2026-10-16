@@ -20,12 +20,20 @@ typedef enum {
     V_PATHLABEL, V_PATHLITERAL, V_REGEX, V_ATTRIBUTE, V_ATTRIBUTELABEL,
     V_ERROR,
     V_BIGINT,
-    V_SOCKET
+    V_SOCKET,
+    V_STORE
 } VKind;
 
 typedef struct Value Value;
 typedef struct IR IR;
 typedef struct Env Env;
+typedef struct StoreBody StoreBody;   /* persistent store state (V_STORE) */
+struct StoreBody {
+    struct Dict *dict; /* the live dictionary body */
+    char *path;        /* backing file */
+    int   json;        /* 0 = native Arturo format, 1 = JSON */
+    int   autosave;    /* save on every mutation (not .deferred) */
+};
 typedef struct SocketBody SocketBody; /* shared socket state (V_SOCKET) */
 struct SocketBody {
     int   fd;          /* -1 once unplugged */
@@ -68,6 +76,7 @@ struct Value {
         Dict       *dict;       /* V_DICT */
         struct { IR *params; IR **body; int nbody; Env *closure; int constructor; int is_action; char **exports; int nexports; } fn; /* V_FUNC */
         SocketBody *sock;   /* V_SOCKET — shared body, like Block/Dict */
+        StoreBody *store;   /* V_STORE — persistent dictionary body */
     } u;
 };
 

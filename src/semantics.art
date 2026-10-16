@@ -34,11 +34,11 @@ NOT_MUTATING: #[
 ; they must never degrade into an unknown-function crash in generated code.
 UNSUPPORTED_INTRINSICS: #[
     "__VerbosePackager": true
-    "cancel": true "channel": true "config": true
+    "cancel": true "channel": true
     "emit": true "eval": true "event": true "failed?": true "finished?": true "info": true
     "mail": true "off": true "on": true
     "serve": true "spin": true
-    "stack": true "store": true
+    "stack": true
     "terminate": true "unstack": true
 ]
 

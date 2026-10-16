@@ -335,6 +335,9 @@ if ./bin/arturoc "$WORK/browse.art" "$WORK/browsebin" >"$WORK/c.log" 2>&1; then
     if [ "$hostlog" = "$cpplog" ] && [ -n "$hostlog" ] && cmp -s "$WORK/b.host" "$WORK/b.cpp"; then ok; else bad "browse opener (host='$hostlog' cpp='$cpplog')"; fi
 else bad "compile browse: $(cat "$WORK/c.log")"; fi
 
+echo "== store parity: cross-engine persistence (host vs compiled) =="
+if ARTURO_HOST="$ARTURO" python3 tests/store_test.py "$WORK" >"$WORK/store.log" 2>&1; then ok; else bad "store parity: $(cat "$WORK/store.log")"; fi
+
 echo "== HTTP parity: request/download vs local server (host vs compiled) =="
 if ARTURO_HOST="$ARTURO" python3 tests/http_test.py "$WORK" >"$WORK/http.log" 2>&1; then ok; else bad "http parity: $(cat "$WORK/http.log")"; fi
 

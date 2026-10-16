@@ -294,6 +294,8 @@ static const char *rune_offset(const char *s, int i);
 static void rune_at(const char *s, char out[5]);
 static const char *last_rune(const char *s);
 static Value v_block_cpy(Value **items, int n);
+static Value store_dict_value(StoreBody *s);   /* store section below */
+static void store_save(StoreBody *s);
 static char *fstr(double f, char *out, size_t cap);
 static char *val_str(Value v);
 static Value runBlockValue(Env *e, Value block);
@@ -1125,6 +1127,10 @@ static void print_scalar(Value v) {
         case V_BIGINT: fputs(v.u.s?v.u.s:"0", stdout); break;
         case V_SOCKET: { char *s=socket_text(v); fputs(s,stdout); free(s); break; }
         case V_BOOL:  printf(v.u.b ? "true" : "false"); break;
+        case V_STORE: {
+            Value dv; memset(&dv, 0, sizeof dv); dv.k = V_DICT; dv.u.dict = v.u.store->dict;
+            print_scalar(dv); break;
+        }
         case V_DICT: {
             const char *objectType=object_type_name(v);
             printf("[");
@@ -2167,6 +2173,7 @@ static const char *type_name(Value v){
         case V_ATTRIBUTE: return "attribute"; case V_ATTRIBUTELABEL: return "attributelabel";
         case V_ERROR: return "error";
         case V_SOCKET: return "socket";
+        case V_STORE: return "store";
     }
     return "null";
 }
@@ -2947,6 +2954,12 @@ static Value b_makeDict(Env*e,Value*a,int n){
 }
 static Value b_set(Env*e,Value*a,int n){
     Value d=a[0]; const char *k=key_text(a[1]); Value val=a[2];
+    if(d.k==V_STORE){
+        Value args2[3]={store_dict_value(d.u.store),a[1],a[2]};
+        (void)b_set(e,args2,3);
+        if(d.u.store->autosave)store_save(d.u.store);
+        return d;
+    }
     if(d.k==V_STR&&a[1].k==V_INT){long index=a[1].u.i;size_t length=strlen(d.u.s);if(index<0||index>=(long)length)die("set: string index out of range");char *replacement=val_str(val);if(!replacement[0])die("set: empty replacement");rune_cache_forget(d.u.s);d.u.s[index]=replacement[0];free(replacement);return d;}
     if(d.k==V_BINARY&&a[1].k==V_INT){long index=a[1].u.i;if(index<0||index>=(long)d.u.binary.len)die("set: binary index out of range");d.u.binary.data[index]=(unsigned char)as_int(val);return d;}
     if((d.k==V_BLOCK||d.k==V_INLINE)&&a[1].k==V_INT){
@@ -2984,6 +2997,10 @@ static const char *key_text(Value v){
 }
 static Value b_get(Env*e,Value*a,int n){
     const char *specialKey=(IS_STRLIKE(a[1].k)||a[1].k==V_PATH||a[1].k==V_PATHLITERAL||a[1].k==V_PATHLABEL)?key_text(a[1]):"";
+    if(a[0].k==V_STORE){
+        int idx=dict_find(store_dict_value(a[0].u.store),specialKey);
+        return idx>=0?a[0].u.store->dict->vals[idx]:v_null();
+    }
     if(a[0].k==V_ERRORKIND&&!strcmp(specialKey,"label"))return v_str(a[0].u.s);
     if(a[0].k==V_ERROR){
         if(!strcmp(specialKey,"kind"))return v_errorkind(a[0].u.error.kind);
@@ -3236,6 +3253,10 @@ static char *val_str(Value v){
                 if(i){ out[len++]=' '; } strcpy(out+len,s); len+=strlen(s); free(s);
             }
             out[len++]=']'; out[len]=0; return out;
+        }
+        case V_STORE: {
+            Value dv; memset(&dv, 0, sizeof dv); dv.k = V_DICT; dv.u.dict = v.u.store->dict;
+            return val_str(dv);
         }
         case V_DICT: {
             size_t cap=32, len=0; char *out=xmalloc(cap); out[0]=0;
@@ -3976,6 +3997,297 @@ static Value b_download(Env*e, Value*a, int n) {
     if (rc != 0) die("download: download failed");
     return v_null();
 }
+/* ---- persistent stores: store / config (host Databases.nim semantics) -- */
+/* A store is a dictionary persisted to a file: native format is Arturo
+ * source (`key: <literal>` lines), JSON format is pretty-printed JSON.
+ * Mutations through set/path-assignment save immediately unless the
+ * store was opened .deferred, in which case they are written at exit.
+ * SQLite (.db) stores are not implemented and fail loudly. */
+static StoreBody **g_stores = NULL;
+static int g_nstores = 0, g_store_atexit = 0;
+static void store_save(StoreBody *s);
+static void store_flush_deferred(void) {
+    for (int i = 0; i < g_nstores; i++) if (!g_stores[i]->autosave) store_save(g_stores[i]);
+}
+static void store_register(StoreBody *s) {
+    g_stores = realloc(g_stores, sizeof(StoreBody*) * (size_t)(g_nstores + 1));
+    g_stores[g_nstores++] = s;
+    if (!g_store_atexit) { g_store_atexit = 1; atexit(store_flush_deferred); }
+}
+static void json_pretty(FILE *f, Value v, int indent) {
+    switch (v.k) {
+        case V_DICT: {
+            if (v.u.dict->n == 0) { fputs("{}", f); break; }
+            fputs("{\n", f);
+            for (int i = 0; i < v.u.dict->n; i++) {
+                for (int j = 0; j < indent + 4; j++) fputc(' ', f);
+                json_escape_add(f, v.u.dict->keys[i]); fputs(": ", f);
+                json_pretty(f, v.u.dict->vals[i], indent + 4);
+                if (i + 1 < v.u.dict->n) fputc(',', f);
+                fputc('\n', f);
+            }
+            for (int j = 0; j < indent; j++) fputc(' ', f);
+            fputc('}', f); break;
+        }
+        case V_BLOCK: {
+            if (v.u.block.b->n == 0) { fputs("[]", f); break; }
+            fputs("[\n", f);
+            for (int i = 0; i < v.u.block.b->n; i++) {
+                for (int j = 0; j < indent + 4; j++) fputc(' ', f);
+                json_pretty(f, *v.u.block.b->items[i], indent + 4);
+                if (i + 1 < v.u.block.b->n) fputc(',', f);
+                fputc('\n', f);
+            }
+            for (int j = 0; j < indent; j++) fputc(' ', f);
+            fputc(']', f); break;
+        }
+        case V_STR: json_escape_add(f, v.u.s); break;
+        default: { char *s = val_str(v); fputs(s, f); free(s); break; }
+    }
+}
+static void store_save(StoreBody *s) {
+    FILE *f = fopen(s->path, "w");
+    if (!f) return;
+    Value dv; memset(&dv, 0, sizeof dv); dv.k = V_DICT; dv.u.dict = s->dict;
+    if (s->json) {
+        json_pretty(f, dv, 0);
+        fputc('\n', f);
+    } else {
+        for (int i = 0; i < s->dict->n; i++) {
+            char *part = express_value(s->dict->vals[i]);
+            fprintf(f, "%s: %s\n", s->dict->keys[i], part);
+            free(part);
+        }
+    }
+    fclose(f);
+}
+static Value store_token_value(Value *items, int n, int *pos);
+static Value store_dict_from_tokens(Value *items, int n) {
+    char **keys = NULL; Value *vals = NULL; int cnt = 0, cap = 0;
+    int pos = 0;
+    while (pos < n) {
+        Value t = items[pos];
+        if (t.k != V_LABEL) { pos++; continue; }
+        const char *key = t.u.s; pos++;
+        Value val = v_null();
+        if (pos < n) val = store_token_value(items, n, &pos);
+        if (cnt == cap) { cap = cap ? cap * 2 : 8; keys = realloc(keys, (size_t)cap * sizeof(char*)); vals = realloc(vals, (size_t)cap * sizeof(Value)); }
+        keys[cnt] = strdup(key); vals[cnt] = val; cnt++;
+    }
+    return v_dict(keys, vals, cnt);
+}
+static Value *store_flatten(Value block, int *out_n) {
+    int cnt = (block.k == V_BLOCK && block.u.block.b) ? block.u.block.b->n : 0;
+    Value *flat = xmalloc(sizeof(Value) * (size_t)(cnt ? cnt : 1));
+    for (int i = 0; i < cnt; i++) flat[i] = *block.u.block.b->items[i];
+    *out_n = cnt;
+    return flat;
+}
+static Value store_token_value(Value *items, int n, int *pos) {
+    Value t = items[*pos];
+    if (t.k == V_SYMBOL && t.u.s && !strcmp(t.u.s, "#") && *pos + 1 < n && items[*pos + 1].k == V_BLOCK) {
+        int fn = 0; Value *flat = store_flatten(items[*pos + 1], &fn);
+        *pos += 2;
+        Value d = store_dict_from_tokens(flat, fn);
+        free(flat);
+        return d;
+    }
+    if (t.k == V_BLOCK) {
+        (*pos)++;
+        int fn = 0; Value *flat = store_flatten(t, &fn);
+        Value **out = xmalloc(sizeof(Value*) * (size_t)(fn ? fn : 1));
+        int ocnt = 0, p = 0;
+        while (p < fn) {
+            out[ocnt] = xmalloc(sizeof(Value));
+            *out[ocnt] = store_token_value(flat, fn, &p);
+            ocnt++;
+        }
+        free(flat);
+        return v_block(out, ocnt);
+    }
+    (*pos)++;
+    if (t.k == V_WORD) {
+        if (!strcmp(t.u.s, "true")) return v_bool(1);
+        if (!strcmp(t.u.s, "false")) return v_bool(0);
+        if (!strcmp(t.u.s, "null")) return v_null();
+    }
+    return t;
+}
+/* minimal JSON reader for JSON store files */
+typedef struct { const char *p; } JsonCur;
+static void json_skip(JsonCur *c) { while (*c->p == ' ' || *c->p == '\n' || *c->p == '\r' || *c->p == '\t') c->p++; }
+static Value json_parse_value(JsonCur *c);
+static char *json_parse_string(JsonCur *c) {
+    if (*c->p != '"') return strdup("");
+    c->p++;
+    size_t cap = 32, n = 0; char *out = xmalloc(cap);
+    while (*c->p && *c->p != '"') {
+        char ch = *c->p++;
+        if (ch == '\\' && *c->p) {
+            char e = *c->p++;
+            switch (e) {
+                case 'n': ch = '\n'; break; case 't': ch = '\t'; break;
+                case 'r': ch = '\r'; break; case 'b': ch = '\b'; break;
+                case 'f': ch = '\f'; break; case '/': ch = '/'; break;
+                case 'u': { /* only BMP, no surrogate pairing in store files */
+                    unsigned code = 0;
+                    for (int i = 0; i < 4 && isxdigit((unsigned char)c->p[i]); i++) {
+                        char h = c->p[i]; code = code * 16 + (h <= '9' ? h - '0' : (tolower((unsigned char)h) - 'a' + 10));
+                    }
+                    c->p += 4;
+                    char tmp[4]; int tl = 0;
+                    if (code < 0x80) tmp[tl++] = (char)code;
+                    else if (code < 0x800) { tmp[tl++] = (char)(0xC0 | (code >> 6)); tmp[tl++] = (char)(0x80 | (code & 63)); }
+                    else { tmp[tl++] = (char)(0xE0 | (code >> 12)); tmp[tl++] = (char)(0x80 | ((code >> 6) & 63)); tmp[tl++] = (char)(0x80 | (code & 63)); }
+                    for (int i = 0; i < tl; i++) { if (n + 1 >= cap) { cap *= 2; out = realloc(out, cap); } out[n++] = tmp[i]; }
+                    continue;
+                }
+                default: ch = e; break;
+            }
+        }
+        if (n + 1 >= cap) { cap *= 2; out = realloc(out, cap); }
+        out[n++] = ch;
+    }
+    if (*c->p == '"') c->p++;
+    out[n] = 0; return out;
+}
+static Value json_parse_value(JsonCur *c) {
+    json_skip(c);
+    if (*c->p == '{') {
+        c->p++;
+        char **keys = NULL; Value *vals = NULL; int cnt = 0, cap = 0;
+        json_skip(c);
+        if (*c->p == '}') { c->p++; return v_dict(keys, vals, 0); }
+        for (;;) {
+            json_skip(c);
+            char *key = json_parse_string(c);
+            json_skip(c); if (*c->p == ':') c->p++;
+            Value val = json_parse_value(c);
+            if (cnt == cap) { cap = cap ? cap * 2 : 8; keys = realloc(keys, (size_t)cap * sizeof(char*)); vals = realloc(vals, (size_t)cap * sizeof(Value)); }
+            keys[cnt] = key; vals[cnt] = val; cnt++;
+            json_skip(c);
+            if (*c->p == ',') { c->p++; continue; }
+            if (*c->p == '}') c->p++;
+            break;
+        }
+        return v_dict(keys, vals, cnt);
+    }
+    if (*c->p == '[') {
+        c->p++;
+        Value **items = NULL; int cnt = 0, cap = 0;
+        json_skip(c);
+        if (*c->p == ']') { c->p++; return v_block(items, 0); }
+        for (;;) {
+            Value val = json_parse_value(c);
+            if (cnt == cap) { cap = cap ? cap * 2 : 8; items = realloc(items, (size_t)cap * sizeof(Value*)); }
+            items[cnt] = xmalloc(sizeof(Value)); *items[cnt] = val; cnt++;
+            json_skip(c);
+            if (*c->p == ',') { c->p++; continue; }
+            if (*c->p == ']') c->p++;
+            break;
+        }
+        return v_block(items, cnt);
+    }
+    if (*c->p == '"') { char *s = json_parse_string(c); Value v = v_str(s); free(s); return v; }
+    if (!strncmp(c->p, "true", 4)) { c->p += 4; return v_bool(1); }
+    if (!strncmp(c->p, "false", 5)) { c->p += 5; return v_bool(0); }
+    if (!strncmp(c->p, "null", 4)) { c->p += 4; return v_null(); }
+    char *end = NULL;
+    double d = strtod(c->p, &end);
+    if (end == c->p) return v_null();
+    c->p = end;
+    if (d == (double)(long)d && !strchr("-.eE", *(end - 1)) ) return v_int((long)d);
+    if (d == (double)(long)d) {
+        const char *q = c->p;
+        (void)q;
+        return v_int((long)d);
+    }
+    return v_float(d);
+}
+static Value store_dict_value(StoreBody *s) {
+    Value dv; memset(&dv, 0, sizeof dv); dv.k = V_DICT; dv.u.dict = s->dict; return dv;
+}
+static Value v_store(StoreBody *s) {
+    Value v; memset(&v, 0, sizeof v); v.k = V_STORE; v.u.store = s; return v;
+}
+static StoreBody *store_open(const char *path, int json) {
+    StoreBody *s = (StoreBody*)xmalloc(sizeof(StoreBody));
+    memset(s, 0, sizeof *s);
+    s->path = strdup(path); s->json = json; s->autosave = 1;
+    Value empty = v_dict((char**)xmalloc(sizeof(char*)), (Value*)xmalloc(sizeof(Value)), 0);
+    s->dict = empty.u.dict;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        /* the host creates the (empty) backing file at open time */
+        FILE *nf = fopen(path, "w"); if (nf) fclose(nf);
+    } else {
+        fclose(f);
+        size_t len = 0; unsigned char *raw = read_whole_file(path, &len);
+        if (raw && len > 0) {
+            if (json) {
+                JsonCur cur = { (const char*)raw };
+                Value parsed = json_parse_value(&cur);
+                if (parsed.k == V_DICT) s->dict = parsed.u.dict;
+            } else {
+                Value tokens = lex_source((const char*)raw);
+                if (tokens.k == V_BLOCK && tokens.u.block.b) {
+                    int cnt = 0; Value *flat = store_flatten(tokens, &cnt);
+                    Value parsed = store_dict_from_tokens(flat, cnt);
+                    if (parsed.k == V_DICT) s->dict = parsed.u.dict;
+                    free(flat);
+                }
+            }
+        }
+        free(raw);
+    }
+    store_register(s);
+    return s;
+}
+static void store_mkdir_for(const char *path) {
+    char *tmp = strdup(path);
+    for (char *p = tmp + 1; *p; p++) if (*p == '/') { *p = 0; mkdir(tmp, 0777); *p = '/'; }
+    free(tmp);
+}
+static Value b_store(Env*e, Value*a, int n) {
+    if (!IS_STRLIKE(a[0].k)) die("store: expected a store name");
+    if (rt_has_attr("db")) die("store: sqlite (.db) stores are not implemented in the native compiler");
+    int json = rt_has_attr("json");
+    const char *name = a[0].u.s;
+    char *path;
+    if (rt_has_attr("global")) {
+        const char *home = getenv("HOME"); if (!home) home = "";
+        const char *suffix = json && !strstr(name, ".json") ? ".json" : "";
+        path = xmalloc(strlen(home) + strlen(name) + strlen(suffix) + 24);
+        sprintf(path, "%s/.arturo/stores/%s%s", home, name, suffix);
+        store_mkdir_for(path);
+    } else if (json) {
+        size_t nl = strlen(name);
+        if (nl >= 5 && !strcmp(name + nl - 5, ".json")) path = strdup(name);
+        else { path = xmalloc(nl + 6); sprintf(path, "%s.json", name); }
+    } else path = strdup(name);
+    StoreBody *s = store_open(path, json);
+    if (rt_has_attr("deferred")) s->autosave = 0;
+    free(path);
+    return v_store(s);
+}
+static StoreBody *g_config_store = NULL;
+static Value b_config(Env*e, Value*a, int n) {
+    if (!g_config_store) {
+        const char *path = "config.art";
+        char *global_path = NULL;
+        if (access("config.art", F_OK) != 0) {
+            const char *home = getenv("HOME"); if (!home) home = "";
+            global_path = xmalloc(strlen(home) + 32);
+            sprintf(global_path, "%s/.arturo/stores/config.art", home);
+            store_mkdir_for(global_path);
+            path = global_path;
+        }
+        g_config_store = store_open(path, 0);
+        free(global_path);
+    }
+    return v_store(g_config_store);
+}
+
 /* ---- zip / unzip / volume (host Files.nim semantics) -------------------- */
 static Value b_volume(Env*e, Value*a, int n) {
     if (!IS_STRLIKE(a[0].k)) die("volume: expected a path");
@@ -5339,6 +5651,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"zip",b_zip},{"unzip",b_unzip},{"volume",b_volume},
     {"request",b_request},{"download",b_download},
     {"cursor",b_cursor},{"goto",b_goto},{"browse",b_browse},
+    {"store",b_store},{"config",b_config},
     {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
     {"lower?",b_lowerp},{"upper?",b_upperp},{"numeric?",b_numericp},
     {"prefix?",b_prefixp},{"suffix?",b_suffixp},{"between?",b_betweenp},{"same?",b_samep},
