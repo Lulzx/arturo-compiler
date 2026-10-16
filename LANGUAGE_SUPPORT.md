@@ -17,7 +17,7 @@ deterministically generated valid programs, and representative invalid cases.
 | Objects/classes/methods | Corpus-proven | Constructors, bound methods, inheritance, `super`, reflection, string rendering, and generated ordering methods are covered |
 | Exceptions | Partial (`try`, `throw`, `throws?`, `error?`, `ensure`, `panic`) | Arturo-level stack frames and exact upstream diagnostic formatting remain |
 | Required portable Arturo value kinds | Corpus-proven | Rational, complex, quantity/unit, date, color, regex, binary, version, error-kind, and symbol-literal values are native; external handles such as stores remain explicitly unavailable |
-| I/O, networking, databases, GUI | Filesystem/process basics supported; 34 declarations intentionally unavailable | Keep compile-time rejection policy machine-checked; only add capabilities with portable implementations and effect tests |
+| I/O, networking, databases, GUI | Filesystem/process basics supported; 27 declarations intentionally unavailable | Keep compile-time rejection policy machine-checked; only add capabilities with portable implementations and effect tests |
 | Diagnostics/tooling | Partial | Native failures have filenames, stable stderr, and nonzero exits; arturoc runtime errors also carry the source line (AIR format v2) on all three backends; Arturo-level stack frames remain |
 
 ## Route to the whole language
@@ -44,8 +44,8 @@ deterministically generated valid programs, and representative invalid cases.
    supported operating systems and architectures, versioned artifacts, and a
    documented compatibility policy.
 
-The current mechanical boundary is 361/395 declarations: no required
-declarations remain and 34 platform/runtime-internal declarations are intentionally
+The current mechanical boundary is 368/395 declarations: no required
+declarations remain and 27 platform/runtime-internal declarations are intentionally
 unavailable. The local corpus has 111 four-way differential and self-hosted
 native cases, plus thirty-two unmodified tests from the pinned upstream suite. `make unsupported`
 proves unavailable capabilities fail during compilation without producing an

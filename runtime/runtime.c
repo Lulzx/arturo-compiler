@@ -21,6 +21,13 @@
 #include <setjmp.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <poll.h>
+#include <errno.h>
+#include <signal.h>
 #include <unistd.h>
 #include <time.h>
 #include <regex.h>
@@ -1068,6 +1075,23 @@ static void range_text(Value v, char *buf, size_t cap){
     }
 }
 
+/* Host socket display: tcp://localhost:18966 (0.0.0.0 and 127.0.0.1 both
+ * render as "localhost", per the host's VSocket string form). */
+static char *socket_text(Value v) {
+    SocketBody *s = v.u.sock;
+    const char *addr = s->addr ? s->addr : "";
+    if (!strcmp(addr, "0.0.0.0") || !strcmp(addr, "127.0.0.1")) addr = "localhost";
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s://%s:%ld", s->udp ? "udp" : "tcp", addr, s->port);
+    return strdup(buf);
+}
+static Value v_socket(int fd, int udp, const char *addr, long port) {
+    SocketBody *s = (SocketBody*)xmalloc(sizeof(SocketBody));
+    memset(s, 0, sizeof *s);
+    s->fd = fd; s->udp = udp; s->port = port; s->addr = strdup(addr ? addr : "");
+    Value v; memset(&v, 0, sizeof v); v.k = V_SOCKET; v.u.sock = s; return v;
+}
+
 /* Arturo print: print the value, then a newline. Strings print raw. A block
  * prints its elements space-separated WITHOUT outer brackets; a block nested
  * inside a printed block keeps its brackets (matching the host). */
@@ -1098,6 +1122,7 @@ static void print_scalar(Value v) {
         case V_VERSION: case V_ERRORKIND: fputs(v.u.s?v.u.s:"",stdout); break;
         case V_CHAR:  fputs(v.u.c, stdout); break;
         case V_BIGINT: fputs(v.u.s?v.u.s:"0", stdout); break;
+        case V_SOCKET: { char *s=socket_text(v); fputs(s,stdout); free(s); break; }
         case V_BOOL:  printf(v.u.b ? "true" : "false"); break;
         case V_DICT: {
             const char *objectType=object_type_name(v);
@@ -2140,6 +2165,7 @@ static const char *type_name(Value v){
         case V_PATHLABEL: return "pathlabel"; case V_PATHLITERAL: return "pathliteral"; case V_REGEX: return "regex";
         case V_ATTRIBUTE: return "attribute"; case V_ATTRIBUTELABEL: return "attributelabel";
         case V_ERROR: return "error";
+        case V_SOCKET: return "socket";
     }
     return "null";
 }
@@ -3177,6 +3203,7 @@ static char *val_str(Value v){
     switch (v.k) {
         case V_INT:    snprintf(b,64,"%ld",v.u.i); return strdup(b);
         case V_BIGINT: return strdup(v.u.s?v.u.s:"0");
+        case V_SOCKET: return socket_text(v);
         case V_FLOAT:  { char fb[64]; fstr(v.u.f,fb,sizeof fb); return strdup(fb); }
         case V_RATIONAL: snprintf(b,64,"%ld/%ld",v.u.rational.num,v.u.rational.den); return strdup(b);
         case V_COMPLEX: {
@@ -3506,6 +3533,139 @@ static Value b_terminal(Env*e,Value*a,int n){
     keys[1]=strdup("height"); vals[1]=v_int(height);
     return v_dict(keys,vals,2);
 }
+/* ---- sockets (host Sockets.nim semantics) ------------------------------- */
+static SocketBody *need_socket(Value v, const char *who) {
+    if (v.k != V_SOCKET) { char buf[96]; snprintf(buf, sizeof buf, "%s: expected a socket", who); die(buf); }
+    return v.u.sock;
+}
+static int resolve_addr(const char *addr, long port, int udp, struct sockaddr_storage *out, socklen_t *len) {
+    struct addrinfo hints; memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET; hints.ai_socktype = udp ? SOCK_DGRAM : SOCK_STREAM;
+    char service[16]; snprintf(service, sizeof service, "%ld", port);
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(addr, service, &hints, &res) != 0 || !res) return 0;
+    memcpy(out, res->ai_addr, res->ai_addrlen); *len = (socklen_t)res->ai_addrlen;
+    freeaddrinfo(res); return 1;
+}
+static Value b_connect(Env*e, Value*a, int n) {
+    if (a[0].k != V_INT) die("connect: expected a port");
+    long port = a[0].u.i;
+    int udp = rt_has_attr("udp") && rt_attr_value("udp", v_bool(0)).k == V_BOOL && rt_attr_value("udp", v_bool(0)).u.b;
+    const char *addr = "0.0.0.0";
+    if (rt_has_attr("to")) { Value t = rt_attr_value("to", v_str("")); if (!IS_STRLIKE(t.k)) die("connect.to: expected an address"); addr = t.u.s; }
+    signal(SIGPIPE, SIG_IGN);
+    int fd = socket(AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+    if (fd < 0) die("connect: cannot create socket");
+    if (udp) { /* upstream creates the datagram socket without connecting */ }
+    else {
+        struct sockaddr_storage ss; socklen_t sl;
+        if (!resolve_addr(addr, port, 0, &ss, &sl) || connect(fd, (struct sockaddr*)&ss, sl) != 0) { close(fd); die("connect: connection failed"); }
+    }
+    return v_socket(fd, udp, addr, port);
+}
+static Value b_listen(Env*e, Value*a, int n) {
+    if (a[0].k != V_INT) die("listen: expected a port");
+    long port = a[0].u.i;
+    int udp = rt_has_attr("udp") && rt_attr_value("udp", v_bool(0)).k == V_BOOL && rt_attr_value("udp", v_bool(0)).u.b;
+    signal(SIGPIPE, SIG_IGN);
+    int fd = socket(AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+    if (fd < 0) die("listen: cannot create socket");
+    int one = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sin; memset(&sin, 0, sizeof sin);
+    sin.sin_family = AF_INET; sin.sin_addr.s_addr = htonl(INADDR_ANY); sin.sin_port = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr*)&sin, sizeof sin) != 0) { close(fd); die("listen: cannot bind port"); }
+    if (!udp && listen(fd, SOMAXCONN) != 0) { close(fd); die("listen: cannot listen"); }
+    return v_socket(fd, udp, "0.0.0.0", port);
+}
+static Value b_accept(Env*e, Value*a, int n) {
+    SocketBody *srv = need_socket(a[0], "accept");
+    if (srv->fd < 0) die("accept: socket is closed");
+    struct sockaddr_in sin; socklen_t sl = sizeof sin;
+    int fd = accept(srv->fd, (struct sockaddr*)&sin, &sl);
+    if (fd < 0) die("accept: accept failed");
+    char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &sin.sin_addr, ip, sizeof ip);
+    return v_socket(fd, srv->udp, ip, ntohs(sin.sin_port));
+}
+static int send_all(SocketBody *s, const char *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t w = send(s->fd, data + sent, len - sent, 0);
+        if (w <= 0) return 0;
+        sent += (size_t)w;
+    }
+    return 1;
+}
+static Value b_send(Env*e, Value*a, int n) {
+    SocketBody *s = need_socket(a[0], "send");
+    if (!IS_STRLIKE(a[1].k)) die("send: expected a message string");
+    if (s->fd < 0) die("send: socket is closed");
+    int chunk = rt_has_attr("chunk");
+    if (!send_all(s, a[1].u.s, strlen(a[1].u.s))) die("send: send failed");
+    if (!chunk && !send_all(s, "\r\n", 2)) die("send: send failed");
+    return v_null();
+}
+static Value b_sendq(Env*e, Value*a, int n) {
+    SocketBody *s = need_socket(a[0], "send?");
+    if (!IS_STRLIKE(a[1].k)) die("send?: expected a message string");
+    if (s->fd < 0) return v_bool(0);
+    /* upstream trySend sends the message as-is, without the line ending */
+    return v_bool(send_all(s, a[1].u.s, strlen(a[1].u.s)));
+}
+static Value b_receive(Env*e, Value*a, int n) {
+    SocketBody *s = need_socket(a[0], "receive");
+    if (s->fd < 0) die("receive: socket is closed");
+    long maxlen = 65536, timeout = -1;
+    if (rt_has_attr("size")) { Value v = rt_attr_value("size", v_int(0)); if (v.k == V_INT && v.u.i > 0) maxlen = v.u.i; }
+    if (rt_has_attr("timeout")) { Value v = rt_attr_value("timeout", v_int(0)); if (v.k == V_INT) timeout = v.u.i; }
+    for (;;) {
+        /* a complete line already buffered? */
+        if (s->rbuf) {
+            char *nl = memchr(s->rbuf, '\n', s->rlen);
+            if (nl) {
+                size_t linelen = (size_t)(nl - s->rbuf);
+                size_t outlen = linelen;
+                if (outlen > 0 && s->rbuf[outlen - 1] == '\r') outlen--;
+                if ((long)outlen > maxlen) outlen = (size_t)maxlen;
+                char *out = xmalloc(outlen + 1); memcpy(out, s->rbuf, outlen); out[outlen] = 0;
+                size_t rest = s->rlen - (linelen + 1);
+                memmove(s->rbuf, nl + 1, rest); s->rlen = rest;
+                Value r = v_str(out); free(out); return r;
+            }
+            if ((long)s->rlen > maxlen) { /* overlong line: return the head, drop through the newline when it comes */
+                char *out = xmalloc((size_t)maxlen + 1); memcpy(out, s->rbuf, (size_t)maxlen); out[maxlen] = 0;
+                size_t rest = s->rlen - (size_t)maxlen;
+                memmove(s->rbuf, s->rbuf + maxlen, rest); s->rlen = rest;
+                Value r = v_str(out); free(out); return r;
+            }
+        }
+        if (timeout >= 0) {
+            struct pollfd pfd; pfd.fd = s->fd; pfd.events = POLLIN; pfd.revents = 0;
+            int pr = poll(&pfd, 1, (int)timeout);
+            if (pr == 0) die("receive: timeout");
+            if (pr < 0 && errno != EINTR) die("receive: poll failed");
+            if (pr < 0) continue;
+        }
+        char chunk[8192];
+        ssize_t got = recv(s->fd, chunk, sizeof chunk, 0);
+        if (got < 0) { if (errno == EINTR) continue; die("receive: receive failed"); }
+        if (got == 0) { /* EOF: an unterminated partial line is discarded, as in the host */
+            s->rlen = 0; return v_str("");
+        }
+        if (s->rlen + (size_t)got > s->rcap) {
+            size_t cap = (s->rlen + (size_t)got) * 2 + 64;
+            s->rbuf = realloc(s->rbuf, cap); if (!s->rbuf) die("out of memory");
+            s->rcap = cap;
+        }
+        memcpy(s->rbuf + s->rlen, chunk, (size_t)got); s->rlen += (size_t)got;
+    }
+}
+static Value b_unplug(Env*e, Value*a, int n) {
+    SocketBody *s = need_socket(a[0], "unplug");
+    if (s->fd >= 0) close(s->fd);
+    s->fd = -1;
+    return v_null();
+}
+static Value b_socketp(Env*e, Value*a, int n){ return v_bool(a[0].k==V_SOCKET); }
 static Value b_standalonep(Env*e,Value*a,int n){ return v_bool(1); }
 static Value b_superuserp(Env*e,Value*a,int n){ return v_bool(geteuid()==0); }
 static Value b_false_always(Env*e,Value*a,int n){ return v_bool(0); }
@@ -4730,7 +4890,9 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"attributeLabel?",b_attributelabelp},{"true?",b_truep},{"false?",b_falsep},
     {"permissions",b_permissions},{"terminal",b_terminal},
     {"standalone?",b_standalonep},{"superuser?",b_superuserp},{"bytecode?",b_false_always},
-    {"database?",b_false_always},{"socket?",b_false_always},{"store?",b_false_always},{"future?",b_futurep},
+    {"database?",b_false_always},{"socket?",b_socketp},{"store?",b_false_always},{"future?",b_futurep},
+    {"connect",b_connect},{"listen",b_listen},{"accept",b_accept},{"send",b_send},
+    {"send?",b_sendq},{"receive",b_receive},{"unplug",b_unplug},
     {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
     {"lower?",b_lowerp},{"upper?",b_upperp},{"numeric?",b_numericp},
     {"prefix?",b_prefixp},{"suffix?",b_suffixp},{"between?",b_betweenp},{"same?",b_samep},

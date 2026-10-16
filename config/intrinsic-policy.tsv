@@ -6,12 +6,10 @@
 # `unsupported` means compilation must reject the feature with a stable,
 # actionable diagnostic rather than failing later as an unknown function.
 __VerbosePackager	unavailable	unsupported
-accept	unavailable	unsupported
 browse	unavailable	unsupported
 cancel	unavailable	unsupported
 channel	unavailable	unsupported
 config	unavailable	unsupported
-connect	unavailable	unsupported
 cursor	unavailable	unsupported
 download	unavailable	unsupported
 emit	unavailable	unsupported
@@ -21,20 +19,15 @@ failed?	unavailable	unsupported
 finished?	unavailable	unsupported
 goto	unavailable	unsupported
 info	unavailable	unsupported
-listen	unavailable	unsupported
 mail	unavailable	unsupported
 off	unavailable	unsupported
 on	unavailable	unsupported
-receive	unavailable	unsupported
 request	unavailable	unsupported
-send	unavailable	unsupported
-send?	unavailable	unsupported
 serve	unavailable	unsupported
 spin	unavailable	unsupported
 stack	unavailable	unsupported
 store	unavailable	unsupported
 terminate	unavailable	unsupported
-unplug	unavailable	unsupported
 unstack	unavailable	unsupported
 unzip	unavailable	unsupported
 volume	unavailable	unsupported

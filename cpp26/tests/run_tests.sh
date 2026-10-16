@@ -280,6 +280,9 @@ for i in $(seq 1 25); do
 done
 if [ "$rerun_fail" -eq 0 ]; then ok; else bad "recompiled output not runnable at iteration $i"; fi
 
+echo "== socket parity over live TCP (host vs compiled) =="
+if ARTURO_HOST="$ARTURO" python3 tests/socket_test.py "$WORK" >"$WORK/sock.log" 2>&1; then ok; else bad "socket parity: $(cat "$WORK/sock.log")"; fi
+
 echo "== malformed AIR payloads rejected without a signal =="
 # Hand-crafted AIR1 streams: unknown opcode, out-of-range constant index,
 # and a define node with no expression. Each must exit nonzero, never by

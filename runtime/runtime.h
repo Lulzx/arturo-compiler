@@ -19,12 +19,22 @@ typedef enum {
     V_WORD, V_LABEL, V_LITERAL, V_SYMBOL, V_SYMBOLLITERAL, V_TYPE, V_VERSION, V_ERRORKIND, V_INLINE,
     V_PATHLABEL, V_PATHLITERAL, V_REGEX, V_ATTRIBUTE, V_ATTRIBUTELABEL,
     V_ERROR,
-    V_BIGINT
+    V_BIGINT,
+    V_SOCKET
 } VKind;
 
 typedef struct Value Value;
 typedef struct IR IR;
 typedef struct Env Env;
+typedef struct SocketBody SocketBody; /* shared socket state (V_SOCKET) */
+struct SocketBody {
+    int   fd;          /* -1 once unplugged */
+    int   udp;         /* IPPROTO_UDP vs TCP, for the tcp:// display */
+    long  port;
+    char *addr;        /* address text as connected/bound/accepted */
+    char *rbuf;        /* receive line buffer (bytes past the last line) */
+    size_t rlen, rcap;
+};
 typedef struct Dict Dict;   /* shared, heap-allocated dictionary body */
 typedef struct Block Block; /* shared, heap-allocated block body (Arturo ref type) */
 
@@ -57,6 +67,7 @@ struct Value {
         struct { Block *b; } block;    /* V_BLOCK — shared body, see Block above */
         Dict       *dict;       /* V_DICT */
         struct { IR *params; IR **body; int nbody; Env *closure; int constructor; int is_action; char **exports; int nexports; } fn; /* V_FUNC */
+        SocketBody *sock;   /* V_SOCKET — shared body, like Block/Dict */
     } u;
 };
 
