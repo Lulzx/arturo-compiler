@@ -267,6 +267,19 @@ for backend in fast c direct; do
     if [ "$ns" != "0" ] && [ "$ns" -lt 128 ] && grep -q "at .*/errline.art:4" "$WORK/e.err"; then ok; else bad "error line ($backend, status $ns): $(cat "$WORK/e.err")"; fi
 done
 
+echo "== recompiling the same output path produces runnable binaries =="
+# Regression: fast-backend outputs are replaced atomically; rapidly
+# re-creating one path must never yield a binary the OS kills on launch
+# (observed on macOS with in-place truncation + code-signature caching).
+printf 'print "rerun-ok"\n' > "$WORK/rerun.art"
+rerun_fail=0
+for i in $(seq 1 25); do
+    ./bin/arturoc "$WORK/rerun.art" "$WORK/rerun-bin" >/dev/null 2>&1 || { rerun_fail=1; break; }
+    out=$("$WORK/rerun-bin" 2>/dev/null) || { rerun_fail=1; break; }
+    [ "$out" = "rerun-ok" ] || { rerun_fail=1; break; }
+done
+if [ "$rerun_fail" -eq 0 ]; then ok; else bad "recompiled output not runnable at iteration $i"; fi
+
 echo "== malformed AIR payloads rejected without a signal =="
 # Hand-crafted AIR1 streams: unknown opcode, out-of-range constant index,
 # and a define node with no expression. Each must exit nonzero, never by

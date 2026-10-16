@@ -54,6 +54,21 @@ static void writeAll(const fs::path& p, const std::uint8_t* data, std::size_t n)
     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
     if (!out) throw artc::CompileError("failed writing " + p.string());
 }
+// Executables are replaced atomically (temp sibling + rename): truncating
+// in place can hand the OS a partially written file, and on macOS rapidly
+// re-creating the same path has been observed to get the new binary killed
+// by stale code-signature validation of the previous inode's contents.
+static void writeExecutable(const fs::path& p, const std::uint8_t* data, std::size_t n) {
+    fs::path tmp = p.string() + ".tmp-" + std::to_string(static_cast<long>(::getpid()));
+    writeAll(tmp, data, n);
+    ::chmod(tmp.c_str(), 0755);
+    std::error_code ec;
+    fs::rename(tmp, p, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        throw artc::CompileError("cannot replace " + p.string());
+    }
+}
 static fs::path exeDir() {
 #if defined(__APPLE__)
     char buf[4096];
@@ -212,8 +227,7 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < 8; ++k) out.push_back(static_cast<std::uint8_t>(v >> (8 * k)));
             };
             put64(off); put64(len); put64(0);
-            writeAll(outPath, out.data(), out.size());
-            ::chmod(outPath.c_str(), 0755);
+            writeExecutable(outPath, out.data(), out.size());
         } else if (backend == "c" || backend == "direct") {
             fs::path rt = findRuntimeDir();
             artc::CEmitter ce(prog);

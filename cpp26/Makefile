@@ -21,7 +21,7 @@ endif
 BIN      := bin
 SRC      := src
 
-.PHONY: all test bench clean
+.PHONY: all test bench random clean
 
 all: $(BIN)/arturoc $(BIN)/arturo-stub
 
@@ -50,6 +50,9 @@ test: all
 
 bench: all
 	bash tests/bench.sh
+
+random: all
+	bash tests/random_test.sh
 
 clean:
 	rm -f $(BIN)/arturoc $(BIN)/arturo-stub $(BIN)/*.o
