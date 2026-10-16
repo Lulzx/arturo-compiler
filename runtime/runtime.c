@@ -3688,6 +3688,17 @@ static Value b_unplug(Env*e, Value*a, int n) {
     return v_null();
 }
 static Value b_socketp(Env*e, Value*a, int n){ return v_bool(a[0].k==V_SOCKET); }
+static Value b_terminate(Env*e, Value*a, int n) {
+    if (a[0].k != V_INT) die("terminate: expected a process id");
+    /* upstream: processes we spawned are closed via the process table
+     * (unreachable here, since async spawning fails in the host too);
+     * external processes get sendSignal(pid, code) with code defaulting
+     * to 0 -- a liveness probe that leaves the process running */
+    long code = 0;
+    if (rt_has_attr("code")) { Value v = rt_attr_value("code", v_int(0)); if (v.k == V_INT) code = v.u.i; }
+    kill((pid_t)a[0].u.i, (int)code);
+    return v_null();
+}
 /* ---- terminal cursor / browser (host Io.nim + Net.nim semantics) -------- */
 static Value b_cursor(Env*e, Value*a, int n) {
     if (a[0].k != V_BOOL) die("cursor: expected a logical");
@@ -5513,6 +5524,9 @@ static Value b_write(Env*e,Value*a,int n){
 }
 /* `execute cmd` — run a shell command and return its captured stdout. */
 static Value b_execute(Env*e,Value*a,int n){
+    /* the pinned host's async execution path fails (exit 1, no output)
+     * for every program; fail the same way rather than run synchronously */
+    if(rt_has_attr("async")){die("execute: asynchronous execution failed");return v_null();}
     char *s=val_str(a[0]);
     FILE *p=popen(s,"r"); free(s);
     if(!p) return v_str("");
@@ -5651,7 +5665,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"zip",b_zip},{"unzip",b_unzip},{"volume",b_volume},
     {"request",b_request},{"download",b_download},
     {"cursor",b_cursor},{"goto",b_goto},{"browse",b_browse},
-    {"store",b_store},{"config",b_config},
+    {"store",b_store},{"config",b_config},{"terminate",b_terminate},
     {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
     {"lower?",b_lowerp},{"upper?",b_upperp},{"numeric?",b_numericp},
     {"prefix?",b_prefixp},{"suffix?",b_suffixp},{"between?",b_betweenp},{"same?",b_samep},

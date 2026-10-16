@@ -39,7 +39,7 @@ UNSUPPORTED_INTRINSICS: #[
     "mail": true "off": true "on": true
     "serve": true "spin": true
     "stack": true
-    "terminate": true "unstack": true
+    "unstack": true
 ]
 
 unsupportedIntrinsic?: function [name][ key? UNSUPPORTED_INTRINSICS name ]

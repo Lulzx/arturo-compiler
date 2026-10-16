@@ -335,6 +335,25 @@ if ./bin/arturoc "$WORK/browse.art" "$WORK/browsebin" >"$WORK/c.log" 2>&1; then
     if [ "$hostlog" = "$cpplog" ] && [ -n "$hostlog" ] && cmp -s "$WORK/b.host" "$WORK/b.cpp"; then ok; else bad "browse opener (host='$hostlog' cpp='$cpplog')"; fi
 else bad "compile browse: $(cat "$WORK/c.log")"; fi
 
+echo "== terminate signal semantics and execute.async failure (host-matching) =="
+printf 'pid: execute.async "sleep 5"\nprint "after"\n' > "$WORK/async.art"
+if ./bin/arturoc "$WORK/async.art" "$WORK/ab" >"$WORK/c.log" 2>&1; then
+    (cd "$WORK" && ./ab >/dev/null 2>&1); ns=$?
+    if [ "$ns" != "0" ] && [ "$ns" -lt 128 ]; then ok; else bad "execute.async should fail like the host (status $ns)"; fi
+else bad "compile async: $(cat "$WORK/c.log")"; fi
+sleep 30 & SL1=$!
+printf 'terminate %s\nprint "done"\n' "$SL1" > "$WORK/term1.art"
+sleep 30 & SL2=$!
+printf 'terminate.code: 9 %s\nprint "done"\n' "$SL2" > "$WORK/term2.art"
+termok=1
+./bin/arturoc "$WORK/term1.art" "$WORK/tb1" >/dev/null 2>&1 && "$WORK/tb1" >/dev/null 2>&1 || termok=0
+kill -0 $SL1 2>/dev/null || termok=0
+./bin/arturoc "$WORK/term2.art" "$WORK/tb2" >/dev/null 2>&1 && "$WORK/tb2" >/dev/null 2>&1 || termok=0
+sleep 0.3
+kill -0 $SL2 2>/dev/null && termok=0
+kill $SL1 2>/dev/null; wait $SL1 2>/dev/null; wait $SL2 2>/dev/null
+if [ "$termok" -eq 1 ]; then ok; else bad "terminate signal semantics"; fi
+
 echo "== store parity: cross-engine persistence (host vs compiled) =="
 if ARTURO_HOST="$ARTURO" python3 tests/store_test.py "$WORK" >"$WORK/store.log" 2>&1; then ok; else bad "store parity: $(cat "$WORK/store.log")"; fi
 
