@@ -8,7 +8,6 @@
 __VerbosePackager	unavailable	unsupported
 cancel	unavailable	unsupported
 channel	unavailable	unsupported
-emit	unavailable	unsupported
 eval	unavailable	unsupported
 event	unavailable	unsupported
 failed?	unavailable	unsupported
@@ -17,6 +16,5 @@ info	unavailable	unsupported
 mail	unavailable	unsupported
 off	unavailable	unsupported
 on	unavailable	unsupported
-serve	unavailable	unsupported
 stack	unavailable	unsupported
 unstack	unavailable	unsupported

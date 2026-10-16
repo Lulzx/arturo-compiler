@@ -14,7 +14,7 @@ if ! diff -u "$work/policy" "$work/compiler"; then
 fi
 
 set +e
-./tmp/ncomp fixtures/unsupported/serve.art "$work/program" >"$work/output" 2>&1
+./tmp/ncomp fixtures/unsupported/stack.art "$work/program" >"$work/output" 2>&1
 status=$?
 set -e
 
@@ -22,7 +22,7 @@ if [ "$status" -eq 0 ]; then
     echo "FAIL unsupported capability compiled successfully" >&2
     exit 1
 fi
-if ! grep -q 'unsupported standalone capability: serve' "$work/output"; then
+if ! grep -q 'unsupported standalone capability: stack' "$work/output"; then
     echo "FAIL missing stable unsupported-capability diagnostic" >&2
     cat "$work/output" >&2
     exit 1

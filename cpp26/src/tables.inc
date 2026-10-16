@@ -527,7 +527,6 @@ inline constexpr const char* kUnsupportedIntrinsics[] = {
   "__VerbosePackager",
   "cancel",
   "channel",
-  "emit",
   "eval",
   "event",
   "failed?",
@@ -536,7 +535,6 @@ inline constexpr const char* kUnsupportedIntrinsics[] = {
   "mail",
   "off",
   "on",
-  "serve",
   "stack",
   "unstack",
 };

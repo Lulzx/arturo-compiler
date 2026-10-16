@@ -259,6 +259,60 @@ class Emitter {
         }
     }
 
+    // `serve [routes]`: compile the route table into an evaluated block of
+    // (method, pattern, handler-function) triples so route actions run as
+    // real closures instead of raw token blocks.
+    std::uint32_t emitServeFunc(const Token& paramsTok, const Token& bodyTok) {
+        auto pg = std::make_shared<GNode>();
+        pg->kind = GNode::Kind::BlockRaw; pg->token = paramsTok;
+        auto bg = std::make_shared<GNode>();
+        bg->kind = GNode::Kind::BlockRaw; bg->token = bodyTok;
+        std::vector<std::uint32_t> kids{paramsOf(pg)};
+        auto body = bodyOf(bg);
+        for (auto k : p_.nodes[body].kids) kids.push_back(k);
+        return p_.make(air::Op::Function, std::move(kids));
+    }
+    std::uint32_t emitServeRoutes(const std::vector<Token>& kids) {
+        std::vector<std::uint32_t> out;
+        auto constStr = [&](const std::string& s) {
+            air::Const c; c.kind = air::CKind::Str; c.s = s;
+            return p_.makeConst(c);
+        };
+        static const std::unordered_set<std::string> kMethods = {
+            "GET", "POST", "PUT", "PATCH", "DELETE"};
+        std::size_t i = 0;
+        while (i < kids.size()) {
+            if (kids[i].kind != TK::Word || !kMethods.count(kids[i].text))
+                throw CompileError("serve: invalid routes (expected GET/POST/PUT/PATCH/DELETE)");
+            std::string method = kids[i].text;
+            ++i;
+            if (i >= kids.size() || kids[i].kind != TK::Str)
+                throw CompileError("serve: invalid routes (missing pattern)");
+            std::string pattern = kids[i].text;
+            ++i;
+            out.push_back(constStr(method));
+            out.push_back(constStr(pattern));
+            if (i + 2 < kids.size() + 1 && i < kids.size() && kids[i].kind == TK::Symbol &&
+                kids[i].text == "$" && i + 2 < kids.size() &&
+                kids[i + 1].kind == TK::Block && kids[i + 2].kind == TK::Block) {
+                out.push_back(emitServeFunc(kids[i + 1], kids[i + 2]));
+                i += 3;
+            } else if (i < kids.size() && kids[i].kind == TK::Block) {
+                Token empty; empty.kind = TK::Block;
+                out.push_back(emitServeFunc(empty, kids[i]));
+                ++i;
+            } else if (i < kids.size() &&
+                       (kids[i].kind == TK::Word || kids[i].kind == TK::Literal)) {
+                out.push_back(emit(g_.wordNode(kids[i].text, kids[i].line)));
+                ++i;
+            } else {
+                throw CompileError("serve: invalid routes (bad action)");
+            }
+        }
+        auto id = p_.make(air::Op::Block, std::move(out));
+        p_.nodes[id].aux = 0;  // evaluated block: strings + closures
+        return id;
+    }
     std::uint32_t emitCall(const GPtr& g) {
         const std::string name = Grouper::calleeName(g->fn);
         const bool intrinsicCallee = g->fn && g->fn->kind == GNode::Kind::Leaf && g->fn->intrinsic;
@@ -277,6 +331,17 @@ class Emitter {
                 auto id = p_.make(name == "function" ? air::Op::Function : air::Op::Method, std::move(kids));
                 attachAttrs(id, g);
                 return id;
+            }
+            if (name == "serve") {
+                need(1);
+                if (a[0]->kind == GNode::Kind::BlockRaw && !a[0]->evaluated) {
+                    auto routes = emitServeRoutes(a[0]->token.kids);
+                    auto id = p_.make(air::Op::Call,
+                                      {p_.makeNamed(air::Op::Intrinsic, "serve"), routes});
+                    attachAttrs(id, g);
+                    return id;
+                }
+                // function-form / stored routes fall through to generic call
             }
             if (name == "constructor") { need(1); return p_.make(air::Op::Constructor, {paramsOf(a[0])}); }
             if (name == "if") { need(2); auto id = p_.make(air::Op::If, {emit(a[0]), bodyOf(a[1])}); attachAttrs(id, g); return id; }

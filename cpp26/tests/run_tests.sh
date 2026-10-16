@@ -375,6 +375,9 @@ if ARTURO_HOST="$ARTURO" python3 tests/http_test.py "$WORK" >"$WORK/http.log" 2>
 echo "== socket parity over live TCP (host vs compiled) =="
 if ARTURO_HOST="$ARTURO" python3 tests/socket_test.py "$WORK" >"$WORK/sock.log" 2>&1; then ok; else bad "socket parity: $(cat "$WORK/sock.log")"; fi
 
+echo "== serve parity over live HTTP (host vs compiled) =="
+if ARTURO_HOST="$ARTURO" python3 tests/serve_test.py "$WORK" >"$WORK/serve.log" 2>&1; then ok; else bad "serve parity: $(cat "$WORK/serve.log")"; fi
+
 echo "== malformed AIR payloads rejected without a signal =="
 # Hand-crafted AIR1 streams: unknown opcode, out-of-range constant index,
 # and a define node with no expression. Each must exit nonzero, never by

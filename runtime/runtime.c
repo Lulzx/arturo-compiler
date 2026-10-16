@@ -4036,6 +4036,489 @@ static Value b_download(Env*e, Value*a, int n) {
     if (rc != 0) die("download: download failed");
     return v_null();
 }
+typedef struct { const char *p; } JsonCur;   /* store section below */
+static Value json_parse_value(JsonCur *c);
+/* ---- web server: serve / emit / send.* (host Net.nim + serve.art) ------- */
+/* Replicates the host's block-routes server: routes are registered from
+ * the (unevaluated) routes block, patterns are anchored regexes with
+ * named captures, actions run per request with `Request` bound, `emit`
+ * and `send.*` set response headers/status, action errors become 500,
+ * and unmatched paths 404. Responses use the host server's framing:
+ * `HTTP/1.1 <status>` with Content-Length, Server: Arturo-HTTP, Date,
+ * then the response headers. The function form takes the Request dict
+ * and returns a string body or a response dictionary. */
+static int   g_serve_active = 0;
+static long  g_serve_status = 0;      /* set via emit .status (0 = unset) */
+static Value g_serve_headers;         /* dict set by emit, or null */
+static void serve_set_content_type(const char *type, int with_attrs) {
+    const char *ct = type;
+    if (with_attrs && rt_has_attr("as")) { Value v = rt_attr_value("as", v_str("")); if (IS_STRLIKE(v.k)) ct = v.u.s; }
+    char **keys = xmalloc(2 * sizeof(char*)); Value *vals = xmalloc(2 * sizeof(Value));
+    keys[0] = strdup("Content-Type"); vals[0] = v_str(ct);
+    int n = 1;
+    if (with_attrs && rt_has_attr("headers")) {
+        Value h = rt_attr_value("headers", v_null());
+        if (h.k == V_DICT) {
+            keys = realloc(keys, sizeof(char*) * (size_t)(h.u.dict->n + 1));
+            vals = realloc(vals, sizeof(Value) * (size_t)(h.u.dict->n + 1));
+            for (int i = 0; i < h.u.dict->n; i++) {
+                if (!strcmp(h.u.dict->keys[i], "Content-Type")) { vals[0] = h.u.dict->vals[i]; continue; }
+                keys[n] = strdup(h.u.dict->keys[i]); vals[n] = h.u.dict->vals[i]; n++;
+            }
+        }
+    }
+    g_serve_headers = v_dict(keys, vals, n);
+    if (with_attrs && rt_has_attr("status")) { Value v = rt_attr_value("status", v_int(0)); if (v.k == V_INT) g_serve_status = v.u.i; }
+}
+static Value emit_common(Env*e, Value*a, int n, const char *preset) {
+    if (!g_serve_active) die("emit: no active request");
+    const char *ct = preset;
+    if (!ct) {
+        ct = "text/plain";
+        if (rt_has_attr("css")) ct = "text/css";
+        else if (rt_has_attr("html")) ct = "text/html";
+        else if (rt_has_attr("js")) ct = "application/javascript";
+        else if (rt_has_attr("json")) ct = "application/json";
+        else if (rt_has_attr("xml")) ct = "application/xml";
+    }
+    serve_set_content_type(ct, 1);
+    return a[0];
+}
+static Value b_emit(Env*e, Value*a, int n) { return emit_common(e, a, n, NULL); }
+static Value b_send_html(Env*e, Value*a, int n) { return emit_common(e, a, n, "text/html"); }
+static Value b_send_json(Env*e, Value*a, int n) { return emit_common(e, a, n, "application/json"); }
+
+typedef struct {
+    char *method;
+    char *pattern;
+    regex_t rx;
+    char **group_names;
+    int ngroups;
+    Value action;          /* block token value, or inline+body pair, or name */
+    int action_is_func;    /* action carries named params (inline or V_FUNC) */
+    Value func_params;     /* inline token (param names) when structural */
+    Value func_value;      /* resolved function when referenced by name */
+} ServeRoute;
+static ServeRoute *g_routes = NULL;
+static int g_nroutes = 0;
+
+static char *serve_regex_source(const char *pattern, char ***names_out, int *ngroups_out) {
+    /* translate (?<name>...) / (?P<name>...) to plain groups, recording names */
+    size_t cap = strlen(pattern) + 16, len = 0;
+    char *out = xmalloc(cap);
+    char **names = NULL; int ngroups = 0, ncap = 0;
+    for (const char *p = pattern; *p; p++) {
+        const char *name_start = NULL; size_t name_len = 0;
+        if (p[0] == '(' && p[1] == '?' && p[2] == '<') { name_start = p + 3; }
+        else if (p[0] == '(' && p[1] == '?' && p[2] == 'P' && p[3] == '<') { name_start = p + 4; }
+        if (name_start) {
+            const char *gt = strchr(name_start, '>');
+            if (gt && gt > name_start) {
+                name_len = (size_t)(gt - name_start);
+                if (len + 2 >= cap) { cap *= 2; out = realloc(out, cap); }
+                out[len++] = '(';
+                if (ngroups == ncap) { ncap = ncap ? ncap * 2 : 4; names = realloc(names, (size_t)ncap * sizeof(char*)); }
+                names[ngroups] = xmalloc(name_len + 1); memcpy(names[ngroups], name_start, name_len); names[ngroups][name_len] = 0;
+                ngroups++;
+                p = gt;
+                continue;
+            }
+        }
+        /* translate PCRE classes \d \w \s (and negations) to POSIX */
+        if (p[0] == '\\' && p[1] && strchr("dwsDWS", p[1])) {
+            if (len + 24 >= cap) { cap *= 2; out = realloc(out, cap); }
+            const char *rep;
+            switch (p[1]) {
+                case 'd': rep = "[0-9]"; break;
+                case 'w': rep = "[A-Za-z0-9_]"; break;
+                case 's': rep = "[[:space:]]"; break;
+                case 'D': rep = "[^0-9]"; break;
+                case 'W': rep = "[^A-Za-z0-9_]"; break;
+                default:  rep = "[^[:space:]]"; break;
+            }
+            size_t rl = strlen(rep); memcpy(out + len, rep, rl); len += rl;
+            p++;
+            continue;
+        }
+        if (len + 2 >= cap) { cap *= 2; out = realloc(out, cap); }
+        out[len++] = *p;
+    }
+    out[len] = 0;
+    *names_out = names; *ngroups_out = ngroups;
+    return out;
+}
+static void serve_add_route(const char *method, const char *pattern, Value action, int is_func, Value params, Value func_value) {
+    g_routes = realloc(g_routes, sizeof(ServeRoute) * (size_t)(g_nroutes + 1));
+    ServeRoute *r = &g_routes[g_nroutes++];
+    memset(r, 0, sizeof *r);
+    r->method = strdup(method);
+    r->pattern = strdup(pattern);
+    char *src = serve_regex_source(pattern, &r->group_names, &r->ngroups);
+    char *anchored = xmalloc(strlen(src) + 3);
+    sprintf(anchored, "^%s$", src);
+    regcomp(&r->rx, anchored, REG_EXTENDED);
+    free(src); free(anchored);
+    r->action = action; r->action_is_func = is_func; r->func_params = params; r->func_value = func_value;
+}
+static void serve_parse_routes(Value routes_block) {
+    if (routes_block.k != V_BLOCK || !routes_block.u.block.b) die("serve: expected a routes block");
+    int cnt = routes_block.u.block.b->n;
+    Value *items = xmalloc(sizeof(Value) * (size_t)(cnt ? cnt : 1));
+    for (int i = 0; i < cnt; i++) items[i] = *routes_block.u.block.b->items[i];
+    int pos = 0;
+    static const char *methods[] = {"GET", "POST", "PUT", "PATCH", "DELETE", NULL};
+    /* compiled form: evaluated (method, pattern, function) triples built
+     * by the frontend from a literal routes block */
+    if (cnt >= 3 && items[0].k == V_STR && items[1].k == V_STR
+        && (items[2].k == V_FUNC || items[2].k == V_BUILTIN)) {
+        while (pos + 2 < cnt + 1 && pos < cnt) {
+            char *method = val_str(items[pos]);
+            char *pattern = val_str(items[pos + 1]);
+            serve_add_route(method, pattern, v_null(), 1, v_null(), items[pos + 2]);
+            free(method); free(pattern);
+            pos += 3;
+        }
+        free(items);
+        return;
+    }
+    while (pos < cnt) {
+        Value m = items[pos];
+        const char *method = NULL;
+        if (m.k == V_WORD || m.k == V_STR) {
+            for (int i = 0; methods[i]; i++) if (!strcmp(m.u.s, methods[i])) method = methods[i];
+        }
+        if (!method) die("serve: invalid routes (expected GET/POST/PUT/PATCH/DELETE)");
+        pos++;
+        if (pos >= cnt) die("serve: invalid routes (missing pattern)");
+        Value pat = items[pos++];
+        char *pattern = val_str(pat);
+        if (pos >= cnt) die("serve: invalid routes (missing action)");
+        Value act = items[pos];
+        if (act.k == V_SYMBOL && !strcmp(act.u.s, "$") && pos + 2 < cnt
+            && items[pos + 1].k == V_BLOCK && items[pos + 2].k == V_BLOCK) {
+            /* $[params][body] inline function: symbol marker + two blocks */
+            serve_add_route(method, pattern, items[pos + 2], 1, items[pos + 1], v_null());
+            pos += 3;
+        } else if (act.k == V_INLINE && pos + 1 < cnt && items[pos + 1].k == V_BLOCK) {
+            serve_add_route(method, pattern, items[pos + 1], 1, act, v_null());
+            pos += 2;
+        } else if (act.k == V_BLOCK) {
+            serve_add_route(method, pattern, act, 0, v_null(), v_null());
+            pos++;
+        } else if (act.k == V_WORD || act.k == V_LITERAL || act.k == V_STR) {
+            serve_add_route(method, pattern, act, 1, v_null(), act);
+            pos++;
+        } else { char msg[128]; snprintf(msg, sizeof msg, "serve: invalid routes (bad action kind %d pos %d cnt %d)", (int)act.k, pos, cnt); die(msg); }
+        free(pattern);
+    }
+    free(items);
+}
+/* look up an action argument in body, then query, then captures (upstream
+ * callActionFunction appends from each source that has the key) */
+static void serve_param_values(const char *name, Value body, Value query, Value captures,
+                               Value **argv, int *argc, int cap) {
+    Value srcs[3] = {body, query, captures};
+    for (int s = 0; s < 3; s++) {
+        if (srcs[s].k != V_DICT) continue;
+        int idx = dict_find(srcs[s], name);
+        if (idx >= 0 && *argc < cap) (*argv)[(*argc)++] = srcs[s].u.dict->vals[idx];
+    }
+}
+static Value serve_run_guarded(Env *frame, Value action_block, Value fn_value, Value *argv, int argc, int *ok) {
+    jmp_buf jb; jmp_buf *prev = g_try_jmp; AttrContext savedAttrs = g_attrs;
+    unsigned long savedEnvSerial = g_env_serial;
+    g_try_jmp = &jb;
+    *ok = 1;
+    if (setjmp(jb) == 0) {
+        Value r = fn_value.k == V_FUNC || fn_value.k == V_BUILTIN
+            ? rt_apply(frame, fn_value, argv, argc)
+            : runBlockValue(frame, action_block);
+        g_try_jmp = prev;
+        return r;
+    }
+    g_try_jmp = prev; g_attrs = savedAttrs; env_rewind(savedEnvSerial);
+    *ok = 0;
+    return v_null();
+}
+typedef struct { int fd; char *buf; size_t len, cap; } ServeConn;
+static int serve_conn_fill(ServeConn *c) {
+    if (c->len == c->cap) { c->cap = c->cap ? c->cap * 2 : 8192; c->buf = realloc(c->buf, c->cap); }
+    ssize_t got = recv(c->fd, c->buf + c->len, c->cap - c->len, 0);
+    if (got <= 0) return 0;
+    c->len += (size_t)got;
+    return 1;
+}
+static char *serve_conn_line(ServeConn *c) {
+    for (;;) {
+        for (size_t i = 0; i + 1 < c->len; i++) {
+            if (c->buf[i] == '\r' && c->buf[i + 1] == '\n') {
+                char *line = xmalloc(i + 1); memcpy(line, c->buf, i); line[i] = 0;
+                memmove(c->buf, c->buf + i + 2, c->len - (i + 2)); c->len -= i + 2;
+                return line;
+            }
+        }
+        if (!serve_conn_fill(c)) {
+            if (c->len == 0) return NULL;
+            char *line = xmalloc(c->len + 1); memcpy(line, c->buf, c->len); line[c->len] = 0;
+            c->len = 0;
+            return line;
+        }
+    }
+}
+static int serve_conn_exact(ServeConn *c, char *out, size_t want) {
+    size_t have = 0;
+    while (have < want) {
+        if (c->len > 0) {
+            size_t take = c->len < want - have ? c->len : want - have;
+            memcpy(out + have, c->buf, take); have += take;
+            memmove(c->buf, c->buf + take, c->len - take); c->len -= take;
+        } else if (!serve_conn_fill(c)) return 0;
+    }
+    return 1;
+}
+static void serve_url_decode_into(const char *in, char *out) {
+    while (*in) {
+        if (*in == '%' && isxdigit((unsigned char)in[1]) && isxdigit((unsigned char)in[2])) {
+            char tmp[3] = {in[1], in[2], 0};
+            *out++ = (char)strtol(tmp, NULL, 16); in += 3;
+        } else if (*in == '+') { *out++ = ' '; in++; }
+        else *out++ = *in++;
+    }
+    *out = 0;
+}
+static Value serve_query_dict(const char *qs) {
+    char **keys = NULL; Value *vals = NULL; int n = 0, cap = 0;
+    if (qs && *qs) {
+        char *copy = strdup(qs);
+        char *save = NULL;
+        for (char *part = strtok_r(copy, "&", &save); part; part = strtok_r(NULL, "&", &save)) {
+            char *eq = strchr(part, '=');
+            char *k = xmalloc(strlen(part) + 1), *v = xmalloc(strlen(part) + 1);
+            if (eq) { *eq = 0; serve_url_decode_into(part, k); serve_url_decode_into(eq + 1, v); }
+            else { serve_url_decode_into(part, k); strcpy(v, ""); }
+            if (n == cap) { cap = cap ? cap * 2 : 8; keys = realloc(keys, (size_t)cap * sizeof(char*)); vals = realloc(vals, (size_t)cap * sizeof(Value)); }
+            keys[n] = k; vals[n] = v_str(v); free(v); n++;
+        }
+        free(copy);
+    }
+    return v_dict(keys, vals, n);
+}
+static Value serve_form_dict(const char *body) { return serve_query_dict(body); }
+static void serve_send_response(ServeConn *c, long status, Value headers, const char *body) {
+    char date[64];
+    time_t now = time(NULL); struct tm gmt; gmtime_r(&now, &gmt);
+    strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S GMT", &gmt);
+    size_t blen = strlen(body);
+    dprintf(c->fd, "HTTP/1.1 %ld\r\nContent-Length: %zu\r\nServer: Arturo-HTTP\r\nDate: %s\r\n", status, blen, date);
+    if (headers.k == V_DICT) {
+        for (int i = 0; i < headers.u.dict->n; i++) {
+            char *v = val_str(headers.u.dict->vals[i]);
+            dprintf(c->fd, "%s: %s\r\n", headers.u.dict->keys[i], v);
+            free(v);
+        }
+    }
+    dprintf(c->fd, "\r\n");
+    if (blen) { const char *p = body; size_t left = blen; while (left) { ssize_t w = write(c->fd, p, left); if (w <= 0) break; p += w; left -= (size_t)w; } }
+}
+static Value serve_dict3(const char *k1, Value v1, const char *k2, Value v2, const char *k3, Value v3,
+                         const char *k4, Value v4, const char *k5, Value v5, const char *k6, Value v6) {
+    char **keys = xmalloc(6 * sizeof(char*)); Value *vals = xmalloc(6 * sizeof(Value));
+    keys[0] = strdup(k1); vals[0] = v1; keys[1] = strdup(k2); vals[1] = v2;
+    keys[2] = strdup(k3); vals[2] = v3; keys[3] = strdup(k4); vals[3] = v4;
+    keys[4] = strdup(k5); vals[4] = v5; keys[5] = strdup(k6); vals[5] = v6;
+    return v_dict(keys, vals, 6);
+}
+static Value b_serve(Env*e, Value*a, int n) {
+    long port = 18966;
+    if (rt_has_attr("port")) { Value v = rt_attr_value("port", v_int(0)); if (v.k == V_INT) port = v.u.i; }
+    int log_enabled = !rt_has_attr("verbose");   /* upstream checks "verbose", not "silent" */
+    int function_form = a[0].k == V_FUNC;
+    if (!function_form) serve_parse_routes(a[0]);
+    signal(SIGPIPE, SIG_IGN);
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) die("serve: cannot create socket");
+    int one = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sin; memset(&sin, 0, sizeof sin);
+    sin.sin_family = AF_INET; sin.sin_addr.s_addr = htonl(INADDR_ANY); sin.sin_port = htons((unsigned short)port);
+    if (bind(lfd, (struct sockaddr*)&sin, sizeof sin) != 0) { close(lfd); die("serve: cannot bind port"); }
+    if (listen(lfd, SOMAXCONN) != 0) { close(lfd); die("serve: cannot listen"); }
+    printf(" :: Starting server on port %ld...\n", port); fflush(stdout);
+    for (;;) {
+        struct sockaddr_in cin; socklen_t cl = sizeof cin;
+        int fd = accept(lfd, (struct sockaddr*)&cin, &cl);
+        if (fd < 0) continue;
+        ServeConn conn = {fd, NULL, 0, 0};
+        for (;;) {   /* keep-alive request loop on this connection */
+            char *request_line = serve_conn_line(&conn);
+            if (!request_line) break;
+            if (!*request_line) { free(request_line); continue; }
+            char method[16] = "", uri[4096] = "", version[16] = "";
+            sscanf(request_line, "%15s %4095s %15s", method, uri, version);
+            free(request_line);
+            long content_length = 0; int conn_close = 0;
+            char *hdr;
+            Value req_headers = v_dict((char**)xmalloc(sizeof(char*)), (Value*)xmalloc(sizeof(Value)), 0);
+            while ((hdr = serve_conn_line(&conn)) && *hdr) {
+                char *colon = strchr(hdr, ':');
+                if (colon) {
+                    *colon = 0;
+                    char *val = colon + 1; while (*val == ' ') val++;
+                    char lname[128]; lower_into(lname, hdr, sizeof lname);
+                    if (!strcmp(lname, "content-length")) content_length = atol(val);
+                    if (!strcmp(lname, "connection") && strcasestr(val, "close")) conn_close = 1;
+                    /* request headers keep the host's title-case keys */
+                    Dict *d = req_headers.u.dict;
+                    int idx = dict_find(req_headers, hdr);
+                    if (idx >= 0) d->vals[idx] = v_str(val);
+                    else {
+                        dict_reserve(d, d->n + 1);
+                        d->keys[d->n] = strdup(hdr); d->vals[d->n] = v_str(val);
+                        dict_index_add(d, d->n); d->n++;
+                    }
+                }
+                free(hdr);
+            }
+            if (!hdr && content_length == 0 && !method[0]) break;
+            free(hdr);
+            char *body_raw = xmalloc((size_t)content_length + 1);
+            if (content_length > 0 && !serve_conn_exact(&conn, body_raw, (size_t)content_length)) { free(body_raw); break; }
+            body_raw[content_length] = 0;
+            /* split uri into path + query */
+            char *qm = strchr(uri, '?');
+            char path_only[4096]; size_t pl = qm ? (size_t)(qm - uri) : strlen(uri);
+            if (pl >= sizeof path_only) pl = sizeof path_only - 1;
+            memcpy(path_only, uri, pl); path_only[pl] = 0;
+            Value query = serve_query_dict(qm ? qm + 1 : "");
+            Value body_value;
+            if (!strcmp(method, "GET")) body_value = v_str("");
+            else {
+                JsonCur cur = { body_raw };
+                Value parsed = json_parse_value(&cur);
+                body_value = (parsed.k == V_DICT) ? parsed : serve_form_dict(body_raw);
+            }
+            Value request = serve_dict3("method", v_str(method), "path", v_str(path_only), "uri", v_str(uri),
+                                        "body", body_value, "query", query, "headers", req_headers);
+            struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+            g_serve_active = 1; g_serve_status = 0; g_serve_headers = v_null();
+            long status = 200;
+            Value result = v_null(); int action_ok = 1; int matched = 0;
+            if (function_form) {
+                Value args1[1] = {request};
+                result = serve_run_guarded(e, v_null(), a[0], args1, 1, &action_ok);
+                matched = 1;
+            } else {
+                for (int ri = 0; ri < g_nroutes && !matched; ri++) {
+                    ServeRoute *r = &g_routes[ri];
+                    if (strcmp(r->method, method)) continue;
+                    regmatch_t matches[32];
+                    if (regexec(&r->rx, path_only, 32, matches, 0) != 0) continue;
+                    matched = 1;
+                    /* named captures */
+                    char **ck = NULL; Value *cv = NULL; int cn = 0;
+                    if (r->ngroups) {
+                        ck = xmalloc(sizeof(char*) * (size_t)r->ngroups); cv = xmalloc(sizeof(Value) * (size_t)r->ngroups);
+                        for (int gi = 0; gi < r->ngroups; gi++) {
+                            ck[cn] = strdup(r->group_names[gi]);
+                            if (matches[gi + 1].rm_so >= 0) {
+                                size_t gl = (size_t)(matches[gi + 1].rm_eo - matches[gi + 1].rm_so);
+                                char *gv = xmalloc(gl + 1); memcpy(gv, path_only + matches[gi + 1].rm_so, gl); gv[gl] = 0;
+                                cv[cn] = v_str(gv); free(gv);
+                            } else cv[cn] = v_str("");
+                            cn++;
+                        }
+                    }
+                    Value captures = v_dict(ck, cv, cn);
+                    Env *frame = env_new(e);
+                    env_define_local(frame, "Request", request);
+                    if (r->action_is_func && r->func_value.k != V_FUNC && r->func_value.k != V_BUILTIN) {
+                        /* inline $[params][body] action */
+                        int np = ((r->func_params.k == V_INLINE || r->func_params.k == V_BLOCK) && r->func_params.u.block.b) ? r->func_params.u.block.b->n : 0;
+                        Value *argv = xmalloc(sizeof(Value) * (size_t)(np * 3 + 1)); int argc = 0;
+                        for (int pi = 0; pi < np; pi++) {
+                            Value pnm = *r->func_params.u.block.b->items[pi];
+                            if (IS_STRLIKE(pnm.k)) serve_param_values(pnm.u.s, body_value, query, captures, &argv, &argc, np * 3);
+                        }
+                        /* bind positionally by declared param order */
+                        Env *call_frame = env_new(frame);
+                        int ai = 0;
+                        for (int pi = 0; pi < np; pi++) {
+                            Value pnm = *r->func_params.u.block.b->items[pi];
+                            if (IS_STRLIKE(pnm.k)) env_define_local(call_frame, pnm.u.s, ai < argc ? argv[ai++] : v_null());
+                        }
+                        result = serve_run_guarded(call_frame, r->action, v_null(), NULL, 0, &action_ok);
+                        (void)argv;
+                    } else if (r->action_is_func) {
+                        /* function value (compiled route) or name to resolve:
+                         * gather args by param name, call once */
+                        Value fn = (r->func_value.k == V_FUNC || r->func_value.k == V_BUILTIN)
+                            ? r->func_value : env_get(e, r->func_value.u.s);
+                        Value *argv = NULL; int argc = 0;
+                        if (fn.k == V_FUNC) {
+                            IR *params = fn.u.fn.params;
+                            int np = (params && params->op && params->opcode == OP_BLOCK) ? params->nargs : 0;
+                            argv = xmalloc(sizeof(Value) * (size_t)(np * 3 + 1));
+                            for (int pi = 0; pi < np; pi++) {
+                                IR *pnode = params->args[pi];
+                                const char *nm = NULL;
+                                if (pnode->op && pnode->opcode == OP_LOAD) nm = pnode->name;
+                                else if (pnode->op && pnode->opcode == OP_CONST && IS_STRLIKE(pnode->v.k)) nm = pnode->v.u.s;
+                                if (nm) serve_param_values(nm, body_value, query, captures, &argv, &argc, np * 3);
+                            }
+                        }
+                        result = serve_run_guarded(frame, v_null(), fn, argv, argc, &action_ok);
+                    } else {
+                        result = serve_run_guarded(frame, r->action, v_null(), NULL, 0, &action_ok);
+                    }
+                }
+            }
+            if (!matched) status = 404;
+            else if (!action_ok) status = 500;
+            else if (g_serve_status) status = g_serve_status;
+            Value headers = g_serve_headers;
+            const char *body_out = "";
+            char *body_alloc = NULL;
+            if (action_ok) {
+                if (function_form && result.k == V_DICT) {
+                    int bi = dict_find(result, "body");
+                    if (bi >= 0) { char *s = val_str(result.u.dict->vals[bi]); body_alloc = s; body_out = s; }
+                    int si = dict_find(result, "status");
+                    if (si >= 0 && result.u.dict->vals[si].k == V_INT) status = result.u.dict->vals[si].u.i;
+                    int hi = dict_find(result, "headers");
+                    if (hi >= 0) headers = result.u.dict->vals[hi];
+                } else if (result.k == V_STR) body_out = result.u.s;
+                else if (result.k != V_NULL) { body_alloc = val_str(result); body_out = body_alloc; }
+            }
+            if (headers.k != V_DICT) headers = v_dict((char**)xmalloc(sizeof(char*)), (Value*)xmalloc(sizeof(Value)), 0);
+            if (!function_form && dict_find(headers, "Content-Type") < 0) {
+                /* host adds text/html when the action didn't set one */
+                Dict *d = headers.u.dict;
+                dict_reserve(d, d->n + 1);
+                d->keys[d->n] = strdup("Content-Type"); d->vals[d->n] = v_str("text/html");
+                dict_index_add(d, d->n); d->n++;
+            }
+            g_serve_active = 0;
+            serve_send_response(&conn, status, headers, body_out);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            if (log_enabled) {
+                char ts[40]; time_t now = time(NULL); struct tm lt; localtime_r(&now, &lt);
+                char tz[8]; strftime(tz, sizeof tz, "%z", &lt);
+                char tzs[10]; snprintf(tzs, sizeof tzs, "%.3s:%.2s", tz, tz + 3);
+                strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S", &lt);
+                double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+                int hi2 = dict_find(headers, "Content-Type");
+                const char *ct = hi2 >= 0 ? headers.u.dict->vals[hi2].u.s : "";
+                printf(" -- %ld [%s%s] %s %s %s |   %.2f ms \n", status, ts, tzs, method, uri, ct, ms);
+                fflush(stdout);
+            }
+            free(body_raw); free(body_alloc);
+            if (conn_close) break;
+            if (!strcmp(version, "HTTP/1.0")) break;
+        }
+        free(conn.buf);
+        close(fd);
+    }
+    return v_null();
+}
 /* ---- persistent stores: store / config (host Databases.nim semantics) -- */
 /* A store is a dictionary persisted to a file: native format is Arturo
  * source (`key: <literal>` lines), JSON format is pretty-printed JSON.
@@ -4153,7 +4636,6 @@ static Value store_token_value(Value *items, int n, int *pos) {
     return t;
 }
 /* minimal JSON reader for JSON store files */
-typedef struct { const char *p; } JsonCur;
 static void json_skip(JsonCur *c) { while (*c->p == ' ' || *c->p == '\n' || *c->p == '\r' || *c->p == '\t') c->p++; }
 static Value json_parse_value(JsonCur *c);
 static char *json_parse_string(JsonCur *c) {
@@ -5694,6 +6176,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"request",b_request},{"download",b_download},
     {"cursor",b_cursor},{"goto",b_goto},{"browse",b_browse},
     {"store",b_store},{"config",b_config},{"terminate",b_terminate},
+    {"serve",b_serve},{"emit",b_emit},{"send.html",b_send_html},{"send.json",b_send_json},
     {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
     {"lower?",b_lowerp},{"upper?",b_upperp},{"numeric?",b_numericp},
     {"prefix?",b_prefixp},{"suffix?",b_suffixp},{"between?",b_betweenp},{"same?",b_samep},
