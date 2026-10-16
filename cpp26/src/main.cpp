@@ -38,6 +38,11 @@
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
+// arturoc's own release version; the compiler targets the pinned
+// Arturo 0.10.0 language/runtime (see cpp26/CONTRACT.md).
+static constexpr const char* kArturocVersion = "1.0.0";
+static constexpr const char* kTargetArturoVersion = "0.10.0";
+
 static double msSince(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
@@ -140,8 +145,12 @@ int main(int argc, char** argv) {
             else if (a == "--timing") timing = true;
             else if (a == "--dump-ir") emitIr = "-";
             else if (a == "--help" || a == "-h") {
-                std::cout << "usage: arturoc [-O0|-O1|-O2] [--backend=fast|c|direct] [--emit-ir f] "
-                             "[--emit-c f] [--dump-ir] [--stats] [--timing] <in.art> <out>\n";
+                std::cout << "arturoc " << kArturocVersion << " (targets Arturo " << kTargetArturoVersion << ")\n"
+                             "usage: arturoc [-O0|-O1|-O2] [--backend=fast|c|direct] [--emit-ir f] "
+                             "[--emit-c f] [--dump-ir] [--stats] [--timing] [--version] <in.art> <out>\n";
+                return 0;
+            } else if (a == "--version" || a == "-V") {
+                std::cout << "arturoc " << kArturocVersion << " (targets Arturo " << kTargetArturoVersion << ")\n";
                 return 0;
             } else if (!a.empty() && a[0] == '-') throw artc::CompileError("unknown option: " + a);
             else if (inPath.empty()) inPath = a;

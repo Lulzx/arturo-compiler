@@ -95,3 +95,5 @@ jobs:
         run: make -C cpp26 all
       - name: Differential tests
         run: make -C cpp26 test
+      - name: Randomized differential tests
+        run: make -C cpp26 random

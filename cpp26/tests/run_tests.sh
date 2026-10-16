@@ -298,6 +298,7 @@ if [ "$ss" = "0" ] && cmp -s "$WORK/stub.out" "$WORK/bin.out"; then ok; else bad
 
 echo "== CLI contract =="
 if ./bin/arturoc --help >"$WORK/help.out" 2>&1 && grep -q "direct" "$WORK/help.out"; then ok; else bad "--help output"; fi
+if ./bin/arturoc --version >"$WORK/ver.out" 2>&1 && grep -q "^arturoc [0-9]" "$WORK/ver.out"; then ok; else bad "--version output"; fi
 printf 'print "hi"\n' > "$WORK/cli.art"
 if ./bin/arturoc --bogus "$WORK/cli.art" "$WORK/cli-bin" >/dev/null 2>&1; then bad "unknown option accepted"; elif [ -e "$WORK/cli-bin" ]; then bad "unknown option produced output"; else ok; fi
 if ./bin/arturoc --backend=bogus "$WORK/cli.art" "$WORK/cli-bin" >/dev/null 2>&1; then bad "unknown backend accepted"; elif [ -e "$WORK/cli-bin" ]; then bad "unknown backend produced output"; else ok; fi
