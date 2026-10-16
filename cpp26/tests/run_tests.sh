@@ -312,6 +312,9 @@ if ./bin/arturoc "$WORK/zipprog.art" "$WORK/zipbin" >"$WORK/c.log" 2>&1; then
     if [ "$zipok" -eq 1 ]; then ok; else bad "zip/unzip/volume parity"; fi
 else bad "compile zipprog: $(cat "$WORK/c.log")"; fi
 
+echo "== HTTP parity: request/download vs local server (host vs compiled) =="
+if ARTURO_HOST="$ARTURO" python3 tests/http_test.py "$WORK" >"$WORK/http.log" 2>&1; then ok; else bad "http parity: $(cat "$WORK/http.log")"; fi
+
 echo "== socket parity over live TCP (host vs compiled) =="
 if ARTURO_HOST="$ARTURO" python3 tests/socket_test.py "$WORK" >"$WORK/sock.log" 2>&1; then ok; else bad "socket parity: $(cat "$WORK/sock.log")"; fi
 

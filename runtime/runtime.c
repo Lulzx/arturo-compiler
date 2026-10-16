@@ -3667,6 +3667,282 @@ static Value b_unplug(Env*e, Value*a, int n) {
     return v_null();
 }
 static Value b_socketp(Env*e, Value*a, int n){ return v_bool(a[0].k==V_SOCKET); }
+static unsigned char *read_whole_file(const char *path, size_t *out_len);  /* zip section below */
+/* ---- HTTP client: request / download (host Net.nim semantics) ----------- */
+/* Transport is the system curl (present on macOS and mainstream Linux),
+ * invoked with an argv vector -- never through a shell. When curl or the
+ * request itself fails, `request` returns null, exactly as the host does
+ * for any failed request; `download` raises, as the host does. */
+typedef struct { char **v; size_t n, cap; } Argv;
+static void argv_push(Argv *a, const char *s) {
+    if (a->n == a->cap) { a->cap = a->cap ? a->cap * 2 : 16; a->v = realloc(a->v, a->cap * sizeof(char*)); }
+    a->v[a->n++] = (char*)s;
+}
+static int run_curl(Argv *args) {
+    argv_push(args, NULL);
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) { execvp(args->v[0], args->v); _exit(127); }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) { if (errno != EINTR) return -1; }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+static void json_escape_add(FILE *f, const char *s) {
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char*)s; *p; p++) {
+        switch (*p) {
+            case '"': fputs("\\\"", f); break;
+            case '\\': fputs("\\\\", f); break;
+            case '\n': fputs("\\n", f); break;
+            case '\r': fputs("\\r", f); break;
+            case '\t': fputs("\\t", f); break;
+            default: if (*p < 0x20) fprintf(f, "\\u%04x", *p); else fputc(*p, f);
+        }
+    }
+    fputc('"', f);
+}
+static void json_write(FILE *f, Value v) {
+    switch (v.k) {
+        case V_NULL: fputs("null", f); break;
+        case V_BOOL: fputs(v.u.b ? "true" : "false", f); break;
+        case V_INT: fprintf(f, "%ld", v.u.i); break;
+        case V_FLOAT: { char *s = val_str(v); fputs(s, f); free(s); break; }
+        case V_BLOCK: {
+            fputc('[', f);
+            for (int i = 0; i < v.u.block.b->n; i++) { if (i) fputc(',', f); json_write(f, *v.u.block.b->items[i]); }
+            fputc(']', f); break;
+        }
+        case V_DICT: {
+            fputc('{', f);
+            for (int i = 0; i < v.u.dict->n; i++) {
+                if (i) fputc(',', f);
+                json_escape_add(f, v.u.dict->keys[i]); fputc(':', f); json_write(f, v.u.dict->vals[i]);
+            }
+            fputc('}', f); break;
+        }
+        default: { char *s = val_str(v); json_escape_add(f, s); free(s); break; }
+    }
+}
+static char *http_url_encode(const char *s) {
+    static const char *hex = "0123456789ABCDEF";
+    size_t cap = strlen(s) * 3 + 1, n = 0;
+    char *out = xmalloc(cap);
+    for (const unsigned char *p = (const unsigned char*)s; *p; p++) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
+            *p == '-' || *p == '_' || *p == '.' || *p == '~') out[n++] = (char)*p;
+        else { out[n++] = '%'; out[n++] = hex[*p >> 4]; out[n++] = hex[*p & 15]; }
+    }
+    out[n] = 0; return out;
+}
+static void lower_into(char *dst, const char *src, size_t cap) {
+    size_t i = 0; for (; src[i] && i + 1 < cap; i++) dst[i] = (char)tolower((unsigned char)src[i]);
+    dst[i] = 0;
+}
+static Value http_header_value(const char *lname, char **vals, int nvals, int raw) {
+    if (raw || nvals > 1) {
+        Value **items = xmalloc(sizeof(Value*) * (size_t)(nvals ? nvals : 1));
+        for (int i = 0; i < nvals; i++) { items[i] = xmalloc(sizeof(Value)); *items[i] = v_str(vals[i]); }
+        return v_block(items, nvals);
+    }
+    const char *v = vals[0];
+    if (!strcmp(lname, "age") || !strcmp(lname, "content-length")) {
+        char *end; long num = strtol(v, &end, 10);
+        if (end != v) return v_int(num);
+        return v_str(v);
+    }
+    if (!strcmp(lname, "access-control-allow-credentials")) return v_bool(!strcmp(v, "true"));
+    if (!strcmp(lname, "date") || !strcmp(lname, "expires") || !strcmp(lname, "last-modified")) {
+        /* the host drops the trailing timezone token and parses the rest */
+        char *copy = strdup(v);
+        char *last_space = strrchr(copy, ' ');
+        if (last_space && strchr(last_space, ' ') == last_space) {
+            struct tm tmv; memset(&tmv, 0, sizeof tmv);
+            char *sp = strrchr(copy, ' ');
+            if (sp) *sp = 0;
+            if (strptime(copy, "%a, %d %b %Y %H:%M:%S", &tmv)) {
+                Value d; memset(&d, 0, sizeof d); d.k = V_DATE; d.u.epoch = (long long)timegm(&tmv);
+                free(copy); return d;
+            }
+        }
+        free(copy);
+        return v_str(v);
+    }
+    return v_str(v);
+}
+static Value b_request(Env*e, Value*a, int n) {
+    if (!IS_STRLIKE(a[0].k)) die("request: expected a url string");
+    char *url = strdup(a[0].u.s);
+    const char *method = "GET";
+    if (rt_has_attr("post")) method = "POST";
+    else if (rt_has_attr("patch")) method = "PATCH";
+    else if (rt_has_attr("put")) method = "PUT";
+    else if (rt_has_attr("delete")) method = "DELETE";
+    int is_get = !strcmp(method, "GET");
+    Argv args = {0};
+    argv_push(&args, "curl"); argv_push(&args, "-s"); argv_push(&args, "-L"); argv_push(&args, "--max-redirs"); argv_push(&args, "5");
+    const char *agent = "Arturo HTTP Client / 0.10.0";
+    char *agent_buf = NULL;
+    if (rt_has_attr("agent")) { Value v = rt_attr_value("agent", v_str("")); if (IS_STRLIKE(v.k)) agent_buf = strdup(v.u.s); }
+    if (agent_buf) agent = agent_buf;
+    argv_push(&args, "-A"); argv_push(&args, agent);
+    if (rt_has_attr("timeout")) {
+        Value v = rt_attr_value("timeout", v_int(0));
+        if (v.k == V_INT) { char *tb = xmalloc(32); snprintf(tb, 32, "%.3f", v.u.i / 1000.0); argv_push(&args, "--max-time"); argv_push(&args, tb); }
+    }
+    if (rt_has_attr("proxy")) { Value v = rt_attr_value("proxy", v_str("")); if (IS_STRLIKE(v.k)) { argv_push(&args, "--proxy"); argv_push(&args, strdup(v.u.s)); } }
+    if (rt_has_attr("certificate")) { Value v = rt_attr_value("certificate", v_str("")); if (IS_STRLIKE(v.k)) { argv_push(&args, "--cacert"); argv_push(&args, strdup(v.u.s)); } }
+    if (rt_has_attr("headers")) {
+        Value h = rt_attr_value("headers", v_null());
+        if (h.k == V_DICT) {
+            for (int i = 0; i < h.u.dict->n; i++) {
+                char *val = val_str(h.u.dict->vals[i]);
+                char *line = xmalloc(strlen(h.u.dict->keys[i]) + strlen(val) + 3);
+                sprintf(line, "%s: %s", h.u.dict->keys[i], val);
+                argv_push(&args, "-H"); argv_push(&args, line);
+                free(val);
+            }
+        }
+    }
+    char *body_tmp = NULL;
+    if (is_get) {
+        if (a[1].k == V_DICT && a[1].u.dict->n > 0) {
+            size_t cap = strlen(url) + 64; char *q = xmalloc(cap); strcpy(q, url); strcat(q, "?");
+            for (int i = 0; i < a[1].u.dict->n; i++) {
+                char *val = val_str(a[1].u.dict->vals[i]);
+                char *ek = http_url_encode(a[1].u.dict->keys[i]), *ev = http_url_encode(val);
+                size_t need = strlen(q) + strlen(ek) + strlen(ev) + 3;
+                if (need > cap) { cap = need * 2; q = realloc(q, cap); }
+                if (i) strcat(q, "&");
+                strcat(q, ek); strcat(q, "="); strcat(q, ev);
+                free(val); free(ek); free(ev);
+            }
+            free(url); url = q;
+        } else if (a[1].k == V_STR) {
+            char *q = xmalloc(strlen(url) + strlen(a[1].u.s) + 2);
+            sprintf(q, "%s?%s", url, a[1].u.s); free(url); url = q;
+        }
+    } else {
+        argv_push(&args, "-X"); argv_push(&args, method);
+        if (rt_has_attr("json")) {
+            argv_push(&args, "-H"); argv_push(&args, "Content-Type: application/json");
+            char tmp[] = "/tmp/arturoc-req-body.XXXXXX";
+            int fd = mkstemp(tmp); if (fd < 0) { free(url); free(agent_buf); return v_null(); }
+            FILE *bf = fdopen(fd, "w"); json_write(bf, a[1]); fclose(bf);
+            body_tmp = strdup(tmp);
+            argv_push(&args, "--data-binary"); char *at = xmalloc(strlen(tmp) + 2); sprintf(at, "@%s", tmp); argv_push(&args, at);
+        } else if (a[1].k == V_STR) {
+            argv_push(&args, "--data-binary"); argv_push(&args, a[1].u.s);
+        } else if (a[1].k == V_DICT) {
+            for (int i = 0; i < a[1].u.dict->n; i++) {
+                char *val = val_str(a[1].u.dict->vals[i]);
+                char *field = xmalloc(strlen(a[1].u.dict->keys[i]) + strlen(val) + 2);
+                sprintf(field, "%s=%s", a[1].u.dict->keys[i], val);
+                argv_push(&args, "-F"); argv_push(&args, field);
+                free(val);
+            }
+        }
+    }
+    char hdr_tmp[] = "/tmp/arturoc-req-hdr.XXXXXX";
+    char out_tmp[] = "/tmp/arturoc-req-out.XXXXXX";
+    int hfd = mkstemp(hdr_tmp), ofd = mkstemp(out_tmp);
+    if (hfd < 0 || ofd < 0) { if (hfd >= 0) close(hfd); if (ofd >= 0) close(ofd); free(url); free(agent_buf); return v_null(); }
+    close(hfd); close(ofd);
+    argv_push(&args, "-D"); argv_push(&args, hdr_tmp);
+    argv_push(&args, "-o"); argv_push(&args, out_tmp);
+    argv_push(&args, url);
+    int rc = run_curl(&args);
+    for (size_t i = 0; i < args.n; i++) { /* entries are literals or heap; leaking to exit is fine */ }
+    free(args.v);
+    if (body_tmp) unlink(body_tmp);
+    if (rc != 0) { unlink(hdr_tmp); unlink(out_tmp); free(url); free(agent_buf); return v_null(); }
+    size_t hlen = 0, blen = 0;
+    unsigned char *hraw = read_whole_file(hdr_tmp, &hlen); unlink(hdr_tmp);
+    unsigned char *braw = read_whole_file(out_tmp, &blen); unlink(out_tmp);
+    free(url); free(agent_buf);
+    if (!hraw || !braw) { free(hraw); free(braw); return v_null(); }
+    /* last header block wins (after any redirects) */
+    char *text = (char*)hraw;
+    char *block_start = text;
+    for (char *p = text; *p; p++) {
+        if ((p == text || p[-1] == '\n') && !strncmp(p, "HTTP/", 5)) block_start = p;
+    }
+    char version[16] = ""; long status_code = 0; char status_text[256] = "";
+    {
+        char *sp1 = strchr(block_start, ' ');
+        if (sp1) {
+            size_t vl = (size_t)(sp1 - (block_start + 5)); if (vl >= sizeof version) vl = sizeof version - 1;
+            memcpy(version, block_start + 5, vl); version[vl] = 0;
+            status_code = strtol(sp1 + 1, NULL, 10);
+            char *eol = strpbrk(sp1 + 1, "\r\n");
+            size_t tl = eol ? (size_t)(eol - (sp1 + 1)) : strlen(sp1 + 1);
+            if (tl >= sizeof status_text) tl = sizeof status_text - 1;
+            memcpy(status_text, sp1 + 1, tl); status_text[tl] = 0;
+        }
+    }
+    /* ordered unique header keys, values accumulated */
+    typedef struct { char *key; char **vals; int n, cap; } Hdr;
+    Hdr *hdrs = NULL; int nh = 0, hcap = 0;
+    int raw = rt_has_attr("raw");
+    char *save = NULL;
+    int first_line = 1;
+    for (char *line = strtok_r(block_start, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save)) {
+        if (first_line) { first_line = 0; continue; }
+        char *colon = strchr(line, ':');
+        if (!colon) continue;
+        *colon = 0;
+        char *val = colon + 1; while (*val == ' ') val++;
+        char lkey[128]; lower_into(lkey, line, sizeof lkey);
+        int idx = -1;
+        for (int i = 0; i < nh; i++) if (!strcmp(hdrs[i].key, lkey)) { idx = i; break; }
+        if (idx < 0) {
+            if (nh == hcap) { hcap = hcap ? hcap * 2 : 8; hdrs = realloc(hdrs, (size_t)hcap * sizeof(Hdr)); }
+            idx = nh++; hdrs[idx].key = strdup(lkey); hdrs[idx].vals = NULL; hdrs[idx].n = 0; hdrs[idx].cap = 0;
+        }
+        if (hdrs[idx].n == hdrs[idx].cap) { hdrs[idx].cap = hdrs[idx].cap ? hdrs[idx].cap * 2 : 4; hdrs[idx].vals = realloc(hdrs[idx].vals, (size_t)hdrs[idx].cap * sizeof(char*)); }
+        hdrs[idx].vals[hdrs[idx].n++] = strdup(val);
+    }
+    char **dkeys = xmalloc(sizeof(char*) * (size_t)(nh + 3));
+    Value *dvals = xmalloc(sizeof(Value) * (size_t)(nh + 3));
+    int dn = 0;
+    dkeys[dn] = strdup("version"); dvals[dn++] = v_str(version);
+    char *body_str = xmalloc(blen + 1); memcpy(body_str, braw, blen); body_str[blen] = 0;
+    dkeys[dn] = strdup("body"); dvals[dn++] = v_str(body_str); free(body_str);
+    char **hkeys = xmalloc(sizeof(char*) * (size_t)(nh ? nh : 1));
+    Value *hvals = xmalloc(sizeof(Value) * (size_t)(nh ? nh : 1));
+    for (int i = 0; i < nh; i++) {
+        hkeys[i] = strdup(hdrs[i].key);
+        hvals[i] = http_header_value(hdrs[i].key, hdrs[i].vals, hdrs[i].n, raw);
+    }
+    dkeys[dn] = strdup("headers"); dvals[dn++] = v_dict(hkeys, hvals, nh);
+    dkeys[dn] = strdup("status");
+    dvals[dn++] = raw ? v_str(status_text) : v_int(status_code);
+    free(hraw); free(braw);
+    return v_dict(dkeys, dvals, dn);
+}
+static Value b_download(Env*e, Value*a, int n) {
+    if (!IS_STRLIKE(a[0].k)) die("download: expected a url string");
+    const char *target = NULL;
+    char *target_buf = NULL;
+    if (rt_has_attr("as")) { Value v = rt_attr_value("as", v_str("")); if (IS_STRLIKE(v.k)) target_buf = strdup(v.u.s); }
+    if (!target_buf) {
+        const char *path = a[0].u.s;
+        const char *q = strchr(path, '?'); 
+        const char *slash = strrchr(path, '/');
+        target_buf = strdup(slash ? slash + 1 : path);
+        if (q && target_buf) { char *qm = strchr(target_buf, '?'); if (qm) *qm = 0; }
+        if (!*target_buf) { free(target_buf); target_buf = strdup("download"); }
+    }
+    target = target_buf;
+    Argv args = {0};
+    argv_push(&args, "curl"); argv_push(&args, "-s"); argv_push(&args, "-L"); argv_push(&args, "--max-redirs"); argv_push(&args, "5");
+    argv_push(&args, "-A"); argv_push(&args, "Arturo HTTP Client / 0.10.0");
+    argv_push(&args, "-o"); argv_push(&args, target);
+    argv_push(&args, a[0].u.s);
+    int rc = run_curl(&args);
+    free(args.v); free(target_buf);
+    if (rc != 0) die("download: download failed");
+    return v_null();
+}
 /* ---- zip / unzip / volume (host Files.nim semantics) -------------------- */
 static Value b_volume(Env*e, Value*a, int n) {
     if (!IS_STRLIKE(a[0].k)) die("volume: expected a path");
@@ -5028,6 +5304,7 @@ static struct { const char *name; Value (*fn)(Env*,Value*,int); } BUILTINS[] = {
     {"connect",b_connect},{"listen",b_listen},{"accept",b_accept},{"send",b_send},
     {"send?",b_sendq},{"receive",b_receive},{"unplug",b_unplug},
     {"zip",b_zip},{"unzip",b_unzip},{"volume",b_volume},
+    {"request",b_request},{"download",b_download},
     {"one?",b_onep},{"ascii?",b_asciip},{"whitespace?",b_whitespacep},
     {"lower?",b_lowerp},{"upper?",b_upperp},{"numeric?",b_numericp},
     {"prefix?",b_prefixp},{"suffix?",b_suffixp},{"between?",b_betweenp},{"same?",b_samep},

@@ -35,10 +35,9 @@ NOT_MUTATING: #[
 UNSUPPORTED_INTRINSICS: #[
     "__VerbosePackager": true "browse": true
     "cancel": true "channel": true "config": true
-    "cursor": true "download": true
+    "cursor": true
     "emit": true "eval": true "event": true "failed?": true "finished?": true "goto": true "info": true
     "mail": true "off": true "on": true
-    "request": true
     "serve": true "spin": true
     "stack": true "store": true
     "terminate": true "unstack": true
